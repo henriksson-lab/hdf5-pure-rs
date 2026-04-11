@@ -1,0 +1,21 @@
+[package]
+name = "hdf5-pure-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust implementation of the HDF5 file format."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bitflags = "2.4"
+flate2 = "1.0"
+crc32fast = "1.4"
+parking_lot = "0.12"
+ndarray = "0.15"
+hdf5-pure-rust-derive = { path = "../hdf5-pure-rust-derive", optional = true }
+
+[features]
+default = ["derive"]
+derive = ["dep:hdf5-pure-rust-derive"]
+
+[dev-dependencies]
+tempfile = "3.9"
