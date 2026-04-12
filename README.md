@@ -1,16 +1,22 @@
 # hdf5-pure-rust
 
-Pure Rust implementation of the HDF5 file format. No C dependencies.
+[![Crates.io](https://img.shields.io/crates/v/hdf5-pure-rust.svg)](https://crates.io/crates/hdf5-pure-rust)
+[![License](https://img.shields.io/crates/l/hdf5-pure-rust.svg)](https://github.com/henriksson-lab/hdf5-pure-rs)
 
-Read and write HDF5 files without linking to the C HDF5 library. Files produced by this crate are verified compatible with the C library (h5dump, h5py).
+Pure Rust implementation of the HDF5 file format. **No C dependencies.**
+
+Read and write HDF5 files without linking to the C HDF5 library. Files produced by this crate are verified compatible with the C library (h5dump, h5py). Can also be compiled for WebAssembly.
 
 Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch).
 
-This is a translation of the original code and not the authoritative implementation. This code should generate bitwise
-equal output to the original. Please report any deviations
+This is a reimplementation of the HDF5 format, not a wrapper around the C library. Output should be bitwise compatible with the original. Please report any deviations.
 
-The aim of this project is to increase performance, especially by providing this code through a type-safe library interface.
-The code can also be compiled to be used for webassembly.
+## Installation
+
+```toml
+[dependencies]
+hdf5-pure-rust = "0.1"
+```
 
 ## Quick Start
 
@@ -30,6 +36,19 @@ wf.flush()?;
 let f = File::open("data.h5")?;
 let ds = f.dataset("temperatures")?;
 let values: Vec<f64> = ds.read::<f64>()?;
+
+// Typed reads with ndarray
+let arr = ds.read_1d::<f64>()?;        // Array1<f64>
+let mat = ds.read_2d::<i32>()?;        // Array2<i32>
+
+// Slicing
+let subset: Vec<f64> = ds.read_slice::<f64, _>(10..20)?;
+
+// Strings
+let strings = ds.read_strings()?;       // Vec<String>
+
+// Compound types
+let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 ```
 
 ## Features
@@ -69,7 +88,7 @@ let values: Vec<f64> = ds.read::<f64>()?;
 1M f64 elements, chunked (50K), deflate level 1:
 
 | Operation | h5py/C (v1.14.5) | hdf5-pure-rust | Speedup |
-|-----------|-------------------|----------------|---------|
+|-----------|------------------:|---------------:|--------:|
 | Write     | 68.7 ms           | 42.4 ms        | 1.6x    |
 | Read      | 17.3 ms           | 20.4 ms        | 0.85x   |
 
@@ -95,7 +114,7 @@ struct Measurement {
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `derive` | yes | `#[derive(H5Type)]` proc macro |
-| `blosc` | no | Blosc decompression via `blosc2-pure-rs` |
+| `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs) |
 
 ## Test Suite
 
@@ -107,12 +126,6 @@ struct Measurement {
 - Write round-trips verified by h5dump and h5py
 - Cross-platform: big-endian, old formats, various file space strategies
 
-## Stats
+## License
 
-| Metric | Value |
-|--------|-------|
-| Source lines | 8,359 (main) + 297 (derive) = 8,656 |
-| Test files | 31 |
-| Tests | 269 |
-| Original C library | 400,232 lines (src/*.c) |
-| Compression ratio | 46x fewer lines |
+MIT OR Apache-2.0
