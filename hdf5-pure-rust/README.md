@@ -6,6 +6,12 @@ Read and write HDF5 files without linking to the C HDF5 library. Files produced 
 
 Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch).
 
+This is a translation of the original code and not the authoritative implementation. This code should generate bitwise
+equal output to the original. Please report any deviations
+
+The aim of this project is to increase performance, especially by providing this code through a type-safe library interface.
+The code can also be compiled to be used for webassembly.
+
 ## Quick Start
 
 ```rust
