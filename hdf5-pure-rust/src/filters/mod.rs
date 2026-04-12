@@ -5,6 +5,7 @@ pub mod nbit;
 pub mod scaleoffset;
 pub mod lzf;
 pub mod szip;
+pub mod blosc;
 
 use crate::error::{Error, Result};
 use crate::format::messages::filter_pipeline::{
@@ -49,6 +50,7 @@ fn apply_filter_reverse(
             Ok(data.to_vec())
         }
         FILTER_SZIP => szip::decompress(data),
+        32001 => blosc::decompress(data),  // HDF5 Blosc filter ID
         32000 => {
             // LZF filter -- need the uncompressed size
             // LZF stores the original size in the first client_data parameter

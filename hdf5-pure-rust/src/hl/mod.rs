@@ -10,3 +10,4 @@ pub mod writable_file;
 pub mod selection;
 pub mod plist;
 pub mod location;
+pub mod mutable_file;

@@ -48,6 +48,11 @@ impl Dataset {
         &self.name
     }
 
+    /// Get the object header address.
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+
     /// List attribute names.
     pub fn attr_names(&self) -> Result<Vec<String>> {
         crate::hl::attribute::attr_names(&self.inner, self.addr)
@@ -311,6 +316,14 @@ impl Dataset {
         };
         let total_bytes = (total_elements as usize).checked_mul(element_size)
             .ok_or_else(|| Error::InvalidFormat("total data size overflow".into()))?;
+
+        // Sanity limit: refuse to allocate more than 4GB in a single read
+        const MAX_READ_BYTES: usize = 4 * 1024 * 1024 * 1024;
+        if total_bytes > MAX_READ_BYTES {
+            return Err(Error::InvalidFormat(format!(
+                "dataset too large for single read: {total_bytes} bytes (max {MAX_READ_BYTES})"
+            )));
+        }
 
         match info.layout.layout_class {
             LayoutClass::Compact => {

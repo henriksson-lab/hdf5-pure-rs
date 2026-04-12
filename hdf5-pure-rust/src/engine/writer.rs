@@ -243,11 +243,11 @@ fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> V
     }
     buf.extend_from_slice(name_bytes);
 
-    // External link value: info_length(2) + version(1) + flags(1) + filename(null-term) + obj_path(null-term)
-    let info_len = 1 + 1 + filename.len() + 1 + obj_path.len() + 1;
+    // External link value: info_length(2) + version(1) + filename(null-term) + obj_path(null-term)
+    // Version 0: no flags byte
+    let info_len = 1 + filename.len() + 1 + obj_path.len() + 1;
     buf.extend_from_slice(&(info_len as u16).to_le_bytes());
-    buf.push(0); // ext version
-    buf.push(0); // ext flags
+    buf.push(0); // ext version = 0 (no flags byte)
     buf.extend_from_slice(filename.as_bytes());
     buf.push(0); // null terminator
     buf.extend_from_slice(obj_path.as_bytes());

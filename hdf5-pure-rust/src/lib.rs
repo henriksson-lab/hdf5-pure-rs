@@ -15,6 +15,7 @@ pub use hl::datatype::Datatype;
 pub use hl::dataspace::Dataspace;
 pub use hl::writable_file::WritableFile;
 pub use hl::dataset_builder::DatasetBuilder;
+pub use hl::mutable_file::MutableFile;
 
 /// Re-export the derive macro when the `derive` feature is enabled.
 #[cfg(feature = "derive")]

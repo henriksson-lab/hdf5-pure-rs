@@ -132,10 +132,15 @@ impl LinkMessage {
                 if pos + info_len > data.len() || info_len < 2 {
                     return Err(Error::InvalidFormat("external link info exceeds bounds".into()));
                 }
-                let _ext_version = data[pos];
-                let _ext_flags = data[pos + 1];
-                pos += 2;
-                let end = (pos + info_len - 2).min(data.len());
+                let ext_version = data[pos];
+                pos += 1;
+                let mut info_consumed = 1;
+                if ext_version >= 1 {
+                    let _ext_flags = data[pos];
+                    pos += 1;
+                    info_consumed += 1;
+                }
+                let end = (pos + info_len - info_consumed).min(data.len());
 
                 // Filename (null-terminated)
                 let null_pos = data[pos..end].iter().position(|&b| b == 0).unwrap_or(end - pos);
