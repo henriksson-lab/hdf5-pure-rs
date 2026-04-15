@@ -31,5 +31,10 @@ tracehash = ["dep:tracehash"]
 name = "benchmark"
 harness = false
 
+[[bin]]
+name = "tracehash_corpus"
+path = "src/bin/tracehash_corpus.rs"
+required-features = ["tracehash"]
+
 [dev-dependencies]
 tempfile = "3.9"

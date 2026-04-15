@@ -74,24 +74,11 @@ impl DataLayoutMessage {
         #[cfg(feature = "tracehash")]
         if let Ok(message) = &result {
             let mut th = tracehash::th_call!("hdf5.data_layout.decode");
-            th.input_u64(sizeof_addr as u64);
-            th.input_u64(sizeof_size as u64);
             th.input_bytes(data);
+            th.output_bool(true);
             th.output_u64(message.version as u64);
             th.output_u64(message.layout_class as u64);
-            th.output_u64(
-                message
-                    .chunk_index_type
-                    .map(|t| t as u64)
-                    .unwrap_or(u64::MAX),
-            );
-            th.output_u64(
-                message
-                    .chunk_dims
-                    .as_ref()
-                    .map(|dims| dims.len())
-                    .unwrap_or(0) as u64,
-            );
+            th.output_u64(message.chunk_index_type.map(|t| t as u64).unwrap_or(0));
             th.finish();
         }
 
@@ -100,6 +87,7 @@ impl DataLayoutMessage {
 
     fn decode_v1_v2(data: &[u8], version: u8, sizeof_addr: u8) -> Result<Self> {
         let sa = sizeof_addr as usize;
+        ensure_available(data, 0, 8, "data layout v1/v2 header")?;
         let ndims = data[1] as usize;
         let layout_class_val = data[2];
         // 5 reserved bytes in v1/v2
@@ -117,8 +105,7 @@ impl DataLayoutMessage {
         };
 
         let data_addr = if layout_class != LayoutClass::Compact {
-            let addr = read_le_u64(&data[pos..], sa);
-            pos += sa;
+            let addr = read_le_u64(data, &mut pos, sa, "data layout v1/v2 address")?;
             Some(addr)
         } else {
             None
@@ -127,9 +114,7 @@ impl DataLayoutMessage {
         // Dimension sizes (ndims * 4 bytes for v1/v2, last dim is element size for chunked)
         let mut dims = Vec::new();
         for _ in 0..ndims {
-            let d =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64;
-            pos += 4;
+            let d = read_u32_le(data, &mut pos, "data layout v1/v2 dimensions")? as u64;
             dims.push(d);
         }
 
@@ -155,9 +140,8 @@ impl DataLayoutMessage {
         match layout_class {
             LayoutClass::Compact => {
                 let compact_size =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
+                    read_u32_le(data, &mut pos, "data layout v1/v2 compact size")? as usize;
+                ensure_available(data, pos, compact_size, "data layout v1/v2 compact data")?;
                 result.compact_data = Some(data[pos..pos + compact_size].to_vec());
             }
             LayoutClass::Contiguous => {
@@ -183,6 +167,7 @@ impl DataLayoutMessage {
     fn decode_v3(data: &[u8], sizeof_addr: u8, sizeof_size: u8) -> Result<Self> {
         let sa = sizeof_addr as usize;
         let ss = sizeof_size as usize;
+        ensure_available(data, 0, 2, "data layout v3 header")?;
         let layout_class_val = data[1];
         let mut pos = 2;
 
@@ -219,34 +204,25 @@ impl DataLayoutMessage {
 
         match layout_class {
             LayoutClass::Compact => {
-                let size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
+                let size = read_u16_le(data, &mut pos, "data layout v3 compact size")? as usize;
+                ensure_available(data, pos, size, "data layout v3 compact data")?;
                 result.compact_data = Some(data[pos..pos + size].to_vec());
             }
             LayoutClass::Contiguous => {
-                let addr = read_le_u64(&data[pos..], sa);
-                pos += sa;
-                let size = read_le_u64(&data[pos..], ss);
+                let addr = read_le_u64(data, &mut pos, sa, "data layout v3 contiguous address")?;
+                let size = read_le_u64(data, &mut pos, ss, "data layout v3 contiguous size")?;
                 result.contiguous_addr = Some(addr);
                 result.contiguous_size = Some(size);
                 result.data_addr = Some(addr);
             }
             LayoutClass::Chunked => {
                 // v3 chunked: ndims(1) + dims(ndims*4) + btree_addr(sizeof_addr)
-                let ndims = data[pos] as usize;
-                pos += 1;
-                let addr = read_le_u64(&data[pos..], sa);
-                pos += sa;
+                let ndims = read_u8(data, &mut pos, "data layout v3 chunk rank")? as usize;
+                let addr = read_le_u64(data, &mut pos, sa, "data layout v3 chunk index address")?;
 
                 let mut dims = Vec::with_capacity(ndims);
                 for _ in 0..ndims {
-                    let d = u32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]) as u64;
-                    pos += 4;
+                    let d = read_u32_le(data, &mut pos, "data layout v3 chunk dimensions")? as u64;
                     dims.push(d);
                 }
 
@@ -261,10 +237,8 @@ impl DataLayoutMessage {
             }
             LayoutClass::Virtual => {
                 // v3 virtual: global_heap_addr(sizeof_addr) + index(4)
-                let addr = read_le_u64(&data[pos..], sa);
-                pos += sa;
-                let index =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let addr = read_le_u64(data, &mut pos, sa, "data layout v3 virtual heap address")?;
+                let index = read_u32_le(data, &mut pos, "data layout v3 virtual heap index")?;
                 result.virtual_heap_addr = Some(addr);
                 result.virtual_heap_index = Some(index);
             }
@@ -276,6 +250,7 @@ impl DataLayoutMessage {
     fn decode_v4(data: &[u8], sizeof_addr: u8, sizeof_size: u8) -> Result<Self> {
         let sa = sizeof_addr as usize;
         let ss = sizeof_size as usize;
+        ensure_available(data, 0, 2, "data layout v4 header")?;
         let layout_class_val = data[1];
         let mut pos = 2;
 
@@ -312,39 +287,39 @@ impl DataLayoutMessage {
 
         match layout_class {
             LayoutClass::Compact => {
-                let size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
+                let size = read_u16_le(data, &mut pos, "data layout v4 compact size")? as usize;
+                ensure_available(data, pos, size, "data layout v4 compact data")?;
                 result.compact_data = Some(data[pos..pos + size].to_vec());
             }
             LayoutClass::Contiguous => {
-                let addr = read_le_u64(&data[pos..], sa);
-                pos += sa;
-                let size = read_le_u64(&data[pos..], ss);
+                let addr = read_le_u64(data, &mut pos, sa, "data layout v4 contiguous address")?;
+                let size = read_le_u64(data, &mut pos, ss, "data layout v4 contiguous size")?;
                 result.contiguous_addr = Some(addr);
                 result.contiguous_size = Some(size);
                 result.data_addr = Some(addr);
             }
             LayoutClass::Chunked => {
-                let flags = data[pos];
-                pos += 1;
-                let ndims = data[pos] as usize;
-                pos += 1;
-                let enc_bytes_per_dim = data[pos] as usize;
-                pos += 1;
+                let flags = read_u8(data, &mut pos, "data layout v4 chunk flags")?;
+                let ndims = read_u8(data, &mut pos, "data layout v4 chunk rank")? as usize;
+                let enc_bytes_per_dim =
+                    read_u8(data, &mut pos, "data layout v4 encoded dimension size")? as usize;
 
                 // Read chunk dimensions (variable-width encoded)
                 let mut dims = Vec::with_capacity(ndims);
                 for _ in 0..ndims {
-                    let d = read_le_u64(&data[pos..], enc_bytes_per_dim);
-                    pos += enc_bytes_per_dim;
+                    let d = read_le_u64(
+                        data,
+                        &mut pos,
+                        enc_bytes_per_dim,
+                        "data layout v4 chunk dimensions",
+                    )?;
                     dims.push(d);
                 }
                 result.chunk_dims = Some(dims);
                 result.chunk_flags = Some(flags);
 
                 // Chunk index type
-                let idx_type_val = data[pos];
-                pos += 1;
+                let idx_type_val = read_u8(data, &mut pos, "data layout v4 chunk index type")?;
 
                 let idx_type = match idx_type_val {
                     0 => ChunkIndexType::BTreeV1,
@@ -366,63 +341,70 @@ impl DataLayoutMessage {
                     ChunkIndexType::SingleChunk => {
                         if flags & 0x02 != 0 {
                             // Single chunk with filter
-                            let filtered_size = read_le_u64(&data[pos..], ss);
-                            pos += ss;
-                            let filter_mask = u32::from_le_bytes([
-                                data[pos],
-                                data[pos + 1],
-                                data[pos + 2],
-                                data[pos + 3],
-                            ]);
-                            pos += 4;
+                            let filtered_size = read_le_u64(
+                                data,
+                                &mut pos,
+                                ss,
+                                "data layout v4 single chunk filtered size",
+                            )?;
+                            let filter_mask =
+                                read_u32_le(data, &mut pos, "data layout v4 single chunk mask")?;
                             result.single_chunk_filtered_size = Some(filtered_size);
                             result.single_chunk_filter_mask = Some(filter_mask);
                         }
-                        let addr = read_le_u64(&data[pos..], sa);
+                        let addr =
+                            read_le_u64(data, &mut pos, sa, "data layout v4 single chunk address")?;
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
                     ChunkIndexType::Implicit => {
-                        let addr = read_le_u64(&data[pos..], sa);
+                        let addr =
+                            read_le_u64(data, &mut pos, sa, "data layout v4 implicit address")?;
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
                     ChunkIndexType::FixedArray => {
                         // Creation parameters: page_bits(1)
-                        let _page_bits = data[pos];
-                        pos += 1;
-                        let addr = read_le_u64(&data[pos..], sa);
+                        let _page_bits =
+                            read_u8(data, &mut pos, "data layout v4 fixed array page bits")?;
+                        let addr =
+                            read_le_u64(data, &mut pos, sa, "data layout v4 fixed array address")?;
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
                     ChunkIndexType::ExtensibleArray => {
                         // Creation parameters: several bytes
-                        let _max_bits = data[pos];
-                        let _idx_bits = data[pos + 1];
-                        let _min_pts = data[pos + 2];
-                        let _min_dblk_bits = data[pos + 3];
-                        let _page_bits = data[pos + 4];
+                        ensure_available(
+                            data,
+                            pos,
+                            5,
+                            "data layout v4 extensible array parameters",
+                        )?;
                         pos += 5;
-                        let addr = read_le_u64(&data[pos..], sa);
+                        let addr = read_le_u64(
+                            data,
+                            &mut pos,
+                            sa,
+                            "data layout v4 extensible array address",
+                        )?;
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
                     ChunkIndexType::BTreeV2 => {
-                        let _node_size = u32::from_le_bytes([
-                            data[pos],
-                            data[pos + 1],
-                            data[pos + 2],
-                            data[pos + 3],
-                        ]);
-                        let _split_percent = data[pos + 4];
-                        let _merge_percent = data[pos + 5];
-                        pos += 6;
-                        let addr = read_le_u64(&data[pos..], sa);
+                        let _node_size =
+                            read_u32_le(data, &mut pos, "data layout v4 btree2 node size")?;
+                        let _split_percent =
+                            read_u8(data, &mut pos, "data layout v4 btree2 split percent")?;
+                        let _merge_percent =
+                            read_u8(data, &mut pos, "data layout v4 btree2 merge percent")?;
+                        let addr =
+                            read_le_u64(data, &mut pos, sa, "data layout v4 btree2 address")?;
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
                     ChunkIndexType::BTreeV1 => {
-                        let addr = read_le_u64(&data[pos..], sa);
+                        let addr =
+                            read_le_u64(data, &mut pos, sa, "data layout v4 btree1 address")?;
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
@@ -430,18 +412,10 @@ impl DataLayoutMessage {
             }
             LayoutClass::Virtual => {
                 // v4 virtual: global_heap_addr(sizeof_addr) + index(4)
-                if pos + sa + 4 <= data.len() {
-                    let addr = read_le_u64(&data[pos..], sa);
-                    pos += sa;
-                    let index = u32::from_le_bytes([
-                        data[pos],
-                        data[pos + 1],
-                        data[pos + 2],
-                        data[pos + 3],
-                    ]);
-                    result.virtual_heap_addr = Some(addr);
-                    result.virtual_heap_index = Some(index);
-                }
+                let addr = read_le_u64(data, &mut pos, sa, "data layout v4 virtual heap address")?;
+                let index = read_u32_le(data, &mut pos, "data layout v4 virtual heap index")?;
+                result.virtual_heap_addr = Some(addr);
+                result.virtual_heap_index = Some(index);
             }
         }
 
@@ -449,10 +423,48 @@ impl DataLayoutMessage {
     }
 }
 
-fn read_le_u64(data: &[u8], size: usize) -> u64 {
-    let mut val = 0u64;
-    for i in 0..size.min(data.len()).min(8) {
-        val |= (data[i] as u64) << (i * 8);
+fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
+    if end > data.len() {
+        return Err(Error::InvalidFormat(format!("{context} is truncated")));
     }
-    val
+    Ok(())
+}
+
+fn read_u8(data: &[u8], pos: &mut usize, context: &str) -> Result<u8> {
+    ensure_available(data, *pos, 1, context)?;
+    let value = data[*pos];
+    *pos += 1;
+    Ok(value)
+}
+
+fn read_u16_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u16> {
+    ensure_available(data, *pos, 2, context)?;
+    let value = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+    *pos += 2;
+    Ok(value)
+}
+
+fn read_u32_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u32> {
+    ensure_available(data, *pos, 4, context)?;
+    let value = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+    *pos += 4;
+    Ok(value)
+}
+
+fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Result<u64> {
+    if !(1..=8).contains(&size) {
+        return Err(Error::InvalidFormat(format!(
+            "{context} has invalid byte width {size}"
+        )));
+    }
+    ensure_available(data, *pos, size, context)?;
+    let mut val = 0u64;
+    for i in 0..size {
+        val |= (data[*pos + i] as u64) << (i * 8);
+    }
+    *pos += size;
+    Ok(val)
 }

@@ -79,18 +79,19 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 | Area | Supported | Explicitly Unsupported |
 |------|-----------|------------------------|
 | Superblocks and object headers | Superblock v0-v3; object header v1/v2 with checksums | Full C-library metadata-cache behavior |
-| Dataset storage | Compact, contiguous, chunked with v1 B-tree, v4 single-chunk datasets, unfiltered v4 implicit chunk indexes, v4 fixed-array chunk indexes, direct-block v4 extensible-array chunk indexes, and v4 v2-B-tree chunk indexes | Virtual dataset reads; v4 extensible-array data/super-block spillover |
-| Filters | Deflate, shuffle, fletcher32, LZF, optional Blosc | NBit, ScaleOffset, SZip, unknown filters |
+| Dataset storage | Compact, contiguous, chunked with v1 B-tree, v4 single-chunk datasets, unfiltered v4 implicit chunk indexes, v4 fixed-array chunk indexes, v4 extensible-array chunk indexes including data/super-block spillover, v4 v2-B-tree chunk indexes, and virtual datasets with all-selection or regular hyperslab mappings | Virtual dataset point/irregular selections and full VDS access-property behavior |
+| Filters | Deflate, shuffle, fletcher32, LZF, NBit, ScaleOffset, optional Blosc | SZip, unknown filters |
 | Datatypes | Primitive numeric types, enum metadata, fixed/vlen strings, compound metadata, primitive compound field reads, raw compound member extraction, recursive compound field values for nested compound/array/vlen/reference members | Full HDF5 datatype conversion parity |
-| Groups and links | v1 symbol tables, v2 link messages, dense link/attribute storage, soft/external links | Full coverage of every HDF5 index/storage variant |
-| Writing | v2 superblock, groups, datasets, attributes, compact/contiguous/chunked storage, deflate/shuffle, soft/external links | General-purpose HDF5 writer parity with the C library |
+| Groups and links | v1 symbol tables, v2 link messages, dense link/attribute storage, filtered direct fractal heap reads, filtered and unfiltered huge direct/indirect fractal heap reads, soft/external links | Full coverage of every HDF5 index/storage variant |
+| Writing | v2 superblock, groups, datasets, attributes, compact/contiguous/chunked storage, deflate/shuffle, soft/external links, limited `MutableFile::write_chunk` append/replace/rebuild for v1 chunk B-trees, and replacement of existing v4 fixed-array chunks | General-purpose HDF5 writer parity with the C library |
 
 **Reading:**
 - Superblock v0-v3
 - Object header v1 and v2 (with checksums)
 - All storage layouts: compact, contiguous, chunked
-- Chunk indices: v1 B-tree, single chunk, unfiltered v4 implicit, v4 fixed array, direct-block v4 extensible array, and v4 v2-B-tree including internal nodes. Extensible-array spillover blocks are parsed from metadata but not yet readable.
-- Filters: deflate, shuffle, fletcher32, LZF, and optional Blosc. NBit, ScaleOffset, SZip, and unknown filters return `Unsupported` for reads.
+- Chunk indices: v1 B-tree, single chunk, unfiltered v4 implicit, v4 fixed array, v4 extensible array including data/super-block spillover, and v4 v2-B-tree including internal nodes.
+- Virtual datasets with serialized all-selection or regular hyperslab source and destination selections.
+- Filters: deflate, shuffle, fletcher32, LZF, NBit, ScaleOffset, and optional Blosc. SZip and unknown filters return `Unsupported` for reads.
 - All primitive types (i8-i64, u8-u64, f32, f64) with automatic big-endian byte-swap
 - Compound and enum datatypes
 - Raw compound field extraction and recursive compound field values for non-primitive member payloads
@@ -111,7 +112,7 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 **Other:**
 - `#[derive(H5Type)]` for user-defined structs and enums
-- `MutableFile::open_rw()` for limited in-place dataset resizing. New chunk-index entries are not yet written.
+- `MutableFile::open_rw()` for limited in-place dataset resizing, v1 chunk B-tree append/replace/rebuild, and existing v4 fixed-array chunk replacement.
 - Property list queries (`ds.create_plist()`)
 - Most checked-in C-library reference files parse successfully; the exact count is enforced by tests rather than treated as a general compatibility guarantee.
 - Zero panics on corrupt/malformed files (CVE regression tested)
@@ -154,7 +155,7 @@ struct Measurement {
 
 ## Test Suite
 
-269 tests covering:
+294 tests covering:
 - Selected C library reference files and generated fixtures
 - All primitive types, compound, enum, strings
 - All storage layouts and filter combinations

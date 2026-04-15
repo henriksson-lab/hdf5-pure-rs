@@ -65,6 +65,153 @@ fn test_resize_chunked_dataset() {
 }
 
 #[test]
+fn test_resize_then_write_appended_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_write_chunk.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[10])
+            .chunk(&[5])
+            .resizable()
+            .write::<i32>(&(0..10).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[15]).unwrap();
+        let chunk: Vec<i32> = (10..15).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("data", &[10], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        assert_eq!(vals, (0..15).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn test_write_chunk_replaces_existing_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_chunk.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[10])
+            .chunk(&[5])
+            .resizable()
+            .write::<i32>(&(0..10).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (100..105).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("data", &[5], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4, 100, 101, 102, 103, 104]);
+    }
+}
+
+#[test]
+fn test_write_chunk_splits_full_v1_btree_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split_full_chunk_btree.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[320])
+            .chunk(&[5])
+            .resizable()
+            .write::<i32>(&(0..320).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[325]).unwrap();
+        let chunk: Vec<i32> = (320..325).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("data", &[320], bytes).unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[330]).unwrap();
+        let chunk: Vec<i32> = (325..330).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("data", &[325], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        assert_eq!(vals, (0..330).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn test_write_chunk_replaces_existing_v4_fixed_array_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_v4_fixed_array.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_fixed_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (1000..1010).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("fixed_array", &[0], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("fixed_array").unwrap().read::<i32>().unwrap();
+        let mut expected: Vec<i32> = (0..100).collect();
+        expected[..10].copy_from_slice(&(1000..1010).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+}
+
+#[test]
 fn test_resize_non_chunked_fails() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resize_nonchunked.h5");

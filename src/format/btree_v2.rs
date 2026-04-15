@@ -111,6 +111,7 @@ pub fn collect_all_records<R: Read + Seek>(
 #[derive(Debug, Clone)]
 struct NodeInfo {
     max_nrec: usize,
+    cum_max_nrec: u64,
     cum_max_nrec_size: usize,
 }
 
@@ -132,6 +133,7 @@ fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<N
     let mut node_info = Vec::with_capacity(header.depth as usize + 1);
     node_info.push(NodeInfo {
         max_nrec: leaf_max,
+        cum_max_nrec: leaf_max as u64,
         cum_max_nrec_size: 0,
     });
 
@@ -151,10 +153,11 @@ fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<N
             ));
         }
 
-        let prev_cum = node_info[depth - 1].max_nrec as u64;
+        let prev_cum = node_info[depth - 1].cum_max_nrec;
         let cum_max_nrec = ((max_nrec as u64 + 1) * prev_cum) + max_nrec as u64;
         node_info.push(NodeInfo {
             max_nrec,
+            cum_max_nrec,
             cum_max_nrec_size: bytes_needed(cum_max_nrec),
         });
     }

@@ -47,13 +47,9 @@ impl FilterPipelineMessage {
         if let Ok(message) = &result {
             let mut th = tracehash::th_call!("hdf5.filter_pipeline.decode");
             th.input_bytes(data);
+            th.output_bool(true);
             th.output_u64(message.version as u64);
             th.output_u64(message.filters.len() as u64);
-            for filter in &message.filters {
-                th.output_u64(filter.id as u64);
-                th.output_u64(filter.flags as u64);
-                th.output_u64(filter.client_data.len() as u64);
-            }
             th.finish();
         }
 
@@ -62,25 +58,20 @@ impl FilterPipelineMessage {
 
     fn decode_v1(data: &[u8], nfilters: usize) -> Result<Self> {
         // v1: version(1) + nfilters(1) + reserved(6)
+        ensure_available(data, 0, 8, "filter pipeline v1 header")?;
         let mut pos = 8;
         let mut filters = Vec::with_capacity(nfilters);
 
         for _ in 0..nfilters {
-            if pos + 8 > data.len() {
-                break;
-            }
-
-            let id = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
-            let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            let flags = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
-            let cd_nelmts = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
+            let id = read_u16_le(data, &mut pos, "filter pipeline v1 filter id")?;
+            let name_len = read_u16_le(data, &mut pos, "filter pipeline v1 name length")? as usize;
+            let flags = read_u16_le(data, &mut pos, "filter pipeline v1 flags")?;
+            let cd_nelmts =
+                read_u16_le(data, &mut pos, "filter pipeline v1 client data count")? as usize;
 
             // Name (null-terminated, padded to 8-byte boundary)
             let name = if name_len > 0 {
+                ensure_available(data, pos, name_len, "filter pipeline v1 name")?;
                 let name_end = pos + name_len;
                 let null_pos = data[pos..name_end]
                     .iter()
@@ -89,6 +80,7 @@ impl FilterPipelineMessage {
                 let n = String::from_utf8_lossy(&data[pos..pos + null_pos]).to_string();
                 // Pad to 8-byte boundary
                 let padded = (name_len + 7) & !7;
+                ensure_available(data, pos, padded, "filter pipeline v1 padded name")?;
                 pos += padded;
                 Some(n)
             } else {
@@ -98,14 +90,13 @@ impl FilterPipelineMessage {
             // Client data values
             let mut client_data = Vec::with_capacity(cd_nelmts);
             for _ in 0..cd_nelmts {
-                let val =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                pos += 4;
+                let val = read_u32_le(data, &mut pos, "filter pipeline v1 client data")?;
                 client_data.push(val);
             }
 
             // Pad cd_nelmts to even number in v1
             if cd_nelmts % 2 != 0 {
+                ensure_available(data, pos, 4, "filter pipeline v1 client data padding")?;
                 pos += 4;
             }
 
@@ -129,18 +120,14 @@ impl FilterPipelineMessage {
         let mut filters = Vec::with_capacity(nfilters);
 
         for _ in 0..nfilters {
-            if pos + 2 > data.len() {
-                break;
-            }
-
-            let id = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
+            let id = read_u16_le(data, &mut pos, "filter pipeline v2 filter id")?;
 
             // v2: name_length and name are OMITTED for known filter IDs (< 256)
             let name = if id >= 256 {
-                let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2;
+                let name_len =
+                    read_u16_le(data, &mut pos, "filter pipeline v2 name length")? as usize;
                 if name_len > 0 {
+                    ensure_available(data, pos, name_len, "filter pipeline v2 name")?;
                     let null_pos = data[pos..pos + name_len]
                         .iter()
                         .position(|&b| b == 0)
@@ -155,16 +142,13 @@ impl FilterPipelineMessage {
                 None
             };
 
-            let flags = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            pos += 2;
-            let cd_nelmts = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
+            let flags = read_u16_le(data, &mut pos, "filter pipeline v2 flags")?;
+            let cd_nelmts =
+                read_u16_le(data, &mut pos, "filter pipeline v2 client data count")? as usize;
 
             let mut client_data = Vec::with_capacity(cd_nelmts);
             for _ in 0..cd_nelmts {
-                let val =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                pos += 4;
+                let val = read_u32_le(data, &mut pos, "filter pipeline v2 client data")?;
                 client_data.push(val);
             }
 
@@ -181,4 +165,28 @@ impl FilterPipelineMessage {
             filters,
         })
     }
+}
+
+fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
+    if end > data.len() {
+        return Err(Error::InvalidFormat(format!("{context} is truncated")));
+    }
+    Ok(())
+}
+
+fn read_u16_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u16> {
+    ensure_available(data, *pos, 2, context)?;
+    let value = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+    *pos += 2;
+    Ok(value)
+}
+
+fn read_u32_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u32> {
+    ensure_available(data, *pos, 4, context)?;
+    let value = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+    *pos += 4;
+    Ok(value)
 }

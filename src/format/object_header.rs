@@ -52,6 +52,8 @@ pub struct RawMessage {
     pub flags: u8,
     /// Creation order index (v2 only, if tracked).
     pub creation_index: Option<u16>,
+    /// Object header chunk this message was read from.
+    pub chunk_index: u16,
     /// Raw message data bytes.
     pub data: Vec<u8>,
 }
@@ -100,13 +102,18 @@ impl ObjectHeader {
 
         #[cfg(feature = "tracehash")]
         if let Ok(header) = &result {
+            let traced_messages: Vec<_> = header
+                .messages
+                .iter()
+                .filter(|message| message.chunk_index == 0)
+                .collect();
             let mut th = tracehash::th_call!("hdf5.object_header.read");
             th.input_u64(addr);
             th.output_u64(header.version as u64);
             th.output_u64(header.flags as u64);
             th.output_u64(header.refcount as u64);
-            th.output_u64(header.messages.len() as u64);
-            for message in &header.messages {
+            th.output_u64(traced_messages.len() as u64);
+            for message in traced_messages {
                 th.output_u64(message.msg_type as u64);
                 th.output_u64(message.data.len() as u64);
             }
@@ -150,11 +157,12 @@ impl ObjectHeader {
             num_messages,
             &mut messages,
             &mut continuations,
+            0,
         )?;
 
         // Process continuation chunks
         for (cont_addr, cont_len) in continuations {
-            Self::read_v1_continuation(reader, cont_addr, cont_len, &mut messages)?;
+            Self::read_v1_continuation(reader, cont_addr, cont_len, &mut messages, 1)?;
         }
 
         Ok(ObjectHeader {
@@ -177,6 +185,7 @@ impl ObjectHeader {
         _num_messages: u16,
         messages: &mut Vec<RawMessage>,
         continuations: &mut Vec<(u64, u64)>,
+        chunk_index: u16,
     ) -> Result<()> {
         while reader.position()? < chunk_end {
             let pos = reader.position()?;
@@ -222,6 +231,7 @@ impl ObjectHeader {
                 msg_type,
                 flags: msg_flags,
                 creation_index: None,
+                chunk_index,
                 data,
             });
         }
@@ -234,16 +244,24 @@ impl ObjectHeader {
         addr: u64,
         length: u64,
         messages: &mut Vec<RawMessage>,
+        chunk_index: u16,
     ) -> Result<()> {
         reader.seek(addr)?;
 
         // V1 continuation chunks are just raw messages, no header.
         let chunk_end = addr + length;
         let mut continuations = Vec::new();
-        Self::read_v1_messages(reader, chunk_end, 0, messages, &mut continuations)?;
+        Self::read_v1_messages(
+            reader,
+            chunk_end,
+            0,
+            messages,
+            &mut continuations,
+            chunk_index,
+        )?;
 
         for (cont_addr, cont_len) in continuations {
-            Self::read_v1_continuation(reader, cont_addr, cont_len, messages)?;
+            Self::read_v1_continuation(reader, cont_addr, cont_len, messages, chunk_index + 1)?;
         }
 
         Ok(())
@@ -318,11 +336,19 @@ impl ObjectHeader {
             has_crt_order,
             &mut messages,
             &mut continuations,
+            0,
         )?;
 
         // Process continuation chunks
         for (cont_addr, cont_len) in continuations {
-            Self::read_v2_continuation(reader, cont_addr, cont_len, has_crt_order, &mut messages)?;
+            Self::read_v2_continuation(
+                reader,
+                cont_addr,
+                cont_len,
+                has_crt_order,
+                &mut messages,
+                1,
+            )?;
         }
 
         Ok(ObjectHeader {
@@ -345,6 +371,7 @@ impl ObjectHeader {
         has_crt_order: bool,
         messages: &mut Vec<RawMessage>,
         continuations: &mut Vec<(u64, u64)>,
+        chunk_index: u16,
     ) -> Result<()> {
         while reader.position()? < chunk_data_end {
             let pos = reader.position()?;
@@ -385,6 +412,7 @@ impl ObjectHeader {
                 msg_type,
                 flags: msg_flags,
                 creation_index,
+                chunk_index,
                 data,
             });
         }
@@ -398,6 +426,7 @@ impl ObjectHeader {
         length: u64,
         has_crt_order: bool,
         messages: &mut Vec<RawMessage>,
+        chunk_index: u16,
     ) -> Result<()> {
         reader.seek(addr)?;
 
@@ -420,6 +449,7 @@ impl ObjectHeader {
             has_crt_order,
             messages,
             &mut continuations,
+            chunk_index,
         )?;
 
         // Verify checksum
@@ -438,7 +468,14 @@ impl ObjectHeader {
 
         // Process nested continuations
         for (cont_addr, cont_len) in continuations {
-            Self::read_v2_continuation(reader, cont_addr, cont_len, has_crt_order, messages)?;
+            Self::read_v2_continuation(
+                reader,
+                cont_addr,
+                cont_len,
+                has_crt_order,
+                messages,
+                chunk_index + 1,
+            )?;
         }
 
         Ok(())

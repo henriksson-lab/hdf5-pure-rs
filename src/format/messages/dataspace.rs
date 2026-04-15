@@ -53,15 +53,21 @@ impl DataspaceMessage {
     }
 
     fn decode_v1(data: &[u8], ndims: u8) -> Result<Self> {
+        ensure_available(data, 0, 8, "dataspace v1 header")?;
         let flags = data[2];
         // v1: reserved bytes [3..8], then dimensions
         let has_max = flags & 0x01 != 0;
 
         let mut pos = 8; // skip 5 reserved bytes after version(1)+ndims(1)+flags(1)
 
-        let dims = read_dims(data, &mut pos, ndims as usize);
+        let dims = read_dims(data, &mut pos, ndims as usize, "dataspace v1 dimensions")?;
         let max_dims = if has_max {
-            Some(read_dims(data, &mut pos, ndims as usize))
+            Some(read_dims(
+                data,
+                &mut pos,
+                ndims as usize,
+                "dataspace v1 max dimensions",
+            )?)
         } else {
             None
         };
@@ -102,9 +108,14 @@ impl DataspaceMessage {
         let has_max = flags & 0x01 != 0;
         let mut pos = 4;
 
-        let dims = read_dims(data, &mut pos, ndims as usize);
+        let dims = read_dims(data, &mut pos, ndims as usize, "dataspace v2 dimensions")?;
         let max_dims = if has_max {
-            Some(read_dims(data, &mut pos, ndims as usize))
+            Some(read_dims(
+                data,
+                &mut pos,
+                ndims as usize,
+                "dataspace v2 max dimensions",
+            )?)
         } else {
             None
         };
@@ -119,23 +130,36 @@ impl DataspaceMessage {
     }
 }
 
-fn read_dims(data: &[u8], pos: &mut usize, count: usize) -> Vec<u64> {
+fn read_dims(data: &[u8], pos: &mut usize, count: usize, context: &str) -> Result<Vec<u64>> {
     let mut dims = Vec::with_capacity(count);
     for _ in 0..count {
-        if *pos + 8 > data.len() {
-            break;
-        }
-        let val = read_le_u64(&data[*pos..], 8);
-        *pos += 8;
+        let val = read_le_u64(data, pos, 8, context)?;
         dims.push(val);
     }
-    dims
+    Ok(dims)
 }
 
-fn read_le_u64(data: &[u8], size: usize) -> u64 {
-    let mut val = 0u64;
-    for i in 0..size.min(data.len()).min(8) {
-        val |= (data[i] as u64) << (i * 8);
+fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
+    if end > data.len() {
+        return Err(Error::InvalidFormat(format!("{context} is truncated")));
     }
-    val
+    Ok(())
+}
+
+fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Result<u64> {
+    if !(1..=8).contains(&size) {
+        return Err(Error::InvalidFormat(format!(
+            "{context} has invalid byte width {size}"
+        )));
+    }
+    ensure_available(data, *pos, size, context)?;
+    let mut val = 0u64;
+    for i in 0..size {
+        val |= (data[*pos + i] as u64) << (i * 8);
+    }
+    *pos += size;
+    Ok(val)
 }

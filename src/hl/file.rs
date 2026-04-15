@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufReader, Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -28,6 +28,7 @@ pub enum ObjectType {
 pub(crate) struct FileInner<R: Read + Seek> {
     pub reader: HdfReader<R>,
     pub superblock: Superblock,
+    pub path: Option<PathBuf>,
 }
 
 /// An open HDF5 file.
@@ -54,6 +55,7 @@ impl File {
         let inner = Arc::new(Mutex::new(FileInner {
             reader,
             superblock: superblock.clone(),
+            path: Some(path.as_ref().to_path_buf()),
         }));
 
         Ok(File { inner, superblock })
@@ -62,6 +64,11 @@ impl File {
     /// Get the superblock.
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    #[cfg(feature = "tracehash")]
+    pub(crate) fn inner_arc(&self) -> Arc<Mutex<FileInner<BufReader<fs::File>>>> {
+        self.inner.clone()
     }
 
     /// Get the root group.

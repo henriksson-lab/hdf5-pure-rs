@@ -55,8 +55,12 @@ impl DatasetCreate {
             layout: info.layout.layout_class,
             chunk_dims: info.layout.chunk_dims,
             filters,
-            fill_value_defined: false,
-            fill_value: None,
+            fill_value_defined: info
+                .fill_value
+                .as_ref()
+                .map(|fill| fill.defined)
+                .unwrap_or(false),
+            fill_value: info.fill_value.and_then(|fill| fill.value),
         })
     }
 

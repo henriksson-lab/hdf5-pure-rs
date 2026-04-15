@@ -34,9 +34,19 @@ impl FillValueMessage {
         }
 
         let defined = data[3] != 0;
-        let value = if defined && data.len() > 4 {
+        let value = if defined {
+            if data.len() < 8 {
+                return Err(Error::InvalidFormat(
+                    "fill value v2 missing value size".into(),
+                ));
+            }
             let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-            if size > 0 && data.len() >= 8 + size {
+            if data.len() < 8 + size {
+                return Err(Error::InvalidFormat(
+                    "fill value v2 value is truncated".into(),
+                ));
+            }
+            if size > 0 {
                 Some(data[8..8 + size].to_vec())
             } else {
                 None
@@ -61,9 +71,19 @@ impl FillValueMessage {
         let flags = data[1];
         let defined = flags & 0x20 != 0 || flags & 0x04 != 0;
 
-        let value = if flags & 0x20 != 0 && data.len() > 2 {
+        let value = if flags & 0x20 != 0 {
+            if data.len() < 6 {
+                return Err(Error::InvalidFormat(
+                    "fill value v3 missing value size".into(),
+                ));
+            }
             let size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
-            if size > 0 && data.len() >= 6 + size {
+            if data.len() < 6 + size {
+                return Err(Error::InvalidFormat(
+                    "fill value v3 value is truncated".into(),
+                ));
+            }
+            if size > 0 {
                 Some(data[6..6 + size].to_vec())
             } else {
                 None
@@ -86,7 +106,10 @@ impl FillValueMessage {
         }
 
         let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let value = if size > 0 && data.len() >= 4 + size {
+        let value = if size > 0 {
+            if data.len() < 4 + size {
+                return Err(Error::InvalidFormat("old fill value is truncated".into()));
+            }
             Some(data[4..4 + size].to_vec())
         } else {
             None

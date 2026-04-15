@@ -26,6 +26,16 @@ fn test_dataset_create_plist_chunked_compressed() {
 }
 
 #[test]
+fn test_dataset_create_plist_fill_value() {
+    let f = File::open("tests/data/hdf5_ref/sparse_chunked_fill_value.h5").unwrap();
+    let ds = f.dataset("sparse_chunked_fill").unwrap();
+    let plist = ds.create_plist().unwrap();
+
+    assert!(plist.fill_value_defined);
+    assert_eq!(plist.fill_value, Some((-7i32).to_le_bytes().to_vec()));
+}
+
+#[test]
 fn test_file_create_plist() {
     use hdf5_pure_rust::hl::plist::file_create::FileCreate;
 

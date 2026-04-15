@@ -49,6 +49,16 @@ fn t9c_fractal_heap_dense_links() {
 }
 
 #[test]
+fn t9c_fractal_heap_modern_dense_links() {
+    let f = File::open("tests/data/hdf5_ref/fractal_heap_modern.h5").unwrap();
+    let group = f.group("many_links").unwrap();
+    let names = group.member_names().unwrap();
+    assert_eq!(names.len(), 80);
+    assert!(names.contains(&"link_000".to_string()));
+    assert!(names.contains(&"link_079".to_string()));
+}
+
+#[test]
 fn t9c_fractal_heap_dense_attrs() {
     // dense_attrs.h5 has the "data" dataset via inline link
     let f = File::open("tests/data/dense_attrs.h5").unwrap();

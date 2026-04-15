@@ -200,16 +200,73 @@ fn postprocess_integer(
 }
 
 fn postprocess_float(
-    _out: &mut [u8],
-    _size: usize,
-    _order: u32,
-    _minbits: usize,
-    _minval: u128,
-    _client_data: &[u32],
+    out: &mut [u8],
+    size: usize,
+    order: u32,
+    minbits: usize,
+    minval: u128,
+    client_data: &[u32],
 ) -> Result<()> {
-    Err(Error::Unsupported(
-        "scaleoffset floating-point reconstruction is not implemented".into(),
-    ))
+    let scale = client_data
+        .get(1)
+        .copied()
+        .ok_or_else(|| Error::InvalidFormat("scaleoffset missing scale factor".into()))?
+        as i32;
+    let divisor = 10f64.powi(scale);
+    let marker = if minbits > 0 && minbits < 128 {
+        Some((1u128 << minbits) - 1)
+    } else {
+        None
+    };
+    let fill = if client_data.get(PARM_FILAVAIL).copied().unwrap_or(0) != 0 {
+        Some(read_fill_value(client_data, size, order))
+    } else {
+        None
+    };
+
+    match size {
+        4 => {
+            let min = f32::from_le_bytes((minval as u32).to_le_bytes()) as f64;
+            let fill = fill.map(|v| f32::from_le_bytes((v as u32).to_le_bytes()));
+            for chunk in out.chunks_exact_mut(size) {
+                let packed = read_uint(chunk, order);
+                let value = if let (Some(marker), Some(fill)) = (marker, fill) {
+                    if packed == marker {
+                        fill
+                    } else {
+                        (packed as i64 as f64 / divisor + min) as f32
+                    }
+                } else {
+                    (packed as i64 as f64 / divisor + min) as f32
+                };
+                write_float32(chunk, order, value);
+            }
+        }
+        8 => {
+            let min = f64::from_le_bytes((minval as u64).to_le_bytes());
+            let fill = fill.map(|v| f64::from_le_bytes((v as u64).to_le_bytes()));
+            for chunk in out.chunks_exact_mut(size) {
+                let packed = read_uint(chunk, order);
+                let value = if let (Some(marker), Some(fill)) = (marker, fill) {
+                    if packed == marker {
+                        fill
+                    } else {
+                        packed as i64 as f64 / divisor + min
+                    }
+                } else {
+                    packed as i64 as f64 / divisor + min
+                };
+                write_float64(chunk, order, value);
+            }
+        }
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "scaleoffset floating-point size {size}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn read_uint(bytes: &[u8], order: u32) -> u128 {
@@ -260,6 +317,24 @@ fn read_fill_value(client_data: &[u32], size: usize, order: u32) -> u128 {
         }
     }
     read_uint(&raw, order)
+}
+
+fn write_float32(bytes: &mut [u8], order: u32, value: f32) {
+    let raw = if order == ORDER_LE {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    };
+    bytes[..4].copy_from_slice(&raw);
+}
+
+fn write_float64(bytes: &mut [u8], order: u32, value: f64) {
+    let raw = if order == ORDER_LE {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    };
+    bytes[..8].copy_from_slice(&raw);
 }
 
 struct BitStream<'a> {

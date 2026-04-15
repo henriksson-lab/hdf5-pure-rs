@@ -20,11 +20,62 @@ pub fn apply_pipeline_reverse(
     pipeline: &FilterPipelineMessage,
     element_size: usize,
 ) -> Result<Vec<u8>> {
+    apply_pipeline_reverse_with_mask(data, pipeline, element_size, 0)
+}
+
+/// Apply filter pipeline in reverse while honoring an HDF5 per-chunk filter mask.
+/// Bit `i` set means filter `i` in the stored pipeline was not applied to the chunk.
+pub fn apply_pipeline_reverse_with_mask(
+    data: &[u8],
+    pipeline: &FilterPipelineMessage,
+    element_size: usize,
+    filter_mask: u32,
+) -> Result<Vec<u8>> {
+    if pipeline.filters.len() > u32::BITS as usize {
+        return Err(Error::InvalidFormat(format!(
+            "filter pipeline length {} exceeds 32-bit chunk filter mask",
+            pipeline.filters.len()
+        )));
+    }
+
+    let valid_mask = if pipeline.filters.len() >= u32::BITS as usize {
+        u32::MAX
+    } else {
+        (1u32 << pipeline.filters.len()) - 1
+    };
+    if filter_mask & !valid_mask != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "filter mask {filter_mask:#x} references filters outside pipeline length {}",
+            pipeline.filters.len()
+        )));
+    }
+
+    #[cfg(feature = "tracehash")]
+    let mut th = {
+        let mut th = tracehash::th_call!("hdf5.filter_pipeline.apply");
+        th.input_u64(pipeline.filters.len() as u64);
+        th.input_u64(0x0100);
+        th.input_u64(filter_mask as u64);
+        th.input_u64(data.len() as u64);
+        th
+    };
+
     let mut buf = data.to_vec();
 
     // Apply filters in reverse order
-    for filter in pipeline.filters.iter().rev() {
+    for (index, filter) in pipeline.filters.iter().enumerate().rev() {
+        if filter_mask & (1u32 << index) != 0 {
+            continue;
+        }
         buf = apply_filter_reverse(&buf, filter, element_size)?;
+    }
+
+    #[cfg(feature = "tracehash")]
+    {
+        th.output_bool(true);
+        th.output_u64(0);
+        th.output_u64(buf.len() as u64);
+        th.finish();
     }
 
     Ok(buf)

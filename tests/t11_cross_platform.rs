@@ -59,6 +59,31 @@ fn t11b_old_fill_values() {
     let f = File::open(&format!("{REF_DIR}/fill_old.h5")).unwrap();
     let names = f.member_names().unwrap();
     println!("fill_old members: {names:?}");
+    assert_eq!(names, vec!["dset1".to_string(), "dset2".to_string()]);
+
+    let vals: Vec<i32> = f.dataset("dset2").unwrap().read::<i32>().unwrap();
+    assert_eq!(vals, vec![4444; 8 * 8]);
+}
+
+#[test]
+fn t11b_old_fill_value_create_plist() {
+    let f = File::open(&format!("{REF_DIR}/fill_old.h5")).unwrap();
+    let plist = f.dataset("dset2").unwrap().create_plist().unwrap();
+
+    assert!(plist.fill_value_defined);
+    assert_eq!(plist.fill_value, Some(4444i32.to_be_bytes().to_vec()));
+}
+
+#[test]
+fn t11b_chunked_fill18_values() {
+    let f = File::open(&format!("{REF_DIR}/fill18.h5")).unwrap();
+    let vals: Vec<i32> = f.dataset("DS1").unwrap().read::<i32>().unwrap();
+    let expected = vec![
+        0, -1, -2, -3, -4, -5, -6, 99, 99, 99, 0, 0, 0, 0, 0, 0, 0, 99, 99, 99, 0, 1, 2, 3, 4, 5,
+        6, 99, 99, 99, 0, 2, 4, 6, 8, 10, 12, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    ];
+    assert_eq!(vals, expected);
 }
 
 #[test]
