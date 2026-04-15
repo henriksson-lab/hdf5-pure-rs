@@ -21,7 +21,7 @@ This translation is not endored by the HDF5 group. Issues related to this transl
 
 ```toml
 [dependencies]
-hdf5-pure-rust = "0.1"
+hdf5-pure-rust = "0.2.2"
 ```
 
 ## Quick Start
