@@ -42,7 +42,9 @@ impl FractalHeapHeader {
 
         let version = reader.read_u8()?;
         if version != 0 {
-            return Err(Error::Unsupported(format!("fractal heap version {version}")));
+            return Err(Error::Unsupported(format!(
+                "fractal heap version {version}"
+            )));
         }
 
         let heap_id_len = reader.read_u16()?;
@@ -51,30 +53,30 @@ impl FractalHeapHeader {
 
         // "Huge" object info
         let max_managed_obj_size = reader.read_u32()?;
-        let _next_huge_id = reader.read_length()?;        // sizeof_size
-        let _huge_btree_addr = reader.read_addr()?;       // sizeof_addr
+        let _next_huge_id = reader.read_length()?; // sizeof_size
+        let _huge_btree_addr = reader.read_addr()?; // sizeof_addr
 
         // Managed free space
-        let _total_man_free = reader.read_length()?;       // sizeof_size
-        let _fs_addr = reader.read_addr()?;                // sizeof_addr
+        let _total_man_free = reader.read_length()?; // sizeof_size
+        let _fs_addr = reader.read_addr()?; // sizeof_addr
 
         // Heap statistics
-        let _man_size = reader.read_length()?;             // sizeof_size
-        let _man_alloc_size = reader.read_length()?;       // sizeof_size
-        let _man_iter_off = reader.read_length()?;         // sizeof_size
-        let num_managed_objects = reader.read_length()?;   // sizeof_size
-        let _huge_size = reader.read_length()?;            // sizeof_size
-        let _huge_nobjs = reader.read_length()?;           // sizeof_size
-        let _tiny_size = reader.read_length()?;            // sizeof_size
-        let _tiny_nobjs = reader.read_length()?;           // sizeof_size
+        let _man_size = reader.read_length()?; // sizeof_size
+        let _man_alloc_size = reader.read_length()?; // sizeof_size
+        let _man_iter_off = reader.read_length()?; // sizeof_size
+        let num_managed_objects = reader.read_length()?; // sizeof_size
+        let _huge_size = reader.read_length()?; // sizeof_size
+        let _huge_nobjs = reader.read_length()?; // sizeof_size
+        let _tiny_size = reader.read_length()?; // sizeof_size
+        let _tiny_nobjs = reader.read_length()?; // sizeof_size
 
         // Doubling table info
         let table_width = reader.read_u16()?;
-        let start_block_size = reader.read_length()?;      // sizeof_size
-        let max_direct_block_size = reader.read_length()?;  // sizeof_size
+        let start_block_size = reader.read_length()?; // sizeof_size
+        let max_direct_block_size = reader.read_length()?; // sizeof_size
         let max_heap_size = reader.read_u16()?;
         let start_root_rows = reader.read_u16()?;
-        let root_block_addr = reader.read_addr()?;         // sizeof_addr
+        let root_block_addr = reader.read_addr()?; // sizeof_addr
         let current_root_rows = reader.read_u16()?;
 
         let has_checksum = flags & 0x02 != 0;
@@ -112,6 +114,12 @@ impl FractalHeapHeader {
         reader: &mut HdfReader<R>,
         heap_id: &[u8],
     ) -> Result<Vec<u8>> {
+        if self.io_filter_len > 0 {
+            return Err(Error::Unsupported(
+                "filtered fractal heaps are not implemented".into(),
+            ));
+        }
+
         if heap_id.is_empty() {
             return Err(Error::InvalidFormat("empty heap ID".into()));
         }
@@ -122,7 +130,9 @@ impl FractalHeapHeader {
             0 => self.read_managed(reader, heap_id),
             1 => Err(Error::Unsupported("huge objects in fractal heap".into())),
             2 => self.read_tiny(heap_id),
-            _ => Err(Error::InvalidFormat(format!("unknown heap ID type {id_type}"))),
+            _ => Err(Error::InvalidFormat(format!(
+                "unknown heap ID type {id_type}"
+            ))),
         }
     }
 
@@ -187,7 +197,9 @@ impl FractalHeapHeader {
 
         let magic = reader.read_bytes(4)?;
         if magic != FHIB_MAGIC {
-            return Err(Error::InvalidFormat("invalid fractal heap indirect block magic".into()));
+            return Err(Error::InvalidFormat(
+                "invalid fractal heap indirect block magic".into(),
+            ));
         }
 
         let _version = reader.read_u8()?;
@@ -202,7 +214,8 @@ impl FractalHeapHeader {
         let mut current_heap_offset = 0u64;
 
         // Calculate the block size overhead for a direct block
-        let dblock_header_size = 5 + reader.sizeof_addr() as u64
+        let dblock_header_size = 5
+            + reader.sizeof_addr() as u64
             + block_offset_bytes as u64
             + if self.has_checksum { 4 } else { 0 };
 

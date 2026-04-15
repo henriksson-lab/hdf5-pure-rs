@@ -6,7 +6,7 @@ name = "hdf5-pure-rust"
 version = "0.2.2"
 edition = "2021"
 description = "Pure Rust implementation of the HDF5 file format. No C dependencies."
-license = "MIT OR Apache-2.0"
+license = "BSD-3-Clause"
 repository = "https://github.com/henriksson-lab/hdf5-pure-rs"
 homepage = "https://github.com/henriksson-lab/hdf5-pure-rs"
 include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/Cargo.toml", "/README.md", "/LICENSE-*"]
@@ -19,11 +19,13 @@ parking_lot = "0.12"
 ndarray = "0.15"
 hdf5-pure-rust-derive = { version = "0.2", path = "derive", optional = true }
 blosc2-pure-rs = { version = "0.2", optional = true }
+tracehash = { path = "tools/tracehash", optional = true }
 
 [features]
 default = ["derive"]
 derive = ["dep:hdf5-pure-rust-derive"]
 blosc = ["dep:blosc2-pure-rs"]
+tracehash = ["dep:tracehash"]
 
 [[bench]]
 name = "benchmark"

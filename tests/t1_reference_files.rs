@@ -27,28 +27,44 @@ fn try_open(filename: &str) -> Result<(), String> {
 // =============================================================
 
 #[test]
-fn t1a_filespace_1_6() { assert!(try_open("filespace_1_6.h5").is_ok()); }
+fn t1a_filespace_1_6() {
+    assert!(try_open("filespace_1_6.h5").is_ok());
+}
 
 #[test]
-fn t1a_filespace_1_8() { assert!(try_open("filespace_1_8.h5").is_ok()); }
+fn t1a_filespace_1_8() {
+    assert!(try_open("filespace_1_8.h5").is_ok());
+}
 
 #[test]
-fn t1a_paged_nopersist() { assert!(try_open("paged_nopersist.h5").is_ok()); }
+fn t1a_paged_nopersist() {
+    assert!(try_open("paged_nopersist.h5").is_ok());
+}
 
 #[test]
-fn t1a_paged_persist() { assert!(try_open("paged_persist.h5").is_ok()); }
+fn t1a_paged_persist() {
+    assert!(try_open("paged_persist.h5").is_ok());
+}
 
 #[test]
-fn t1a_fsm_aggr_nopersist() { assert!(try_open("fsm_aggr_nopersist.h5").is_ok()); }
+fn t1a_fsm_aggr_nopersist() {
+    assert!(try_open("fsm_aggr_nopersist.h5").is_ok());
+}
 
 #[test]
-fn t1a_fsm_aggr_persist() { assert!(try_open("fsm_aggr_persist.h5").is_ok()); }
+fn t1a_fsm_aggr_persist() {
+    assert!(try_open("fsm_aggr_persist.h5").is_ok());
+}
 
 #[test]
-fn t1a_aggr() { assert!(try_open("aggr.h5").is_ok()); }
+fn t1a_aggr() {
+    assert!(try_open("aggr.h5").is_ok());
+}
 
 #[test]
-fn t1a_tarrold() { assert!(try_open("tarrold.h5").is_ok()); }
+fn t1a_tarrold() {
+    assert!(try_open("tarrold.h5").is_ok());
+}
 
 // =============================================================
 // T1b: Groups & links
@@ -64,19 +80,29 @@ fn t1b_group_old() {
 }
 
 #[test]
-fn t1b_be_extlink1() { assert!(try_open("be_extlink1.h5").is_ok()); }
+fn t1b_be_extlink1() {
+    assert!(try_open("be_extlink1.h5").is_ok());
+}
 
 #[test]
-fn t1b_be_extlink2() { assert!(try_open("be_extlink2.h5").is_ok()); }
+fn t1b_be_extlink2() {
+    assert!(try_open("be_extlink2.h5").is_ok());
+}
 
 #[test]
-fn t1b_le_extlink1() { assert!(try_open("le_extlink1.h5").is_ok()); }
+fn t1b_le_extlink1() {
+    assert!(try_open("le_extlink1.h5").is_ok());
+}
 
 #[test]
-fn t1b_le_extlink2() { assert!(try_open("le_extlink2.h5").is_ok()); }
+fn t1b_le_extlink2() {
+    assert!(try_open("le_extlink2.h5").is_ok());
+}
 
 #[test]
-fn t1b_mergemsg() { assert!(try_open("mergemsg.h5").is_ok()); }
+fn t1b_mergemsg() {
+    assert!(try_open("mergemsg.h5").is_ok());
+}
 
 // =============================================================
 // T1c: Datatypes
@@ -89,20 +115,28 @@ fn t1c_charsets() {
 }
 
 #[test]
-fn t1c_tnullspace() { assert!(try_open("tnullspace.h5").is_ok()); }
+fn t1c_tnullspace() {
+    assert!(try_open("tnullspace.h5").is_ok());
+}
 
 // =============================================================
 // T1d: Fill values & layouts
 // =============================================================
 
 #[test]
-fn t1d_fill18() { assert!(try_open("fill18.h5").is_ok()); }
+fn t1d_fill18() {
+    assert!(try_open("fill18.h5").is_ok());
+}
 
 #[test]
-fn t1d_fill_old() { assert!(try_open("fill_old.h5").is_ok()); }
+fn t1d_fill_old() {
+    assert!(try_open("fill_old.h5").is_ok());
+}
 
 #[test]
-fn t1d_tlayouto() { assert!(try_open("tlayouto.h5").is_ok()); }
+fn t1d_tlayouto() {
+    assert!(try_open("tlayouto.h5").is_ok());
+}
 
 // =============================================================
 // T1e: Filters
@@ -115,26 +149,38 @@ fn t1e_deflate() {
 }
 
 #[test]
-fn t1e_test_filters_be() { assert!(try_open("test_filters_be.h5").is_ok()); }
+fn t1e_test_filters_be() {
+    assert!(try_open("test_filters_be.h5").is_ok());
+}
 
 #[test]
-fn t1e_test_filters_le() { assert!(try_open("test_filters_le.h5").is_ok()); }
+fn t1e_test_filters_le() {
+    assert!(try_open("test_filters_le.h5").is_ok());
+}
 
 #[test]
-fn t1e_noencoder() { assert!(try_open("noencoder.h5").is_ok()); }
+fn t1e_noencoder() {
+    assert!(try_open("noencoder.h5").is_ok());
+}
 
 #[test]
-fn t1e_filter_error() { assert!(try_open("filter_error.h5").is_ok()); }
+fn t1e_filter_error() {
+    assert!(try_open("filter_error.h5").is_ok());
+}
 
 // =============================================================
 // T1f: Chunk indexing
 // =============================================================
 
 #[test]
-fn t1f_btree_idx_1_6() { assert!(try_open("btree_idx_1_6.h5").is_ok()); }
+fn t1f_btree_idx_1_6() {
+    assert!(try_open("btree_idx_1_6.h5").is_ok());
+}
 
 #[test]
-fn t1f_btree_idx_1_8() { assert!(try_open("btree_idx_1_8.h5").is_ok()); }
+fn t1f_btree_idx_1_8() {
+    assert!(try_open("btree_idx_1_8.h5").is_ok());
+}
 
 // =============================================================
 // T1g: Endianness
@@ -157,17 +203,23 @@ fn t1g_le_data() {
 // =============================================================
 
 #[test]
-fn t1h_tmtimen() { assert!(try_open("tmtimen.h5").is_ok()); }
+fn t1h_tmtimen() {
+    assert!(try_open("tmtimen.h5").is_ok());
+}
 
 #[test]
-fn t1h_tmtimeo() { assert!(try_open("tmtimeo.h5").is_ok()); }
+fn t1h_tmtimeo() {
+    assert!(try_open("tmtimeo.h5").is_ok());
+}
 
 // =============================================================
 // T1i: Heap structures
 // =============================================================
 
 #[test]
-fn t1i_tsizeslheap() { assert!(try_open("tsizeslheap.h5").is_ok()); }
+fn t1i_tsizeslheap() {
+    assert!(try_open("tsizeslheap.h5").is_ok());
+}
 
 // =============================================================
 // All remaining reference files -- just verify open doesn't panic

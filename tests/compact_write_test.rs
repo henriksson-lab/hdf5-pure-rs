@@ -5,10 +5,11 @@ use hdf5_pure_rust::File;
 
 #[test]
 fn test_write_compact_dataset() {
-    let path = "tests/data/written_compact.h5";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_compact.h5");
 
     {
-        let f = fs::File::create(path).unwrap();
+        let f = fs::File::create(&path).unwrap();
         let mut w = HdfFileWriter::new(f);
         w.begin().unwrap();
         w.create_root_group().unwrap();
@@ -23,14 +24,15 @@ fn test_write_compact_dataset() {
                 dtype: DtypeSpec::U8,
                 data: &data,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         w.finalize().unwrap();
     }
 
     // Read back with pure-Rust
     {
-        let f = File::open(path).unwrap();
+        let f = File::open(&path).unwrap();
         let ds = f.dataset("small").unwrap();
         assert_eq!(ds.shape().unwrap(), vec![5]);
         let raw = ds.read_raw().unwrap();
@@ -39,14 +41,16 @@ fn test_write_compact_dataset() {
 
     // Verify with h5dump
     {
-        let out = std::process::Command::new("h5dump").arg(path).output();
+        let out = std::process::Command::new("h5dump").arg(&path).output();
         if let Ok(out) = out {
             let stdout = String::from_utf8_lossy(&out.stdout);
             println!("h5dump compact:\n{stdout}");
-            assert!(out.status.success(), "h5dump failed: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "h5dump failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             assert!(stdout.contains("1, 2, 3, 4, 5"));
         }
     }
-
-    fs::remove_file(path).ok();
 }

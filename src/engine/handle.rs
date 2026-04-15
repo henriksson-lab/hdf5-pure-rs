@@ -46,11 +46,7 @@ impl HandleRegistry {
     }
 
     /// Register a new object and return its handle ID.
-    pub fn register<T: Send + Sync + 'static>(
-        &self,
-        handle_type: HandleType,
-        data: T,
-    ) -> Hid {
+    pub fn register<T: Send + Sync + 'static>(&self, handle_type: HandleType, data: T) -> Hid {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = HandleEntry {
             handle_type,

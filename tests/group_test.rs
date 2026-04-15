@@ -47,8 +47,12 @@ fn test_member_types_v0() {
     let f = File::open("tests/data/simple_v0.h5").expect("failed to open v0 file");
     let root = f.root_group().expect("failed to get root");
 
-    let data_type = root.member_type("data").expect("failed to get type of data");
-    let group_type = root.member_type("group1").expect("failed to get type of group1");
+    let data_type = root
+        .member_type("data")
+        .expect("failed to get type of data");
+    let group_type = root
+        .member_type("group1")
+        .expect("failed to get type of group1");
 
     println!("v0: data={data_type:?}, group1={group_type:?}");
     assert_eq!(data_type, hdf5_pure_rust::hl::file::ObjectType::Dataset);
@@ -60,8 +64,12 @@ fn test_member_types_v3() {
     let f = File::open("tests/data/simple_v2.h5").expect("failed to open v3 file");
     let root = f.root_group().expect("failed to get root");
 
-    let data_type = root.member_type("data").expect("failed to get type of data");
-    let group_type = root.member_type("group1").expect("failed to get type of group1");
+    let data_type = root
+        .member_type("data")
+        .expect("failed to get type of data");
+    let group_type = root
+        .member_type("group1")
+        .expect("failed to get type of group1");
 
     println!("v3: data={data_type:?}, group1={group_type:?}");
     assert_eq!(data_type, hdf5_pure_rust::hl::file::ObjectType::Dataset);

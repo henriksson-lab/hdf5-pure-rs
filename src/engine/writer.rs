@@ -83,32 +83,35 @@ impl DtypeSpec {
                     buf.extend_from_slice(&[0x20, 31, 0x00]); // bf0=0x20(norm=2,LE), bf1=31(sign bit), bf2=0
                     buf.extend_from_slice(&size.to_le_bytes());
                     // Properties: bit_offset(2) + bit_precision(2) + epos(1) + esize(1) + mpos(1) + msize(1) + ebias(4)
-                    buf.extend_from_slice(&0u16.to_le_bytes());   // bit offset
-                    buf.extend_from_slice(&32u16.to_le_bytes());  // bit precision
-                    buf.push(23);  // exponent position
-                    buf.push(8);   // exponent size
-                    buf.push(0);   // mantissa position
-                    buf.push(23);  // mantissa size
+                    buf.extend_from_slice(&0u16.to_le_bytes()); // bit offset
+                    buf.extend_from_slice(&32u16.to_le_bytes()); // bit precision
+                    buf.push(23); // exponent position
+                    buf.push(8); // exponent size
+                    buf.push(0); // mantissa position
+                    buf.push(23); // mantissa size
                     buf.extend_from_slice(&127u32.to_le_bytes()); // exponent bias
                 } else {
                     buf.push(class_and_version);
                     buf.extend_from_slice(&[0x20, 63, 0x00]); // bf0=0x20(norm=2,LE), bf1=63(sign bit), bf2=0
                     buf.extend_from_slice(&size.to_le_bytes());
-                    buf.extend_from_slice(&0u16.to_le_bytes());    // bit offset
-                    buf.extend_from_slice(&64u16.to_le_bytes());   // bit precision
-                    buf.push(52);   // exponent position
-                    buf.push(11);   // exponent size
-                    buf.push(0);    // mantissa position
-                    buf.push(52);   // mantissa size
+                    buf.extend_from_slice(&0u16.to_le_bytes()); // bit offset
+                    buf.extend_from_slice(&64u16.to_le_bytes()); // bit precision
+                    buf.push(52); // exponent position
+                    buf.push(11); // exponent size
+                    buf.push(0); // mantissa position
+                    buf.push(52); // mantissa size
                     buf.extend_from_slice(&1023u32.to_le_bytes()); // exponent bias
                 }
             }
             _ => {
                 let size = self.size();
-                let is_signed = matches!(self, DtypeSpec::I8 | DtypeSpec::I16 | DtypeSpec::I32 | DtypeSpec::I64);
+                let is_signed = matches!(
+                    self,
+                    DtypeSpec::I8 | DtypeSpec::I16 | DtypeSpec::I32 | DtypeSpec::I64
+                );
                 // class_and_version: version=1, class=0 (fixed-point)
                 let class_and_version = 0x10u8; // version 1, class 0
-                // class bit fields: byte order = LE (bit 0 = 0), sign = signed (bit 3)
+                                                // class bit fields: byte order = LE (bit 0 = 0), sign = signed (bit 3)
                 let bf0 = if is_signed { 0x08u8 } else { 0x00u8 };
                 buf.push(class_and_version);
                 buf.extend_from_slice(&[bf0, 0x00, 0x00]);
@@ -198,7 +201,13 @@ fn encode_soft_link_message(name: &str, target_path: &str) -> Vec<u8> {
     let name_len = name_bytes.len();
     let target_bytes = target_path.as_bytes();
 
-    let (size_flag, len_bytes) = if name_len < 256 { (0u8, 1) } else if name_len < 65536 { (1u8, 2) } else { (2u8, 4) };
+    let (size_flag, len_bytes) = if name_len < 256 {
+        (0u8, 1)
+    } else if name_len < 65536 {
+        (1u8, 2)
+    } else {
+        (2u8, 4)
+    };
 
     buf.push(1); // version
     buf.push(size_flag | 0x08 | 0x10); // flags: size_flag + has_link_type + has_char_encoding
@@ -227,7 +236,13 @@ fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> V
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len();
 
-    let (size_flag, len_bytes) = if name_len < 256 { (0u8, 1) } else if name_len < 65536 { (1u8, 2) } else { (2u8, 4) };
+    let (size_flag, len_bytes) = if name_len < 256 {
+        (0u8, 1)
+    } else if name_len < 65536 {
+        (1u8, 2)
+    } else {
+        (2u8, 4)
+    };
 
     buf.push(1); // version
     buf.push(size_flag | 0x08 | 0x10); // flags: size_flag + has_link_type + has_char_encoding
@@ -257,7 +272,12 @@ fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> V
 }
 
 /// Encode a data layout message (v3, contiguous).
-fn encode_contiguous_layout(data_addr: u64, data_size: u64, sizeof_addr: u8, sizeof_size: u8) -> Vec<u8> {
+fn encode_contiguous_layout(
+    data_addr: u64,
+    data_size: u64,
+    sizeof_addr: u8,
+    sizeof_size: u8,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(3); // version 3
     buf.push(1); // layout class = contiguous
@@ -320,7 +340,7 @@ fn encode_filter_pipeline(compression_level: Option<u32>, shuffle: bool) -> Vec<
 
     for (id, params) in &filters {
         buf.extend_from_slice(&id.to_le_bytes()); // filter ID
-        // v2: skip name_length for known filter IDs (< 256)
+                                                  // v2: skip name_length for known filter IDs (< 256)
         buf.extend_from_slice(&0u16.to_le_bytes()); // flags
         buf.extend_from_slice(&(params.len() as u16).to_le_bytes()); // number of client data values
         for &p in params {
@@ -473,7 +493,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             format!("{parent}/{name}")
         };
         self.groups.insert(full_path.clone(), addr);
-        self.links.push((parent.to_string(), name.to_string(), addr));
+        self.links
+            .push((parent.to_string(), name.to_string(), addr));
         Ok(addr)
     }
 
@@ -484,18 +505,20 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     }
 
     /// Create an external link in a group.
-    pub fn create_external_link(&mut self, parent: &str, name: &str, filename: &str, obj_path: &str) {
+    pub fn create_external_link(
+        &mut self,
+        parent: &str,
+        name: &str,
+        filename: &str,
+        obj_path: &str,
+    ) {
         let msg = encode_external_link_message(name, filename, obj_path);
         self.special_links.push((parent.to_string(), msg));
     }
 
     /// Create a dataset with compact storage (data embedded in the object header).
     /// Best for small datasets (< ~64KB).
-    pub fn create_compact_dataset(
-        &mut self,
-        parent: &str,
-        spec: &DatasetSpec,
-    ) -> Result<u64> {
+    pub fn create_compact_dataset(&mut self, parent: &str, spec: &DatasetSpec) -> Result<u64> {
         let dtype_bytes = spec.dtype.encode();
         let ds_bytes = encode_dataspace(spec.shape);
 
@@ -519,17 +542,14 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
-        self.links.push((parent.to_string(), spec.name.to_string(), oh_addr));
+        self.links
+            .push((parent.to_string(), spec.name.to_string(), oh_addr));
 
         Ok(oh_addr)
     }
 
     /// Create a dataset with contiguous storage.
-    pub fn create_dataset(
-        &mut self,
-        parent: &str,
-        spec: &DatasetSpec,
-    ) -> Result<u64> {
+    pub fn create_dataset(&mut self, parent: &str, spec: &DatasetSpec) -> Result<u64> {
         let dtype_bytes = spec.dtype.encode();
         let ds_bytes = encode_dataspace(spec.shape);
 
@@ -543,12 +563,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             UNDEF_ADDR
         };
 
-        let layout_bytes = encode_contiguous_layout(
-            data_addr,
-            data_size,
-            self.sizeof_addr,
-            self.sizeof_size,
-        );
+        let layout_bytes =
+            encode_contiguous_layout(data_addr, data_size, self.sizeof_addr, self.sizeof_size);
 
         // Fill value message (v3, "undefined" fill value)
         let fill_value_bytes = vec![3u8, 0x09]; // version 3, flags=0x09 (never write, undefined)
@@ -564,7 +580,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
-        self.links.push((parent.to_string(), spec.name.to_string(), oh_addr));
+        self.links
+            .push((parent.to_string(), spec.name.to_string(), oh_addr));
 
         Ok(oh_addr)
     }
@@ -588,7 +605,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             UNDEF_ADDR
         };
 
-        let layout_bytes = encode_contiguous_layout(data_addr, data_size, self.sizeof_addr, self.sizeof_size);
+        let layout_bytes =
+            encode_contiguous_layout(data_addr, data_size, self.sizeof_addr, self.sizeof_size);
         let fill_value_bytes = vec![3u8, 0x09];
 
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
@@ -599,16 +617,19 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         ];
 
         for attr in attrs {
-            let attr_bytes = encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
+            let attr_bytes =
+                encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
             messages.push((MSG_ATTRIBUTE, attr_bytes));
         }
 
-        let msg_refs: Vec<(u16, &[u8])> = messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
+        let msg_refs: Vec<(u16, &[u8])> =
+            messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
         let oh_bytes = build_v2_object_header(&msg_refs, 0);
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
-        self.links.push((parent.to_string(), spec.name.to_string(), oh_addr));
+        self.links
+            .push((parent.to_string(), spec.name.to_string(), oh_addr));
 
         Ok(oh_addr)
     }
@@ -649,7 +670,9 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         // Calculate number of chunks per dimension
         let mut n_chunks_per_dim = Vec::with_capacity(ndims);
         for i in 0..ndims {
-            n_chunks_per_dim.push(((spec.shape[i] as usize) + chunk_dims[i] as usize - 1) / chunk_dims[i] as usize);
+            n_chunks_per_dim.push(
+                ((spec.shape[i] as usize) + chunk_dims[i] as usize - 1) / chunk_dims[i] as usize,
+            );
         }
         let total_chunks: usize = n_chunks_per_dim.iter().product();
 
@@ -667,7 +690,14 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
             // Extract chunk data from the source array
             let mut chunk_buf = vec![0u8; chunk_raw_bytes];
-            self.extract_chunk(spec.data, spec.shape, &coords, chunk_dims, element_size, &mut chunk_buf);
+            self.extract_chunk(
+                spec.data,
+                spec.shape,
+                &coords,
+                chunk_dims,
+                element_size,
+                &mut chunk_buf,
+            );
 
             // Apply filters in forward order
             let mut filtered = chunk_buf;
@@ -716,7 +746,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
-        self.links.push((parent.to_string(), spec.name.to_string(), oh_addr));
+        self.links
+            .push((parent.to_string(), spec.name.to_string(), oh_addr));
 
         Ok(oh_addr)
     }
@@ -771,7 +802,9 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 if in_bounds {
                     let src_offset = src_linear * element_size;
                     let dst_offset = elem * element_size;
-                    if src_offset + element_size <= data.len() && dst_offset + element_size <= out.len() {
+                    if src_offset + element_size <= data.len()
+                        && dst_offset + element_size <= out.len()
+                    {
                         out[dst_offset..dst_offset + element_size]
                             .copy_from_slice(&data[src_offset..src_offset + element_size]);
                     }
@@ -835,7 +868,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         // Final key (sentinel)
         buf.extend_from_slice(&0u32.to_le_bytes()); // chunk_size = 0
         buf.extend_from_slice(&0u32.to_le_bytes()); // filter_mask = 0
-        // Final coords = last chunk's coords (or data shape end)
+                                                    // Final coords = last chunk's coords (or data shape end)
         if let Some((last_coords, _, _)) = chunks.last() {
             for &c in last_coords {
                 buf.extend_from_slice(&c.to_le_bytes());
@@ -870,7 +903,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
         for path in group_paths {
             // Collect links for this group, using CURRENT addresses
-            let group_links: Vec<(String, u64)> = self.links
+            let group_links: Vec<(String, u64)> = self
+                .links
                 .iter()
                 .filter(|(parent, _, _)| *parent == path)
                 .map(|(_, name, addr)| {
@@ -920,10 +954,8 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 }
             }
 
-            let msg_refs: Vec<(u16, &[u8])> = messages
-                .iter()
-                .map(|(t, d)| (*t, d.as_slice()))
-                .collect();
+            let msg_refs: Vec<(u16, &[u8])> =
+                messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
 
             let oh_bytes = build_v2_object_header(&msg_refs, 0);
             let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
@@ -934,9 +966,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
 
         // Write superblock
-        let root_addr = *self.groups.get("/").ok_or_else(|| {
-            Error::Other("no root group".into())
-        })?;
+        let root_addr = *self
+            .groups
+            .get("/")
+            .ok_or_else(|| Error::Other("no root group".into()))?;
         let eof = self.allocator.eof();
 
         let sb = Superblock {

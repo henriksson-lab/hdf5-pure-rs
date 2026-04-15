@@ -3,19 +3,36 @@
 [![Crates.io](https://img.shields.io/crates/v/hdf5-pure-rust.svg)](https://crates.io/crates/hdf5-pure-rust)
 [![License](https://img.shields.io/crates/l/hdf5-pure-rust.svg)](https://github.com/henriksson-lab/hdf5-pure-rs)
 
-Pure Rust implementation of the HDF5 file format. **No C dependencies.**
-
-Read and write HDF5 files without linking to the C HDF5 library. Files produced by this crate are verified compatible with the C library (h5dump, h5py). Can also be compiled for WebAssembly.
+Pure Rust implementation of the HDF5 file format. 
 
 Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch).
 
-This is a reimplementation of the HDF5 format, not a wrapper around the C library. Output should be bitwise compatible with the original. Please report any deviations.
-
 **This crate is still under construction, with more testing and benchmarking needed. Be careful in using it for production**
 
-## Support
 
-This translation is not endored by the HDF5 group. Issues related to this translation should be raised on this Github page.
+
+## This is an LLM-mediated faithful (hopefully) translation, not the original code!
+
+Most users should probably first see if the existing original code works for them, unless they have reason otherwise. The original source
+may have newer features and it has had more love in terms of fixing bugs. In fact, we aim to replicate bugs if they are present, for the
+sake of reproducibility! (but then we might have added a few more in the process)
+
+There are however cases when you might prefer this Rust version. We generally agree with [this page](https://rewrites.bio/)
+but more specifically:
+* We have had many issues with ensuring that our software works using existing containers (Docker, PodMan, Singularity). One size does not fit all and it eats our resources trying to keep up with every way of delivering software
+* Common package managers do not work well. It was great when we had a few Linux distributions with stable procedures, but now there are just too many ecosystems (Homebrew, Conda). Conda has an NP-complete resolver which does not scale. Homebrew is only so-stable. And our dependencies in Python still break. These can no longer be considered professional serious options. Meanwhile, Cargo enables multiple versions of packages to be available, even within the same program(!)
+* The future is the web. We deploy software in the web browser, and until now that has meant Javascript. This is a language where even the == operator is broken. Typescript is one step up, but a game changer is the ability to compile Rust code into webassembly, enabling performance and sharing of code with the backend. Translating code to Rust enables new ways of deployment and running code in the browser has especial benefits for science - researchers do not have deep pockets to run servers, so pushing compute to the user enables deployment that otherwise would be impossible
+* Old CLI-based utilities are bad for the environment(!). A large amount of compute resources are spent creating and communicating via small files, which we can bypass by using code as libraries. Even better, we can avoid frequent reloading of databases by hoisting this stage, with up to 100x speedups in some cases. Less compute means faster compute and less electricity wasted
+* LLM-mediated translations may actually be safer to use than the original code. This article shows that [running the same code on different operating systems can give somewhat different answers](https://doi.org/10.1038/nbt.3820). This is a gap that Rust+Cargo can reduce. Typesafe interfaces also reduce coding mistakes and error handling, as opposed to typical command-line scripting
+
+But:
+
+* **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back to the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
+* Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
+* **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
+* **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
+
+
 
 ## Installation
 
@@ -59,14 +76,24 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 ## Features
 
+| Area | Supported | Explicitly Unsupported |
+|------|-----------|------------------------|
+| Superblocks and object headers | Superblock v0-v3; object header v1/v2 with checksums | Full C-library metadata-cache behavior |
+| Dataset storage | Compact, contiguous, chunked with v1 B-tree, v4 single-chunk datasets, unfiltered v4 implicit chunk indexes, v4 fixed-array chunk indexes, direct-block v4 extensible-array chunk indexes, and v4 v2-B-tree chunk indexes | Virtual dataset reads; v4 extensible-array data/super-block spillover |
+| Filters | Deflate, shuffle, fletcher32, LZF, optional Blosc | NBit, ScaleOffset, SZip, unknown filters |
+| Datatypes | Primitive numeric types, enum metadata, fixed/vlen strings, compound metadata, primitive compound field reads, raw compound member extraction, recursive compound field values for nested compound/array/vlen/reference members | Full HDF5 datatype conversion parity |
+| Groups and links | v1 symbol tables, v2 link messages, dense link/attribute storage, soft/external links | Full coverage of every HDF5 index/storage variant |
+| Writing | v2 superblock, groups, datasets, attributes, compact/contiguous/chunked storage, deflate/shuffle, soft/external links | General-purpose HDF5 writer parity with the C library |
+
 **Reading:**
 - Superblock v0-v3
 - Object header v1 and v2 (with checksums)
 - All storage layouts: compact, contiguous, chunked
-- Chunk indices: v1 B-tree, v2 B-tree, fixed array, extensible array, single chunk
-- Filters: deflate, shuffle, fletcher32, NBit, ScaleOffset, LZF, SZip (stub), Blosc (optional)
+- Chunk indices: v1 B-tree, single chunk, unfiltered v4 implicit, v4 fixed array, direct-block v4 extensible array, and v4 v2-B-tree including internal nodes. Extensible-array spillover blocks are parsed from metadata but not yet readable.
+- Filters: deflate, shuffle, fletcher32, LZF, and optional Blosc. NBit, ScaleOffset, SZip, and unknown filters return `Unsupported` for reads.
 - All primitive types (i8-i64, u8-u64, f32, f64) with automatic big-endian byte-swap
 - Compound and enum datatypes
+- Raw compound field extraction and recursive compound field values for non-primitive member payloads
 - Fixed-length and variable-length strings (via global heap)
 - Groups with v1 symbol tables and v2 link messages
 - Dense link/attribute storage (fractal heap + v2 B-tree)
@@ -84,9 +111,9 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 **Other:**
 - `#[derive(H5Type)]` for user-defined structs and enums
-- `MutableFile::open_rw()` for in-place dataset resizing
+- `MutableFile::open_rw()` for limited in-place dataset resizing. New chunk-index entries are not yet written.
 - Property list queries (`ds.create_plist()`)
-- 93% of C library reference test files parse successfully
+- Most checked-in C-library reference files parse successfully; the exact count is enforced by tests rather than treated as a general compatibility guarantee.
 - Zero panics on corrupt/malformed files (CVE regression tested)
 
 ## Benchmark
@@ -123,18 +150,21 @@ struct Measurement {
 |---------|---------|-------------|
 | `derive` | yes | `#[derive(H5Type)]` proc macro |
 | `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs) |
+| `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. See `analysis/tracehash_divergence.md`. |
 
 ## Test Suite
 
 269 tests covering:
-- 53/57 C library reference files (93% compatibility)
+- Selected C library reference files and generated fixtures
 - All primitive types, compound, enum, strings
 - All storage layouts and filter combinations
 - Corrupt file handling (zero panics, CVE regressions)
 - Write round-trips verified by h5dump and h5py
 - Cross-platform: big-endian, old formats, various file space strategies
 
-**This test suite need to be expanded before any claims of general compatibility**
+**This test suite needs to be expanded before any claims of general compatibility.**
+
+Unsupported HDF5 features are tracked in `analysis/unsupported_features.md`.
 
 
 ## How to Cite HDF5
@@ -146,9 +176,5 @@ If you use HDF5 in your research, please cite it. See the original [original cod
 
 ## License
 
-This is [derived work](https://github.com/HDFGroup/hdf5) and the license follows from the original HDF5 (BSD-3).
+This is [derived work](https://github.com/HDFGroup/hdf5) and the license follows from the original HDF5 (BSD-3-Clause).
 See the LICENSE file
-
-
-
-

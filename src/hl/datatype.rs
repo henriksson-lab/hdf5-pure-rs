@@ -75,4 +75,16 @@ impl Datatype {
     pub fn enum_members(&self) -> Option<Vec<(String, u64)>> {
         self.msg.enum_members()
     }
+
+    /// Get array dimensions and base datatype for array types.
+    pub fn array_dims_base(&self) -> Option<(Vec<u64>, Datatype)> {
+        self.msg
+            .array_dims_base()
+            .map(|(dims, base)| (dims, Datatype::from_message(base)))
+    }
+
+    /// Get the base datatype for variable-length sequence/string types.
+    pub fn vlen_base(&self) -> Option<Datatype> {
+        self.msg.vlen_base().map(Datatype::from_message)
+    }
 }

@@ -62,14 +62,40 @@ impl DataLayoutMessage {
         }
 
         let version = data[0];
-        match version {
+        let result = match version {
             1 | 2 => Self::decode_v1_v2(data, version, sizeof_addr),
             3 => Self::decode_v3(data, sizeof_addr, sizeof_size),
             4 => Self::decode_v4(data, sizeof_addr, sizeof_size),
             _ => Err(Error::Unsupported(format!(
                 "data layout message version {version}"
             ))),
+        };
+
+        #[cfg(feature = "tracehash")]
+        if let Ok(message) = &result {
+            let mut th = tracehash::th_call!("hdf5.data_layout.decode");
+            th.input_u64(sizeof_addr as u64);
+            th.input_u64(sizeof_size as u64);
+            th.input_bytes(data);
+            th.output_u64(message.version as u64);
+            th.output_u64(message.layout_class as u64);
+            th.output_u64(
+                message
+                    .chunk_index_type
+                    .map(|t| t as u64)
+                    .unwrap_or(u64::MAX),
+            );
+            th.output_u64(
+                message
+                    .chunk_dims
+                    .as_ref()
+                    .map(|dims| dims.len())
+                    .unwrap_or(0) as u64,
+            );
+            th.finish();
         }
+
+        result
     }
 
     fn decode_v1_v2(data: &[u8], version: u8, sizeof_addr: u8) -> Result<Self> {
@@ -101,7 +127,8 @@ impl DataLayoutMessage {
         // Dimension sizes (ndims * 4 bytes for v1/v2, last dim is element size for chunked)
         let mut dims = Vec::new();
         for _ in 0..ndims {
-            let d = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64;
+            let d =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64;
             pos += 4;
             dims.push(d);
         }
@@ -213,7 +240,12 @@ impl DataLayoutMessage {
 
                 let mut dims = Vec::with_capacity(ndims);
                 for _ in 0..ndims {
-                    let d = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64;
+                    let d = u32::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as u64;
                     pos += 4;
                     dims.push(d);
                 }
@@ -231,7 +263,8 @@ impl DataLayoutMessage {
                 // v3 virtual: global_heap_addr(sizeof_addr) + index(4)
                 let addr = read_le_u64(&data[pos..], sa);
                 pos += sa;
-                let index = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let index =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 result.virtual_heap_addr = Some(addr);
                 result.virtual_heap_index = Some(index);
             }
@@ -336,7 +369,10 @@ impl DataLayoutMessage {
                             let filtered_size = read_le_u64(&data[pos..], ss);
                             pos += ss;
                             let filter_mask = u32::from_le_bytes([
-                                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
                             ]);
                             pos += 4;
                             result.single_chunk_filtered_size = Some(filtered_size);
@@ -371,7 +407,21 @@ impl DataLayoutMessage {
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
                     }
-                    ChunkIndexType::BTreeV1 | ChunkIndexType::BTreeV2 => {
+                    ChunkIndexType::BTreeV2 => {
+                        let _node_size = u32::from_le_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                        ]);
+                        let _split_percent = data[pos + 4];
+                        let _merge_percent = data[pos + 5];
+                        pos += 6;
+                        let addr = read_le_u64(&data[pos..], sa);
+                        result.chunk_index_addr = Some(addr);
+                        result.data_addr = Some(addr);
+                    }
+                    ChunkIndexType::BTreeV1 => {
                         let addr = read_le_u64(&data[pos..], sa);
                         result.chunk_index_addr = Some(addr);
                         result.data_addr = Some(addr);
@@ -383,7 +433,12 @@ impl DataLayoutMessage {
                 if pos + sa + 4 <= data.len() {
                     let addr = read_le_u64(&data[pos..], sa);
                     pos += sa;
-                    let index = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                    let index = u32::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]);
                     result.virtual_heap_addr = Some(addr);
                     result.virtual_heap_index = Some(index);
                 }

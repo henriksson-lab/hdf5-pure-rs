@@ -1,89 +1,308 @@
 use crate::error::{Error, Result};
 
-/// Decompress ScaleOffset-filtered data.
-///
-/// ScaleOffset stores integer data as: (value - min_value) with reduced bit width.
-/// For integer types, the minimum value and the number of bits needed are stored
-/// as parameters in the filter pipeline message.
-///
-/// Client data parameters (from filter pipeline):
-/// [0] = scale_type (0=integer, 1=float dscale)
-/// [1] = scale_factor (for float) or 0
-/// [2] = number of elements
-/// [3..] = minimum value bytes (for integer mode)
-///
-/// This is a simplified implementation for the integer case.
-pub fn decompress(
-    data: &[u8],
-    element_size: usize,
-    num_elements: usize,
-    client_data: &[u32],
-) -> Result<Vec<u8>> {
-    if client_data.is_empty() {
+const PARM_SCALETYPE: usize = 0;
+const PARM_NELMTS: usize = 2;
+const PARM_CLASS: usize = 3;
+const PARM_SIZE: usize = 4;
+const PARM_SIGN: usize = 5;
+const PARM_ORDER: usize = 6;
+const PARM_FILAVAIL: usize = 7;
+const PARM_FILVAL: usize = 8;
+
+const CLS_INTEGER: u32 = 0;
+const CLS_FLOAT: u32 = 1;
+const SIGN_UNSIGNED: u32 = 0;
+const SIGN_TWOS: u32 = 1;
+const ORDER_LE: u32 = 0;
+const ORDER_BE: u32 = 1;
+const HEADER_LEN: usize = 21;
+
+#[derive(Debug, Clone, Copy)]
+struct Parms {
+    size: usize,
+    minbits: usize,
+    order: u32,
+}
+
+/// Decompress HDF5 ScaleOffset-filtered chunks using the datatype-aware
+/// parameters stored in the filter pipeline.
+pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
+    if client_data.len() <= PARM_ORDER {
         return Err(Error::InvalidFormat(
-            "scaleoffset filter missing parameters".into(),
+            "scaleoffset filter missing datatype parameters".into(),
         ));
     }
 
-    let scale_type = client_data[0];
+    let scale_type = client_data[PARM_SCALETYPE];
+    let nelmts = client_data[PARM_NELMTS] as usize;
+    let class = client_data[PARM_CLASS];
+    let size = client_data[PARM_SIZE] as usize;
+    let sign = client_data[PARM_SIGN];
+    let order = client_data[PARM_ORDER];
 
-    if scale_type != 0 {
-        return Err(Error::Unsupported(format!(
-            "scaleoffset scale_type {scale_type} (only integer mode supported)"
+    if size == 0 {
+        return Err(Error::InvalidFormat(
+            "scaleoffset datatype size is zero".into(),
+        ));
+    }
+    if order != ORDER_LE && order != ORDER_BE {
+        return Err(Error::InvalidFormat(format!(
+            "invalid scaleoffset byte order {order}"
         )));
     }
-
-    // For integer scaleoffset:
-    // The compressed data starts with: min_bits(4 bytes) + min_value(element_size bytes) + packed_data
-    if data.len() < 4 + element_size {
+    if data.len() < HEADER_LEN {
         return Err(Error::InvalidFormat("scaleoffset data too short".into()));
     }
 
-    let min_bits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let pos = 4;
-
-    // Read minimum value
-    let mut min_value: u64 = 0;
-    for i in 0..element_size.min(8) {
-        min_value |= (data[pos + i] as u64) << (i * 8);
+    let minbits = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let minval_size = data[4] as usize;
+    if minval_size > 16 || data.len() < 5 + minval_size {
+        return Err(Error::InvalidFormat(
+            "invalid scaleoffset minimum value header".into(),
+        ));
     }
-    let pos = pos + element_size;
+    let minval = read_le_u128(&data[5..5 + minval_size]);
 
-    if min_bits == 0 {
-        // All values are the same (= min_value)
-        let mut output = vec![0u8; num_elements * element_size];
-        for elem in 0..num_elements {
-            let start = elem * element_size;
-            for i in 0..element_size.min(8) {
-                output[start + i] = (min_value >> (i * 8)) as u8;
+    let out_len = nelmts
+        .checked_mul(size)
+        .ok_or_else(|| Error::InvalidFormat("scaleoffset output size overflow".into()))?;
+    let mut out = vec![0u8; out_len];
+
+    if minbits == size * 8 {
+        let raw = data.get(HEADER_LEN..HEADER_LEN + out_len).ok_or_else(|| {
+            Error::InvalidFormat("scaleoffset full-precision data too short".into())
+        })?;
+        out.copy_from_slice(raw);
+    } else if minbits != 0 {
+        let parms = Parms {
+            size,
+            minbits,
+            order,
+        };
+        let mut stream = BitStream::new(&data[HEADER_LEN..]);
+        for idx in 0..nelmts {
+            decompress_atomic(&mut out, idx * size, &mut stream, parms)?;
+        }
+    }
+
+    match class {
+        CLS_INTEGER => {
+            let fill = if client_data.get(PARM_FILAVAIL).copied().unwrap_or(0) != 0 {
+                Some(read_fill_value(client_data, size, order))
+            } else {
+                None
+            };
+            postprocess_integer(&mut out, size, sign, order, minbits, minval, fill)?
+        }
+        CLS_FLOAT if scale_type == 0 => {
+            postprocess_float(&mut out, size, order, minbits, minval, client_data)?
+        }
+        CLS_FLOAT => {
+            return Err(Error::Unsupported(format!(
+                "scaleoffset float scale type {scale_type}"
+            )));
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "scaleoffset datatype class {other}"
+            )));
+        }
+    }
+
+    Ok(out)
+}
+
+fn decompress_atomic(
+    out: &mut [u8],
+    data_offset: usize,
+    stream: &mut BitStream<'_>,
+    parms: Parms,
+) -> Result<()> {
+    let dtype_bits = parms.size * 8;
+    if parms.minbits == 0 || parms.minbits > dtype_bits {
+        return Err(Error::InvalidFormat(
+            "invalid scaleoffset minimum bit count".into(),
+        ));
+    }
+
+    if parms.order == ORDER_LE {
+        let begin = parms.size - 1 - (dtype_bits - parms.minbits) / 8;
+        for k in (0..=begin).rev() {
+            decompress_byte(out, data_offset, k, begin, stream, parms, dtype_bits)?;
+        }
+    } else {
+        let begin = (dtype_bits - parms.minbits) / 8;
+        for k in begin..parms.size {
+            decompress_byte(out, data_offset, k, begin, stream, parms, dtype_bits)?;
+        }
+    }
+    Ok(())
+}
+
+fn decompress_byte(
+    out: &mut [u8],
+    data_offset: usize,
+    k: usize,
+    begin: usize,
+    stream: &mut BitStream<'_>,
+    parms: Parms,
+    dtype_bits: usize,
+) -> Result<()> {
+    let bits_to_copy = if k == begin {
+        8 - (dtype_bits - parms.minbits) % 8
+    } else {
+        8
+    };
+    let bits = stream.read_bits(bits_to_copy)? as u8;
+    out[data_offset + k] = bits;
+    Ok(())
+}
+
+fn postprocess_integer(
+    out: &mut [u8],
+    size: usize,
+    sign: u32,
+    order: u32,
+    minbits: usize,
+    minval: u128,
+    fill: Option<u128>,
+) -> Result<()> {
+    let fill_marker = if minbits > 0 && minbits < 128 {
+        Some((1u128 << minbits) - 1)
+    } else if minbits == 128 {
+        Some(u128::MAX)
+    } else {
+        None
+    };
+
+    for chunk in out.chunks_exact_mut(size) {
+        let value = read_uint(chunk, order);
+        let value = if let (Some(fill), Some(marker)) = (fill, fill_marker) {
+            if value == marker {
+                fill
+            } else {
+                minval.wrapping_add(value)
+            }
+        } else if minbits == 0 {
+            minval
+        } else {
+            minval.wrapping_add(value)
+        };
+        write_uint(chunk, order, value);
+
+        if sign != SIGN_UNSIGNED && sign != SIGN_TWOS {
+            return Err(Error::InvalidFormat(format!(
+                "invalid scaleoffset integer sign {sign}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn postprocess_float(
+    _out: &mut [u8],
+    _size: usize,
+    _order: u32,
+    _minbits: usize,
+    _minval: u128,
+    _client_data: &[u32],
+) -> Result<()> {
+    Err(Error::Unsupported(
+        "scaleoffset floating-point reconstruction is not implemented".into(),
+    ))
+}
+
+fn read_uint(bytes: &[u8], order: u32) -> u128 {
+    let mut value = 0u128;
+    if order == ORDER_LE {
+        for (idx, byte) in bytes.iter().take(16).enumerate() {
+            value |= (*byte as u128) << (idx * 8);
+        }
+    } else {
+        for byte in bytes.iter().take(16) {
+            value = (value << 8) | (*byte as u128);
+        }
+    }
+    value
+}
+
+fn write_uint(bytes: &mut [u8], order: u32, value: u128) {
+    if order == ORDER_LE {
+        for (idx, byte) in bytes.iter_mut().take(16).enumerate() {
+            *byte = (value >> (idx * 8)) as u8;
+        }
+    } else {
+        let n = bytes.len().min(16);
+        for (idx, byte) in bytes.iter_mut().take(n).enumerate() {
+            *byte = (value >> ((n - idx - 1) * 8)) as u8;
+        }
+    }
+}
+
+fn read_le_u128(bytes: &[u8]) -> u128 {
+    let mut value = 0u128;
+    for (idx, byte) in bytes.iter().take(16).enumerate() {
+        value |= (*byte as u128) << (idx * 8);
+    }
+    value
+}
+
+fn read_fill_value(client_data: &[u32], size: usize, order: u32) -> u128 {
+    let mut raw = vec![0u8; size];
+    let mut pos = 0usize;
+    for value in client_data.iter().skip(PARM_FILVAL) {
+        let bytes = value.to_le_bytes();
+        for byte in bytes {
+            if pos < raw.len() {
+                raw[pos] = byte;
+                pos += 1;
             }
         }
-        return Ok(output);
+    }
+    read_uint(&raw, order)
+}
+
+struct BitStream<'a> {
+    data: &'a [u8],
+    byte: usize,
+    bits_left: usize,
+}
+
+impl<'a> BitStream<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte: 0,
+            bits_left: 8,
+        }
     }
 
-    // Unpack bit-packed offsets and add min_value
-    let packed = &data[pos..];
-    let mut output = vec![0u8; num_elements * element_size];
-    let mut bit_pos = 0;
+    fn read_bits(&mut self, mut nbits: usize) -> Result<u16> {
+        if nbits > 16 {
+            return Err(Error::InvalidFormat("scaleoffset bit run too long".into()));
+        }
 
-    for elem in 0..num_elements {
-        let mut offset: u64 = 0;
-        for bit in 0..min_bits {
-            let byte_idx = bit_pos / 8;
-            let bit_idx = bit_pos % 8;
-            if byte_idx < packed.len() {
-                let bit_val = (packed[byte_idx] >> bit_idx) & 1;
-                offset |= (bit_val as u64) << bit;
+        let mut value = 0u16;
+        while nbits > 0 {
+            let byte = *self
+                .data
+                .get(self.byte)
+                .ok_or_else(|| Error::InvalidFormat("scaleoffset data too short".into()))?;
+            let take = self.bits_left.min(nbits);
+            let shift = self.bits_left - take;
+            let mask = if take == 8 {
+                0xff
+            } else {
+                ((1u16 << take) - 1) as u8
+            };
+            value = (value << take) | (((byte >> shift) & mask) as u16);
+            self.bits_left -= take;
+            nbits -= take;
+            if self.bits_left == 0 {
+                self.byte += 1;
+                self.bits_left = 8;
             }
-            bit_pos += 1;
         }
-
-        let value = min_value.wrapping_add(offset);
-        let start = elem * element_size;
-        for i in 0..element_size.min(8) {
-            output[start + i] = (value >> (i * 8)) as u8;
-        }
+        Ok(value)
     }
-
-    Ok(output)
 }

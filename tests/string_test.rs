@@ -22,7 +22,11 @@ fn test_read_vlen_string_attr() {
 
     // Variable-length string attributes store data inline (via global heap ref)
     // For now, just verify we can read the raw data
-    println!("vlen_str attr raw data ({} bytes): {:?}", attr.raw_data().len(), attr.raw_data());
+    println!(
+        "vlen_str attr raw data ({} bytes): {:?}",
+        attr.raw_data().len(),
+        attr.raw_data()
+    );
 }
 
 #[test]

@@ -21,7 +21,9 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             // Literal run: copy (ctrl + 1) bytes
             let count = ctrl + 1;
             if ip + count > data.len() {
-                return Err(Error::InvalidFormat("lzf: literal run exceeds input".into()));
+                return Err(Error::InvalidFormat(
+                    "lzf: literal run exceeds input".into(),
+                ));
             }
             output.extend_from_slice(&data[ip..ip + count]);
             ip += count;
@@ -33,7 +35,9 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             if length == 7 {
                 // Long match: read additional length byte
                 if ip >= data.len() {
-                    return Err(Error::InvalidFormat("lzf: unexpected end in long match".into()));
+                    return Err(Error::InvalidFormat(
+                        "lzf: unexpected end in long match".into(),
+                    ));
                 }
                 length += data[ip] as usize;
                 ip += 1;
@@ -41,7 +45,9 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
             length += 2; // minimum match length is 2
 
             if ip >= data.len() {
-                return Err(Error::InvalidFormat("lzf: unexpected end reading offset".into()));
+                return Err(Error::InvalidFormat(
+                    "lzf: unexpected end reading offset".into(),
+                ));
             }
             offset += data[ip] as usize + 1;
             ip += 1;

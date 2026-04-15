@@ -1,9 +1,9 @@
 //! Phase T8: Object header parsing tests.
 //! Verify v1 and v2 object headers parse correctly across reference files.
 
-use hdf5_pure_rust::format::object_header::{ObjectHeader, MSG_DATASPACE, MSG_DATATYPE, MSG_LAYOUT,
-    MSG_SYMBOL_TABLE, MSG_LINK, MSG_LINK_INFO, MSG_ATTRIBUTE, MSG_FILL_VALUE, MSG_FILTER_PIPELINE,
-    MSG_ATTR_INFO};
+use hdf5_pure_rust::format::object_header::{
+    ObjectHeader, MSG_ATTRIBUTE, MSG_LINK, MSG_LINK_INFO, MSG_SYMBOL_TABLE,
+};
 use hdf5_pure_rust::format::superblock::Superblock;
 use hdf5_pure_rust::io::HdfReader;
 use std::fs;
@@ -30,7 +30,7 @@ fn t8a_v1_header_simple_v0() {
 
 #[test]
 fn t8a_v1_header_datasets_v0() {
-    let (sb, oh) = read_root_oh("tests/data/datasets_v0.h5");
+    let (_sb, oh) = read_root_oh("tests/data/datasets_v0.h5");
     assert_eq!(oh.version, 1);
     assert!(oh.messages.iter().any(|m| m.msg_type == MSG_SYMBOL_TABLE));
 }
@@ -55,7 +55,10 @@ fn t8b_v2_header_simple_v3() {
     assert!(sb.version >= 2);
     assert_eq!(oh.version, 2);
     // V2 root group should have link messages
-    let has_links = oh.messages.iter().any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO);
+    let has_links = oh
+        .messages
+        .iter()
+        .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO);
     assert!(has_links);
 }
 

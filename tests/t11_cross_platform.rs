@@ -89,15 +89,20 @@ fn t11b_old_array() {
 #[test]
 fn t11c_filespace_strategies() {
     for name in [
-        "filespace_1_6.h5", "filespace_1_8.h5",
-        "paged_nopersist.h5", "paged_persist.h5",
-        "fsm_aggr_nopersist.h5", "fsm_aggr_persist.h5",
+        "filespace_1_6.h5",
+        "filespace_1_8.h5",
+        "paged_nopersist.h5",
+        "paged_persist.h5",
+        "fsm_aggr_nopersist.h5",
+        "fsm_aggr_persist.h5",
         "aggr.h5",
     ] {
         let f = File::open(&format!("{REF_DIR}/{name}")).unwrap();
         let sb = f.superblock();
-        println!("{name}: sb_version={}, sizeof_addr={}, sizeof_size={}",
-            sb.version, sb.sizeof_addr, sb.sizeof_size);
+        println!(
+            "{name}: sb_version={}, sizeof_addr={}, sizeof_size={}",
+            sb.version, sb.sizeof_addr, sb.sizeof_size
+        );
     }
 }
 

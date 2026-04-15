@@ -308,7 +308,11 @@ impl Superblock {
             let entry_size = self.sizeof_size as usize + self.sizeof_addr as usize + 4 + 4 + 16;
             let common = 16; // freespace(1) + rootgrp(1) + reserved(1) + shared(1) + sizes(2) + reserved(1) + btree_k(4) + flags(4) + 1 extra reserved
             let addrs = 4 * self.sizeof_addr as usize;
-            let v1_extra = if self.version > 0 { 2 + if self.version == 1 { 2 } else { 0 } } else { 0 };
+            let v1_extra = if self.version > 0 {
+                2 + if self.version == 1 { 2 } else { 0 }
+            } else {
+                0
+            };
             9 + common + v1_extra + addrs + entry_size
         } else {
             // Fixed: sig(8) + version(1) + sizeof_addr(1) + sizeof_size(1) + flags(1) +

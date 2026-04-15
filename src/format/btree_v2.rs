@@ -5,10 +5,11 @@ use crate::io::reader::HdfReader;
 
 /// v2 B-tree header magic: "BTHD"
 const B2HD_MAGIC: [u8; 4] = [b'B', b'T', b'H', b'D'];
-/// v2 B-tree internal node magic: "BTIN"
-const B2IN_MAGIC: [u8; 4] = [b'B', b'T', b'I', b'N'];
 /// v2 B-tree leaf node magic: "BTLF"
 const B2LF_MAGIC: [u8; 4] = [b'B', b'T', b'L', b'F'];
+/// v2 B-tree internal node magic: "BTIN"
+const B2IN_MAGIC: [u8; 4] = [b'B', b'T', b'I', b'N'];
+const B2_METADATA_PREFIX_SIZE: usize = 10;
 
 /// v2 B-tree header.
 #[derive(Debug, Clone)]
@@ -26,16 +27,22 @@ pub struct BTreeV2Header {
 
 impl BTreeV2Header {
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
-        reader.seek(addr)?;
+        reader.seek(addr).map_err(|err| {
+            Error::InvalidFormat(format!("failed to seek to v2 B-tree header {addr}: {err}"))
+        })?;
 
         let magic = reader.read_bytes(4)?;
         if magic != B2HD_MAGIC {
-            return Err(Error::InvalidFormat("invalid v2 B-tree header magic".into()));
+            return Err(Error::InvalidFormat(
+                "invalid v2 B-tree header magic".into(),
+            ));
         }
 
         let version = reader.read_u8()?;
         if version != 0 {
-            return Err(Error::Unsupported(format!("v2 B-tree header version {version}")));
+            return Err(Error::Unsupported(format!(
+                "v2 B-tree header version {version}"
+            )));
         }
 
         let tree_type = reader.read_u8()?;
@@ -77,24 +84,160 @@ pub fn collect_all_records<R: Read + Seek>(
     }
 
     let mut records = Vec::new();
-
     if header.depth == 0 {
-        // Root is a leaf node
-        read_leaf_records(reader, header.root_addr, header.root_nrecords, header.record_size, &mut records)?;
-    } else {
-        // Root is an internal node, recurse
-        read_internal_records(
+        read_leaf_records(
             reader,
             header.root_addr,
             header.root_nrecords,
-            header.depth,
             header.record_size,
-            header.node_size,
+            &mut records,
+        )?;
+    } else {
+        let node_info = compute_node_info(&header, reader.sizeof_addr() as usize)?;
+        read_internal_records(
+            reader,
+            &header,
+            &node_info,
+            header.root_addr,
+            header.root_nrecords,
+            header.depth,
             &mut records,
         )?;
     }
 
     Ok(records)
+}
+
+#[derive(Debug, Clone)]
+struct NodeInfo {
+    max_nrec: usize,
+    cum_max_nrec_size: usize,
+}
+
+fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<NodeInfo>> {
+    let node_size = header.node_size as usize;
+    let record_size = header.record_size as usize;
+    if node_size <= B2_METADATA_PREFIX_SIZE || record_size == 0 {
+        return Err(Error::InvalidFormat("invalid v2 B-tree node sizing".into()));
+    }
+
+    let leaf_max = (node_size - B2_METADATA_PREFIX_SIZE) / record_size;
+    if leaf_max == 0 {
+        return Err(Error::InvalidFormat(
+            "v2 B-tree leaf cannot hold any records".into(),
+        ));
+    }
+
+    let max_nrec_size = bytes_needed(leaf_max as u64);
+    let mut node_info = Vec::with_capacity(header.depth as usize + 1);
+    node_info.push(NodeInfo {
+        max_nrec: leaf_max,
+        cum_max_nrec_size: 0,
+    });
+
+    for depth in 1..=header.depth as usize {
+        let pointer_size = sizeof_addr + max_nrec_size + node_info[depth - 1].cum_max_nrec_size;
+        if node_size <= B2_METADATA_PREFIX_SIZE + pointer_size {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal node cannot hold records".into(),
+            ));
+        }
+
+        let max_nrec =
+            (node_size - (B2_METADATA_PREFIX_SIZE + pointer_size)) / (record_size + pointer_size);
+        if max_nrec == 0 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal node cannot hold records".into(),
+            ));
+        }
+
+        let prev_cum = node_info[depth - 1].max_nrec as u64;
+        let cum_max_nrec = ((max_nrec as u64 + 1) * prev_cum) + max_nrec as u64;
+        node_info.push(NodeInfo {
+            max_nrec,
+            cum_max_nrec_size: bytes_needed(cum_max_nrec),
+        });
+    }
+
+    Ok(node_info)
+}
+
+fn read_internal_records<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    header: &BTreeV2Header,
+    node_info: &[NodeInfo],
+    addr: u64,
+    nrecords: u16,
+    depth: u16,
+    records: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    reader.seek(addr).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "failed to seek to v2 B-tree internal node {addr}: {err}"
+        ))
+    })?;
+
+    let magic = reader.read_bytes(4)?;
+    if magic != B2IN_MAGIC {
+        return Err(Error::InvalidFormat(
+            "invalid v2 B-tree internal magic".into(),
+        ));
+    }
+
+    let _version = reader.read_u8()?;
+    let _type = reader.read_u8()?;
+
+    let mut node_records = Vec::with_capacity(nrecords as usize);
+    for _ in 0..nrecords {
+        node_records.push(reader.read_bytes(header.record_size as usize)?);
+    }
+
+    let max_nrec_size = bytes_needed(node_info[0].max_nrec as u64);
+    let child_all_nrec_size = if depth > 1 {
+        node_info[depth as usize - 1].cum_max_nrec_size
+    } else {
+        0
+    };
+
+    let mut children = Vec::with_capacity(nrecords as usize + 1);
+    for _ in 0..=nrecords {
+        let child_addr = reader.read_addr()?;
+        let child_nrecords = read_var_uint(reader, max_nrec_size)? as u16;
+        if child_all_nrec_size > 0 {
+            let _child_all_records = read_var_uint(reader, child_all_nrec_size)?;
+        }
+        children.push((child_addr, child_nrecords));
+    }
+
+    for idx in 0..node_records.len() {
+        read_child_records(reader, header, node_info, children[idx], depth - 1, records)?;
+        records.push(node_records[idx].clone());
+    }
+    read_child_records(
+        reader,
+        header,
+        node_info,
+        children[node_records.len()],
+        depth - 1,
+        records,
+    )?;
+
+    Ok(())
+}
+
+fn read_child_records<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    header: &BTreeV2Header,
+    node_info: &[NodeInfo],
+    child: (u64, u16),
+    depth: u16,
+    records: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    if depth == 0 {
+        read_leaf_records(reader, child.0, child.1, header.record_size, records)
+    } else {
+        read_internal_records(reader, header, node_info, child.0, child.1, depth, records)
+    }
 }
 
 fn read_leaf_records<R: Read + Seek>(
@@ -104,7 +247,9 @@ fn read_leaf_records<R: Read + Seek>(
     record_size: u16,
     records: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
-    reader.seek(addr)?;
+    reader.seek(addr).map_err(|err| {
+        Error::InvalidFormat(format!("failed to seek to v2 B-tree leaf {addr}: {err}"))
+    })?;
 
     let magic = reader.read_bytes(4)?;
     if magic != B2LF_MAGIC {
@@ -122,99 +267,26 @@ fn read_leaf_records<R: Read + Seek>(
     Ok(())
 }
 
-fn read_internal_records<R: Read + Seek>(
-    reader: &mut HdfReader<R>,
-    addr: u64,
-    nrecords: u16,
-    depth: u16,
-    record_size: u16,
-    node_size: u32,
-    records: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    reader.seek(addr)?;
-
-    let magic = reader.read_bytes(4)?;
-    if magic != B2IN_MAGIC {
-        return Err(Error::InvalidFormat("invalid v2 B-tree internal magic".into()));
+fn read_var_uint<R: Read + Seek>(reader: &mut HdfReader<R>, size: usize) -> Result<u64> {
+    if size == 0 || size > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "invalid v2 B-tree variable integer size {size}"
+        )));
     }
 
-    let _version = reader.read_u8()?;
-    let _type = reader.read_u8()?;
-
-    // Read records and child pointers interleaved
-    // Structure: record[0], child[0], record[1], child[1], ..., record[n-1], child[n-1], child[n]
-    // Actually: child[0], record[0], child[1], record[1], ..., record[n-1], child[n]
-    // Wait, the v2 B-tree spec says: records interleaved with child node pointers.
-    // Format: record[0], child_ptr[0], record[1], child_ptr[1], ..., record[nrec-1], child_ptr[nrec]
-    // No wait - it's: child_ptr[0], record[0], child_ptr[1], record[1], ..., record[nrec-1], child_ptr[nrec]
-    // Actually let me check: the format has nrecords records and nrecords+1 child pointers.
-
-    // In practice, for simplicity, let's collect child addresses and recurse.
-    // The internal node has: magic(4) + version(1) + type(1) + records_and_children + checksum(4)
-    // Each child pointer = addr(sizeof_addr) + nrecords_in_child(variable) + total_records_in_child(variable)
-
-    // This is getting complex. For now, let's just read all records from leaf nodes by following
-    // the leftmost path and then scanning siblings. A simpler approach: read the whole node data
-    // and parse records.
-
-    // For the common case of depth=1 (root is internal, children are leaves):
-    // We need to read child pointers and recurse into leaves.
-
-    // Simplified approach: read all data from the node and extract child addresses
-    let _sizeof_addr = reader.sizeof_addr() as usize;
-
-    // The number of child records bytes depends on the max records per node.
-    // For simplicity, let's just collect children and recurse.
-    // Internal node format after magic+version+type:
-    // For each record/child pair and extra child at end.
-    // Actually the format is simpler than I thought:
-    // records are stored, then child node pointers follow.
-
-    // Let me just read records from this node and child pointers
-    let mut child_addrs = Vec::new();
-    let mut child_nrecords = Vec::new();
-
-    // Read nrecords records and nrecords+1 child pointers
-    // The layout within the node is: [records...] [child_pointers...]
-    // where each child pointer = address + nrecords_in_child(2 bytes for depth>1)
-
-    // First, read all records
-    for _ in 0..nrecords {
-        let record = reader.read_bytes(record_size as usize)?;
-        records.push(record);
+    let bytes = reader.read_bytes(size)?;
+    let mut value = 0u64;
+    for (idx, byte) in bytes.iter().enumerate() {
+        value |= (*byte as u64) << (idx * 8);
     }
+    Ok(value)
+}
 
-    // Then read child pointers: (nrecords + 1) children
-    for _ in 0..=nrecords {
-        let child_addr = reader.read_addr()?;
-        // Number of records in child (encoded size depends on max records)
-        // For simplicity, assume 2 bytes
-        let child_nrec = reader.read_u16()?;
-        child_addrs.push(child_addr);
-        child_nrecords.push(child_nrec);
-
-        // If depth > 1, there's also a total records count
-        if depth > 1 {
-            let _total = reader.read_length()?;
-        }
+fn bytes_needed(mut value: u64) -> usize {
+    let mut bytes = 1usize;
+    while value > 0xff {
+        value >>= 8;
+        bytes += 1;
     }
-
-    // Recurse into children
-    for (i, &child_addr) in child_addrs.iter().enumerate() {
-        if depth - 1 == 0 {
-            read_leaf_records(reader, child_addr, child_nrecords[i], record_size, records)?;
-        } else {
-            read_internal_records(
-                reader,
-                child_addr,
-                child_nrecords[i],
-                depth - 1,
-                record_size,
-                node_size,
-                records,
-            )?;
-        }
-    }
-
-    Ok(())
+    bytes
 }

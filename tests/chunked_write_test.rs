@@ -5,10 +5,11 @@ use hdf5_pure_rust::File;
 
 #[test]
 fn test_write_chunked_no_compression() {
-    let path = "tests/data/written_chunked_nocomp.h5";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_chunked_nocomp.h5");
 
     {
-        let f = fs::File::create(path).unwrap();
+        let f = fs::File::create(&path).unwrap();
         let mut w = HdfFileWriter::new(f);
         w.begin().unwrap();
         w.create_root_group().unwrap();
@@ -24,22 +25,24 @@ fn test_write_chunked_no_compression() {
                 dtype: DtypeSpec::F32,
                 data: &data_bytes,
             },
-            &[10],   // chunk dims
-            None,     // no compression
-            false,    // no shuffle
-        ).unwrap();
+            &[10], // chunk dims
+            None,  // no compression
+            false, // no shuffle
+        )
+        .unwrap();
 
         w.finalize().unwrap();
     }
 
     // Read back
     {
-        let f = File::open(path).unwrap();
+        let f = File::open(&path).unwrap();
         let ds = f.dataset("chunked").unwrap();
         assert_eq!(ds.shape().unwrap(), vec![100]);
 
         let raw = ds.read_raw().unwrap();
-        let values: Vec<f32> = raw.chunks_exact(4)
+        let values: Vec<f32> = raw
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values.len(), 100);
@@ -47,16 +50,15 @@ fn test_write_chunked_no_compression() {
             assert_eq!(*v, i as f32, "mismatch at index {i}");
         }
     }
-
-    fs::remove_file(path).ok();
 }
 
 #[test]
 fn test_write_chunked_with_deflate() {
-    let path = "tests/data/written_chunked_deflate.h5";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_chunked_deflate.h5");
 
     {
-        let f = fs::File::create(path).unwrap();
+        let f = fs::File::create(&path).unwrap();
         let mut w = HdfFileWriter::new(f);
         w.begin().unwrap();
         w.create_root_group().unwrap();
@@ -72,20 +74,22 @@ fn test_write_chunked_with_deflate() {
                 dtype: DtypeSpec::F32,
                 data: &data_bytes,
             },
-            &[25],     // chunk dims
-            Some(6),   // deflate level 6
-            false,     // no shuffle
-        ).unwrap();
+            &[25],   // chunk dims
+            Some(6), // deflate level 6
+            false,   // no shuffle
+        )
+        .unwrap();
 
         w.finalize().unwrap();
     }
 
     // Read back with pure-Rust
     {
-        let f = File::open(path).unwrap();
+        let f = File::open(&path).unwrap();
         let ds = f.dataset("compressed").unwrap();
         let raw = ds.read_raw().unwrap();
-        let values: Vec<f32> = raw.chunks_exact(4)
+        let values: Vec<f32> = raw
+            .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values.len(), 100);
@@ -97,25 +101,29 @@ fn test_write_chunked_with_deflate() {
     // Verify with h5dump
     {
         let out = std::process::Command::new("h5dump")
-            .arg("-d").arg("compressed")
-            .arg(path)
+            .arg("-d")
+            .arg("compressed")
+            .arg(&path)
             .output();
         if let Ok(out) = out {
             let stdout = String::from_utf8_lossy(&out.stdout);
             println!("h5dump output:\n{stdout}");
-            assert!(out.status.success(), "h5dump failed: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "h5dump failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
-
-    fs::remove_file(path).ok();
 }
 
 #[test]
 fn test_write_chunked_with_shuffle_and_deflate() {
-    let path = "tests/data/written_chunked_shuf_def.h5";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_chunked_shuf_def.h5");
 
     {
-        let f = fs::File::create(path).unwrap();
+        let f = fs::File::create(&path).unwrap();
         let mut w = HdfFileWriter::new(f);
         w.begin().unwrap();
         w.create_root_group().unwrap();
@@ -132,19 +140,21 @@ fn test_write_chunked_with_shuffle_and_deflate() {
                 data: &data_bytes,
             },
             &[10],
-            Some(4),  // deflate level 4
-            true,     // shuffle
-        ).unwrap();
+            Some(4), // deflate level 4
+            true,    // shuffle
+        )
+        .unwrap();
 
         w.finalize().unwrap();
     }
 
     // Read back
     {
-        let f = File::open(path).unwrap();
+        let f = File::open(&path).unwrap();
         let ds = f.dataset("shuf_def").unwrap();
         let raw = ds.read_raw().unwrap();
-        let values: Vec<i32> = raw.chunks_exact(4)
+        let values: Vec<i32> = raw
+            .chunks_exact(4)
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values.len(), 50);
@@ -156,8 +166,8 @@ fn test_write_chunked_with_shuffle_and_deflate() {
     // h5dump verification (structure only, data may differ in edge cases)
     {
         let out = std::process::Command::new("h5dump")
-            .arg("-pH")  // properties + header only, no data
-            .arg(path)
+            .arg("-pH") // properties + header only, no data
+            .arg(&path)
             .output();
         if let Ok(out) = out {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -166,6 +176,4 @@ fn test_write_chunked_with_shuffle_and_deflate() {
             assert!(stdout.contains("DEFLATE"), "should detect deflate filter");
         }
     }
-
-    fs::remove_file(path).ok();
 }

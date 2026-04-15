@@ -82,11 +82,7 @@ impl Group {
             if msg.msg_type == object_header::MSG_LINK_INFO {
                 let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
                 if link_info.has_dense_storage() {
-                    return Self::read_dense_links(
-                        &mut guard.reader,
-                        &link_info,
-                        sizeof_addr,
-                    );
+                    return Self::read_dense_links(&mut guard.reader, &link_info, sizeof_addr);
                 }
             }
         }
@@ -110,12 +106,10 @@ impl Group {
             }
             let heap_id = &record[4..4 + heap.heap_id_len as usize];
             match heap.read_managed_object(reader, heap_id) {
-                Ok(link_data) => {
-                    match LinkMessage::decode(&link_data, sizeof_addr) {
-                        Ok(link) => links.push(link),
-                        Err(_) => {}
-                    }
-                }
+                Ok(link_data) => match LinkMessage::decode(&link_data, sizeof_addr) {
+                    Ok(link) => links.push(link),
+                    Err(_) => {}
+                },
                 Err(_) => {}
             }
         }
@@ -130,10 +124,13 @@ impl Group {
         sizeof_addr: u8,
     ) -> Result<Vec<(String, u64)>> {
         let links = Self::read_dense_link_messages(reader, link_info, sizeof_addr)?;
-        Ok(links.into_iter().map(|l| {
-            let addr = l.hard_link_addr.unwrap_or(0);
-            (l.name, addr)
-        }).collect())
+        Ok(links
+            .into_iter()
+            .map(|l| {
+                let addr = l.hard_link_addr.unwrap_or(0);
+                (l.name, addr)
+            })
+            .collect())
     }
 
     /// Find a specific link by name, checking both inline messages and dense storage.
@@ -158,9 +155,8 @@ impl Group {
             if msg.msg_type == object_header::MSG_LINK_INFO {
                 let link_info = LinkInfoMessage::decode(&msg.data, sizeof_addr)?;
                 if link_info.has_dense_storage() {
-                    let links = Self::read_dense_link_messages(
-                        &mut guard.reader, &link_info, sizeof_addr,
-                    )?;
+                    let links =
+                        Self::read_dense_link_messages(&mut guard.reader, &link_info, sizeof_addr)?;
                     if let Some(link) = links.into_iter().find(|l| l.name == name) {
                         return Ok(link);
                     }
@@ -225,9 +221,7 @@ impl Group {
             }
         }
 
-        Err(Error::InvalidFormat(format!(
-            "member '{name}' not found"
-        )))
+        Err(Error::InvalidFormat(format!("member '{name}' not found")))
     }
 
     /// List attribute names.
@@ -249,17 +243,15 @@ impl Group {
     /// Get the target path of a soft link.
     pub fn soft_link_target(&self, name: &str) -> Result<String> {
         let link = self.find_link_by_name(name)?;
-        link.soft_link_target.ok_or_else(|| {
-            Error::InvalidFormat(format!("'{name}' is not a soft link"))
-        })
+        link.soft_link_target
+            .ok_or_else(|| Error::InvalidFormat(format!("'{name}' is not a soft link")))
     }
 
     /// Get the target (filename, object_path) of an external link.
     pub fn external_link_target(&self, name: &str) -> Result<(String, String)> {
         let link = self.find_link_by_name(name)?;
-        link.external_link.ok_or_else(|| {
-            Error::InvalidFormat(format!("'{name}' is not an external link"))
-        })
+        link.external_link
+            .ok_or_else(|| Error::InvalidFormat(format!("'{name}' is not an external link")))
     }
 
     /// Check if a named member (link) exists in this group.
@@ -293,8 +285,6 @@ impl Group {
             }
         }
 
-        Err(Error::InvalidFormat(format!(
-            "dataset '{name}' not found"
-        )))
+        Err(Error::InvalidFormat(format!("dataset '{name}' not found")))
     }
 }

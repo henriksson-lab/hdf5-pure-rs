@@ -81,7 +81,8 @@ impl WritableFile {
 
     /// Create an external link in the root group.
     pub fn link_external(&mut self, name: &str, filename: &str, obj_path: &str) {
-        self.writer.create_external_link("/", name, filename, obj_path);
+        self.writer
+            .create_external_link("/", name, filename, obj_path);
     }
 
     /// Finalize and close the file. Returns a read-only File handle.
@@ -125,6 +126,7 @@ impl<'a> WritableGroup<'a> {
 
     /// Create an external link in this group.
     pub fn link_external(&mut self, name: &str, filename: &str, obj_path: &str) {
-        self.writer.create_external_link(&self.path, name, filename, obj_path);
+        self.writer
+            .create_external_link(&self.path, name, filename, obj_path);
     }
 }

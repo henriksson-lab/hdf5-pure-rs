@@ -3,7 +3,9 @@
 use hdf5_pure_rust::File;
 
 const FILE: &str = "tests/data/hdf5_ref/selections_test.h5";
-fn open() -> File { File::open(FILE).unwrap() }
+fn open() -> File {
+    File::open(FILE).unwrap()
+}
 
 // T7a: Dataspace types
 

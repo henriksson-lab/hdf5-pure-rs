@@ -13,6 +13,7 @@ use crate::format::messages::datatype::DatatypeMessage;
 use crate::format::messages::filter_pipeline::FilterPipelineMessage;
 use crate::format::object_header::{self, ObjectHeader, RawMessage};
 use crate::hl::file::FileInner;
+use crate::hl::value::H5Value;
 use crate::io::reader::HdfReader;
 
 /// An HDF5 dataset.
@@ -73,7 +74,11 @@ impl Dataset {
         Self::parse_info(&oh.messages, sizeof_addr, sizeof_size)
     }
 
-    fn parse_info(messages: &[RawMessage], sizeof_addr: u8, sizeof_size: u8) -> Result<DatasetInfo> {
+    fn parse_info(
+        messages: &[RawMessage],
+        sizeof_addr: u8,
+        sizeof_size: u8,
+    ) -> Result<DatasetInfo> {
         let mut dataspace = None;
         let mut datatype = None;
         let mut layout = None;
@@ -88,7 +93,11 @@ impl Dataset {
                     datatype = Some(DatatypeMessage::decode(&msg.data)?);
                 }
                 object_header::MSG_LAYOUT => {
-                    layout = Some(DataLayoutMessage::decode(&msg.data, sizeof_addr, sizeof_size)?);
+                    layout = Some(DataLayoutMessage::decode(
+                        &msg.data,
+                        sizeof_addr,
+                        sizeof_size,
+                    )?);
                 }
                 object_header::MSG_FILTER_PIPELINE => {
                     filter_pipeline = Some(FilterPipelineMessage::decode(&msg.data)?);
@@ -139,7 +148,9 @@ impl Dataset {
     /// Get the dataspace.
     pub fn space(&self) -> Result<crate::hl::dataspace::Dataspace> {
         let info = self.info()?;
-        Ok(crate::hl::dataspace::Dataspace::from_message(info.dataspace))
+        Ok(crate::hl::dataspace::Dataspace::from_message(
+            info.dataspace,
+        ))
     }
 
     /// Whether the dataset uses chunked storage.
@@ -217,7 +228,10 @@ impl Dataset {
                         collection_addr: addr,
                         object_index: index,
                     };
-                    match crate::format::global_heap::read_global_heap_object(&mut guard.reader, &gh_ref) {
+                    match crate::format::global_heap::read_global_heap_object(
+                        &mut guard.reader,
+                        &gh_ref,
+                    ) {
                         Ok(data) => {
                             let s = String::from_utf8_lossy(&data).to_string();
                             // Trim trailing nulls
@@ -245,26 +259,35 @@ impl Dataset {
     /// Read a single string (for scalar string datasets/attributes).
     pub fn read_string(&self) -> Result<String> {
         let strings = self.read_strings()?;
-        strings.into_iter().next().ok_or_else(|| Error::InvalidFormat("no string data".into()))
+        strings
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::InvalidFormat("no string data".into()))
     }
 
     /// Read compound type field info. Returns field names, offsets, and sizes.
     pub fn compound_fields(&self) -> Result<Vec<crate::format::messages::datatype::CompoundField>> {
         let info = self.info()?;
-        info.datatype.compound_fields().ok_or_else(|| Error::InvalidFormat("not a compound type".into()))
+        info.datatype
+            .compound_fields()
+            .ok_or_else(|| Error::InvalidFormat("not a compound type".into()))
     }
 
     /// Read a single field from a compound dataset as typed values.
     /// Example: `ds.read_field::<f64>("x")` reads the "x" field from all records.
     pub fn read_field<T: crate::hl::types::H5Type>(&self, field_name: &str) -> Result<Vec<T>> {
         let fields = self.compound_fields()?;
-        let field = fields.iter().find(|f| f.name == field_name)
+        let field = fields
+            .iter()
+            .find(|f| f.name == field_name)
             .ok_or_else(|| Error::InvalidFormat(format!("field '{field_name}' not found")))?;
 
         if field.size != T::type_size() {
             return Err(Error::InvalidFormat(format!(
                 "field '{}' has size {} but requested type has size {}",
-                field_name, field.size, T::type_size()
+                field_name,
+                field.size,
+                T::type_size()
             )));
         }
 
@@ -292,9 +315,273 @@ impl Dataset {
         Ok(result)
     }
 
+    /// Read a single compound field as raw per-record byte slices.
+    ///
+    /// This is useful for compound members whose HDF5 datatype is not directly
+    /// representable as a primitive Rust `H5Type`, such as nested compound,
+    /// array, variable-length, or reference members.
+    pub fn read_field_raw(&self, field_name: &str) -> Result<Vec<Vec<u8>>> {
+        let fields = self.compound_fields()?;
+        let field = fields
+            .iter()
+            .find(|f| f.name == field_name)
+            .ok_or_else(|| Error::InvalidFormat(format!("field '{field_name}' not found")))?;
+
+        let raw = self.read_raw()?;
+        let info = self.info()?;
+        let record_size = info.datatype.size as usize;
+        let offset = field.byte_offset;
+        let elem_size = field.size;
+        let n_records = raw.len() / record_size;
+
+        let mut result = Vec::with_capacity(n_records);
+        for i in 0..n_records {
+            let start = i * record_size + offset;
+            let end = start + elem_size;
+            if end > raw.len() {
+                return Err(Error::InvalidFormat(format!(
+                    "compound field '{field_name}' exceeds record bounds"
+                )));
+            }
+            result.push(raw[start..end].to_vec());
+        }
+
+        Ok(result)
+    }
+
+    /// Read a compound field as recursively decoded high-level values.
+    ///
+    /// This handles nested compound, array, variable-length, and reference
+    /// members. Datatype classes without a richer public representation are
+    /// returned as `H5Value::Raw`.
+    pub fn read_field_values(&self, field_name: &str) -> Result<Vec<H5Value>> {
+        let fields = self.compound_fields()?;
+        let field = fields
+            .iter()
+            .find(|f| f.name == field_name)
+            .ok_or_else(|| Error::InvalidFormat(format!("field '{field_name}' not found")))?;
+
+        let raw = self.read_raw()?;
+        let info = self.info()?;
+        let record_size = info.datatype.size as usize;
+        if record_size == 0 || field.byte_offset + field.size > record_size {
+            return Err(Error::InvalidFormat(format!(
+                "compound field '{field_name}' exceeds record bounds"
+            )));
+        }
+
+        let mut guard = self.inner.lock();
+        let sizeof_addr = guard.superblock.sizeof_addr as usize;
+        let n_records = raw.len() / record_size;
+        let mut result = Vec::with_capacity(n_records);
+
+        for record in raw.chunks_exact(record_size) {
+            let bytes = &record[field.byte_offset..field.byte_offset + field.size];
+            result.push(Self::decode_value(
+                &field.datatype,
+                bytes,
+                sizeof_addr,
+                &mut guard.reader,
+            )?);
+        }
+
+        Ok(result)
+    }
+
+    fn decode_value<R: Read + Seek>(
+        dtype: &DatatypeMessage,
+        bytes: &[u8],
+        sizeof_addr: usize,
+        reader: &mut HdfReader<R>,
+    ) -> Result<H5Value> {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeClass};
+
+        match dtype.class {
+            DatatypeClass::FixedPoint | DatatypeClass::BitField => {
+                let le = matches!(dtype.byte_order(), Some(ByteOrder::LittleEndian) | None);
+                if dtype.is_signed().unwrap_or(false) {
+                    Ok(H5Value::Int(read_signed_int(bytes, le)))
+                } else {
+                    Ok(H5Value::UInt(read_unsigned_int(bytes, le)))
+                }
+            }
+            DatatypeClass::FloatingPoint => match dtype.size {
+                4 => {
+                    let arr = endian_array::<4>(bytes, dtype.byte_order())?;
+                    Ok(H5Value::Float(f32::from_le_bytes(arr) as f64))
+                }
+                8 => {
+                    let arr = endian_array::<8>(bytes, dtype.byte_order())?;
+                    Ok(H5Value::Float(f64::from_le_bytes(arr)))
+                }
+                _ => Ok(H5Value::Raw(bytes.to_vec())),
+            },
+            DatatypeClass::String => Ok(H5Value::String(decode_fixed_string(bytes))),
+            DatatypeClass::Compound => {
+                let fields = dtype
+                    .compound_fields()
+                    .ok_or_else(|| Error::InvalidFormat("invalid nested compound type".into()))?;
+                let mut values = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let end = field.byte_offset.checked_add(field.size).ok_or_else(|| {
+                        Error::InvalidFormat("nested compound field offset overflow".into())
+                    })?;
+                    if end > bytes.len() {
+                        return Err(Error::InvalidFormat(format!(
+                            "nested compound field '{}' exceeds record bounds",
+                            field.name
+                        )));
+                    }
+                    values.push((
+                        field.name.clone(),
+                        Self::decode_value(
+                            &field.datatype,
+                            &bytes[field.byte_offset..end],
+                            sizeof_addr,
+                            reader,
+                        )?,
+                    ));
+                }
+                Ok(H5Value::Compound(values))
+            }
+            DatatypeClass::Array => {
+                let (dims, base) = dtype
+                    .array_dims_base()
+                    .ok_or_else(|| Error::InvalidFormat("invalid array datatype".into()))?;
+                let count = dims.iter().try_fold(1usize, |acc, &dim| {
+                    acc.checked_mul(dim as usize)
+                        .ok_or_else(|| Error::InvalidFormat("array element count overflow".into()))
+                })?;
+                let elem_size = base.size as usize;
+                if elem_size == 0 || bytes.len() < count.saturating_mul(elem_size) {
+                    return Err(Error::InvalidFormat("array field payload too short".into()));
+                }
+                let mut values = Vec::with_capacity(count);
+                for chunk in bytes[..count * elem_size].chunks_exact(elem_size) {
+                    values.push(Self::decode_value(&base, chunk, sizeof_addr, reader)?);
+                }
+                Ok(H5Value::Array(values))
+            }
+            DatatypeClass::VarLen => {
+                let base = dtype.vlen_base();
+                Self::decode_vlen_value(base.as_ref(), bytes, sizeof_addr, reader)
+            }
+            DatatypeClass::Reference => {
+                let n = bytes.len().min(sizeof_addr).min(8);
+                let mut addr = 0u64;
+                for (i, byte) in bytes.iter().take(n).enumerate() {
+                    addr |= (*byte as u64) << (i * 8);
+                }
+                Ok(H5Value::Reference(addr))
+            }
+            DatatypeClass::Enum | DatatypeClass::Opaque | DatatypeClass::Time => {
+                Ok(H5Value::Raw(bytes.to_vec()))
+            }
+        }
+    }
+
+    fn decode_vlen_value<R: Read + Seek>(
+        base: Option<&DatatypeMessage>,
+        bytes: &[u8],
+        sizeof_addr: usize,
+        reader: &mut HdfReader<R>,
+    ) -> Result<H5Value> {
+        if bytes.len() < 4 + sizeof_addr + 4 {
+            return Err(Error::InvalidFormat(
+                "variable-length descriptor too short".into(),
+            ));
+        }
+
+        let seq_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let mut addr = 0u64;
+        for i in 0..sizeof_addr.min(8) {
+            addr |= (bytes[4 + i] as u64) << (i * 8);
+        }
+        let index_pos = 4 + sizeof_addr;
+        let index = u32::from_le_bytes([
+            bytes[index_pos],
+            bytes[index_pos + 1],
+            bytes[index_pos + 2],
+            bytes[index_pos + 3],
+        ]);
+
+        if seq_len == 0 || addr == 0 || crate::io::reader::is_undef_addr(addr) {
+            return Ok(H5Value::VarLen(Vec::new()));
+        }
+
+        let data = crate::format::global_heap::read_global_heap_object(
+            reader,
+            &crate::format::global_heap::GlobalHeapRef {
+                collection_addr: addr,
+                object_index: index,
+            },
+        )?;
+
+        let Some(base) = base else {
+            return Ok(H5Value::Raw(data));
+        };
+
+        if base.class == crate::format::messages::datatype::DatatypeClass::String {
+            return Ok(H5Value::String(
+                String::from_utf8_lossy(&data)
+                    .trim_end_matches('\0')
+                    .to_string(),
+            ));
+        }
+
+        let elem_size = base.size as usize;
+        if elem_size == 0 || data.len() < seq_len.saturating_mul(elem_size) {
+            return Ok(H5Value::Raw(data));
+        }
+
+        let mut values = Vec::with_capacity(seq_len);
+        for chunk in data[..seq_len * elem_size].chunks_exact(elem_size) {
+            values.push(Self::decode_value(base, chunk, sizeof_addr, reader)?);
+        }
+
+        Ok(H5Value::VarLen(values))
+    }
+
     /// Byte-swap a specific compound field in the raw data buffer.
-    /// Currently a no-op -- assumes native byte order for compound members.
-    fn maybe_byte_swap_field(&self, _data: &mut [u8], _field: &crate::format::messages::datatype::CompoundField) -> Result<()> {
+    fn maybe_byte_swap_field(
+        &self,
+        data: &mut [u8],
+        field: &crate::format::messages::datatype::CompoundField,
+    ) -> Result<()> {
+        use crate::format::messages::datatype::{ByteOrder, DatatypeClass};
+
+        if field.size <= 1 {
+            return Ok(());
+        }
+
+        match field.class {
+            DatatypeClass::FixedPoint | DatatypeClass::FloatingPoint | DatatypeClass::BitField => {}
+            _ => return Ok(()),
+        }
+
+        let need_swap = match field.byte_order {
+            Some(ByteOrder::BigEndian) => cfg!(target_endian = "little"),
+            Some(ByteOrder::LittleEndian) => cfg!(target_endian = "big"),
+            None => false,
+        };
+
+        if !need_swap {
+            return Ok(());
+        }
+
+        let info = self.info()?;
+        let record_size = info.datatype.size as usize;
+        if record_size == 0 || field.byte_offset + field.size > record_size {
+            return Err(Error::InvalidFormat(format!(
+                "compound field '{}' exceeds record bounds",
+                field.name
+            )));
+        }
+
+        for record in data.chunks_exact_mut(record_size) {
+            record[field.byte_offset..field.byte_offset + field.size].reverse();
+        }
+
         Ok(())
     }
 
@@ -311,10 +598,12 @@ impl Dataset {
             1
         } else {
             info.dataspace.dims.iter().try_fold(1u64, |acc, &d| {
-                acc.checked_mul(d).ok_or_else(|| Error::InvalidFormat("dimension product overflow".into()))
+                acc.checked_mul(d)
+                    .ok_or_else(|| Error::InvalidFormat("dimension product overflow".into()))
             })?
         };
-        let total_bytes = (total_elements as usize).checked_mul(element_size)
+        let total_bytes = (total_elements as usize)
+            .checked_mul(element_size)
             .ok_or_else(|| Error::InvalidFormat("total data size overflow".into()))?;
 
         // Sanity limit: refuse to allocate more than 4GB in a single read
@@ -348,13 +637,7 @@ impl Dataset {
                 let data = guard.reader.read_bytes(size)?;
                 Ok(data)
             }
-            LayoutClass::Chunked => {
-                Self::read_chunked(
-                    &mut guard.reader,
-                    &info,
-                    total_bytes,
-                )
-            }
+            LayoutClass::Chunked => Self::read_chunked(&mut guard.reader, &info, total_bytes),
             LayoutClass::Virtual => Err(Error::Unsupported("virtual datasets".into())),
         }
     }
@@ -389,14 +672,13 @@ impl Dataset {
         let shape = self.shape()?;
         if shape.len() != 2 {
             return Err(Error::InvalidFormat(format!(
-                "expected 2D dataset, got {}D", shape.len()
+                "expected 2D dataset, got {}D",
+                shape.len()
             )));
         }
         let vec = self.read::<T>()?;
-        ndarray::Array2::from_shape_vec(
-            (shape[0] as usize, shape[1] as usize),
-            vec,
-        ).map_err(|e| Error::Other(format!("ndarray shape error: {e}")))
+        ndarray::Array2::from_shape_vec((shape[0] as usize, shape[1] as usize), vec)
+            .map_err(|e| Error::Other(format!("ndarray shape error: {e}")))
     }
 
     /// Read a subset of the dataset using a selection.
@@ -518,24 +800,41 @@ impl Dataset {
 
         let data_dims = &info.dataspace.dims;
         let ndims = data_dims.len();
+        let chunk_data_dims = if chunk_dims.len() == ndims + 1 {
+            &chunk_dims[..ndims]
+        } else if chunk_dims.len() == ndims {
+            chunk_dims.as_slice()
+        } else {
+            return Err(Error::InvalidFormat(format!(
+                "chunk dims rank {} does not match dataspace rank {}",
+                chunk_dims.len(),
+                ndims
+            )));
+        };
 
         // Calculate chunk size in bytes
-        let chunk_elements: u64 = chunk_dims.iter().copied()
-            .try_fold(1u64, |a, b| a.checked_mul(b))
-            .ok_or_else(|| Error::InvalidFormat("chunk dimension product overflow".into()))?;
-        let chunk_bytes = (chunk_elements as usize).checked_mul(element_size)
-            .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?;
+        let chunk_bytes = if chunk_dims.len() == ndims + 1 {
+            chunk_dims
+                .iter()
+                .copied()
+                .try_fold(1u64, |a, b| a.checked_mul(b))
+                .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?
+                as usize
+        } else {
+            let chunk_elements: u64 = chunk_data_dims
+                .iter()
+                .copied()
+                .try_fold(1u64, |a, b| a.checked_mul(b))
+                .ok_or_else(|| Error::InvalidFormat("chunk dimension product overflow".into()))?;
+            (chunk_elements as usize)
+                .checked_mul(element_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?
+        };
 
-        // Calculate number of chunks in each dimension
-        let mut n_chunks_per_dim = Vec::with_capacity(ndims);
-        for i in 0..ndims {
-            let n = (data_dims[i] + chunk_dims[i] - 1) / chunk_dims[i];
-            n_chunks_per_dim.push(n);
-        }
-
-        let idx_addr = info.layout.chunk_index_addr.ok_or_else(|| {
-            Error::InvalidFormat("chunked dataset missing index address".into())
-        })?;
+        let idx_addr = info
+            .layout
+            .chunk_index_addr
+            .ok_or_else(|| Error::InvalidFormat("chunked dataset missing index address".into()))?;
 
         if crate::io::reader::is_undef_addr(idx_addr) {
             return Ok(vec![0u8; total_bytes]);
@@ -554,7 +853,7 @@ impl Dataset {
                         idx_addr,
                         info,
                         data_dims,
-                        chunk_dims,
+                        chunk_data_dims,
                         chunk_bytes,
                         element_size,
                         total_bytes,
@@ -563,7 +862,9 @@ impl Dataset {
                     // Single chunk: data is at the index address
                     reader.seek(idx_addr)?;
                     let mut raw = reader.read_bytes(
-                        info.layout.single_chunk_filtered_size.unwrap_or(chunk_bytes as u64) as usize,
+                        info.layout
+                            .single_chunk_filtered_size
+                            .unwrap_or(chunk_bytes as u64) as usize,
                     )?;
 
                     if let Some(ref pipeline) = info.filter_pipeline {
@@ -592,19 +893,59 @@ impl Dataset {
 
                 Ok(raw[..total_bytes.min(raw.len())].to_vec())
             }
-            _ => {
-                // For other index types, try v1 B-tree as fallback
-                Self::read_chunked_btree_v1(
-                    reader,
-                    idx_addr,
-                    info,
-                    data_dims,
-                    chunk_dims,
-                    chunk_bytes,
-                    element_size,
-                    total_bytes,
-                )
-            }
+            Some(ChunkIndexType::BTreeV1) => Self::read_chunked_btree_v1(
+                reader,
+                idx_addr,
+                info,
+                data_dims,
+                chunk_data_dims,
+                chunk_bytes,
+                element_size,
+                total_bytes,
+            ),
+            Some(ChunkIndexType::Implicit) => Self::read_chunked_implicit(
+                reader,
+                idx_addr,
+                info,
+                data_dims,
+                chunk_data_dims,
+                chunk_bytes,
+                element_size,
+                total_bytes,
+            ),
+            Some(ChunkIndexType::FixedArray) => Self::read_chunked_fixed_array(
+                reader,
+                idx_addr,
+                info,
+                data_dims,
+                chunk_data_dims,
+                chunk_bytes,
+                element_size,
+                total_bytes,
+            ),
+            Some(ChunkIndexType::ExtensibleArray) => Self::read_chunked_extensible_array(
+                reader,
+                idx_addr,
+                info,
+                data_dims,
+                chunk_data_dims,
+                chunk_bytes,
+                element_size,
+                total_bytes,
+            ),
+            Some(ChunkIndexType::BTreeV2) => Self::read_chunked_btree_v2(
+                reader,
+                idx_addr,
+                info,
+                data_dims,
+                chunk_data_dims,
+                chunk_bytes,
+                element_size,
+                total_bytes,
+            ),
+            None => Err(Error::InvalidFormat(
+                "chunked dataset missing chunk index type".into(),
+            )),
         }
     }
 
@@ -651,6 +992,331 @@ impl Dataset {
         }
 
         Ok(output)
+    }
+
+    fn read_chunked_implicit<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        base_addr: u64,
+        info: &DatasetInfo,
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_bytes: usize,
+        element_size: usize,
+        total_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if let Some(ref pipeline) = info.filter_pipeline {
+            if !pipeline.filters.is_empty() {
+                return Err(Error::Unsupported(
+                    "v4 implicit chunk index with filters is not implemented".into(),
+                ));
+            }
+        }
+
+        let ndims = data_dims.len();
+        let total_chunks: usize = data_dims
+            .iter()
+            .zip(chunk_dims)
+            .map(|(&dim, &chunk)| ((dim + chunk - 1) / chunk) as usize)
+            .try_fold(1usize, |acc, count| acc.checked_mul(count))
+            .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
+
+        let mut output = vec![0u8; total_bytes];
+        for chunk_index in 0..total_chunks {
+            let coords = Self::implicit_chunk_coords(chunk_index, data_dims, chunk_dims);
+            let offset = (chunk_index as u64)
+                .checked_mul(chunk_bytes as u64)
+                .and_then(|off| base_addr.checked_add(off))
+                .ok_or_else(|| Error::InvalidFormat("implicit chunk address overflow".into()))?;
+            reader.seek(offset)?;
+            let raw = reader.read_bytes(chunk_bytes)?;
+            Self::copy_chunk_to_output(
+                &raw,
+                &coords,
+                data_dims,
+                chunk_dims,
+                element_size,
+                &mut output,
+            );
+        }
+
+        if ndims == 0 {
+            output.truncate(total_bytes.min(chunk_bytes));
+        }
+        Ok(output)
+    }
+
+    fn read_chunked_fixed_array<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        index_addr: u64,
+        info: &DatasetInfo,
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_bytes: usize,
+        element_size: usize,
+        total_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let filtered = info
+            .filter_pipeline
+            .as_ref()
+            .map(|pipeline| !pipeline.filters.is_empty())
+            .unwrap_or(false);
+        let chunk_size_len = if filtered {
+            Self::filtered_chunk_size_len(info, chunk_bytes, reader.sizeof_size() as usize)?
+        } else {
+            0
+        };
+
+        let elements = crate::format::fixed_array::read_fixed_array_chunks(
+            reader,
+            index_addr,
+            filtered,
+            chunk_size_len,
+        )?;
+        let mut output = vec![0u8; total_bytes];
+
+        for (chunk_index, element) in elements.iter().enumerate() {
+            if crate::io::reader::is_undef_addr(element.addr) {
+                continue;
+            }
+
+            let coords = Self::implicit_chunk_coords(chunk_index, data_dims, chunk_dims);
+            reader.seek(element.addr)?;
+            let read_size = element.nbytes.unwrap_or(chunk_bytes as u64) as usize;
+            let mut raw = reader.read_bytes(read_size).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "failed to read fixed-array chunk {chunk_index} at address {} with size {read_size}: {err}",
+                    element.addr
+                ))
+            })?;
+
+            if let Some(ref pipeline) = info.filter_pipeline {
+                if !pipeline.filters.is_empty() {
+                    raw = filters::apply_pipeline_reverse(&raw, pipeline, element_size)?;
+                }
+            }
+
+            Self::copy_chunk_to_output(
+                &raw,
+                &coords,
+                data_dims,
+                chunk_dims,
+                element_size,
+                &mut output,
+            );
+        }
+
+        Ok(output)
+    }
+
+    fn read_chunked_extensible_array<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        index_addr: u64,
+        info: &DatasetInfo,
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_bytes: usize,
+        element_size: usize,
+        total_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let filtered = info
+            .filter_pipeline
+            .as_ref()
+            .map(|pipeline| !pipeline.filters.is_empty())
+            .unwrap_or(false);
+        let chunk_size_len = if filtered {
+            Self::filtered_chunk_size_len(info, chunk_bytes, reader.sizeof_size() as usize)?
+        } else {
+            0
+        };
+
+        let elements = crate::format::extensible_array::read_extensible_array_chunks(
+            reader,
+            index_addr,
+            filtered,
+            chunk_size_len,
+        )?;
+        let mut output = vec![0u8; total_bytes];
+
+        for (chunk_index, element) in elements.iter().enumerate() {
+            if crate::io::reader::is_undef_addr(element.addr) {
+                continue;
+            }
+
+            let coords = Self::implicit_chunk_coords(chunk_index, data_dims, chunk_dims);
+            reader.seek(element.addr)?;
+            let read_size = element.nbytes.unwrap_or(chunk_bytes as u64) as usize;
+            let mut raw = reader.read_bytes(read_size).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "failed to read extensible-array chunk {chunk_index} at address {} with size {read_size}: {err}",
+                    element.addr
+                ))
+            })?;
+
+            if let Some(ref pipeline) = info.filter_pipeline {
+                if !pipeline.filters.is_empty() {
+                    raw = filters::apply_pipeline_reverse(&raw, pipeline, element_size)?;
+                }
+            }
+
+            Self::copy_chunk_to_output(
+                &raw,
+                &coords,
+                data_dims,
+                chunk_dims,
+                element_size,
+                &mut output,
+            );
+        }
+
+        Ok(output)
+    }
+
+    fn read_chunked_btree_v2<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        index_addr: u64,
+        info: &DatasetInfo,
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_bytes: usize,
+        element_size: usize,
+        total_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let filtered = info
+            .filter_pipeline
+            .as_ref()
+            .map(|pipeline| !pipeline.filters.is_empty())
+            .unwrap_or(false);
+        let chunk_size_len = if filtered {
+            Self::filtered_chunk_size_len(info, chunk_bytes, reader.sizeof_size() as usize)?
+        } else {
+            0
+        };
+        let records = crate::format::btree_v2::collect_all_records(reader, index_addr)?;
+        let mut output = vec![0u8; total_bytes];
+
+        for record in records {
+            let (addr, nbytes, _filter_mask, scaled) = Self::decode_btree_v2_chunk_record(
+                &record,
+                filtered,
+                chunk_size_len,
+                reader.sizeof_addr() as usize,
+                data_dims.len(),
+                chunk_bytes,
+            )?;
+            if crate::io::reader::is_undef_addr(addr) {
+                continue;
+            }
+
+            let coords: Vec<u64> = scaled
+                .iter()
+                .zip(chunk_dims)
+                .map(|(&coord, &chunk)| coord * chunk)
+                .collect();
+            reader.seek(addr).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "failed to seek to v2-B-tree chunk address {addr}: {err}"
+                ))
+            })?;
+            let mut raw = reader.read_bytes(nbytes as usize).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "failed to read v2-B-tree chunk at address {addr} with size {nbytes}: {err}"
+                ))
+            })?;
+
+            if let Some(ref pipeline) = info.filter_pipeline {
+                if !pipeline.filters.is_empty() {
+                    raw = filters::apply_pipeline_reverse(&raw, pipeline, element_size)?;
+                }
+            }
+
+            Self::copy_chunk_to_output(
+                &raw,
+                &coords,
+                data_dims,
+                chunk_dims,
+                element_size,
+                &mut output,
+            );
+        }
+
+        Ok(output)
+    }
+
+    fn decode_btree_v2_chunk_record(
+        record: &[u8],
+        filtered: bool,
+        chunk_size_len: usize,
+        sizeof_addr: usize,
+        ndims: usize,
+        chunk_bytes: usize,
+    ) -> Result<(u64, u64, u32, Vec<u64>)> {
+        let mut pos = 0;
+        let addr = read_le_uint(&record[pos..], sizeof_addr)?;
+        pos += sizeof_addr;
+
+        let (nbytes, filter_mask) = if filtered {
+            let nbytes = read_le_uint(&record[pos..], chunk_size_len)?;
+            pos += chunk_size_len;
+            if pos + 4 > record.len() {
+                return Err(Error::InvalidFormat(
+                    "truncated v2-B-tree filter mask".into(),
+                ));
+            }
+            let filter_mask = u32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            (nbytes, filter_mask)
+        } else {
+            (chunk_bytes as u64, 0)
+        };
+
+        let mut scaled = Vec::with_capacity(ndims);
+        for _ in 0..ndims {
+            let coord = read_le_uint(&record[pos..], 8)?;
+            pos += 8;
+            scaled.push(coord);
+        }
+
+        Ok((addr, nbytes, filter_mask, scaled))
+    }
+
+    fn filtered_chunk_size_len(
+        info: &DatasetInfo,
+        chunk_bytes: usize,
+        sizeof_size: usize,
+    ) -> Result<usize> {
+        if info.layout.version > 4 {
+            return Ok(sizeof_size);
+        }
+
+        let bits = if chunk_bytes == 0 {
+            0
+        } else {
+            usize::BITS as usize - chunk_bytes.leading_zeros() as usize
+        };
+        Ok((1 + ((bits + 8) / 8)).min(8))
+    }
+
+    fn implicit_chunk_coords(
+        chunk_index: usize,
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+    ) -> Vec<u64> {
+        let ndims = data_dims.len();
+        let chunks_per_dim: Vec<usize> = data_dims
+            .iter()
+            .zip(chunk_dims)
+            .map(|(&dim, &chunk)| ((dim + chunk - 1) / chunk) as usize)
+            .collect();
+        let mut remaining = chunk_index;
+        let mut coords = vec![0u64; ndims];
+
+        for dim in (0..ndims).rev() {
+            let chunk_coord = remaining % chunks_per_dim[dim];
+            remaining /= chunks_per_dim[dim];
+            coords[dim] = (chunk_coord as u64) * chunk_dims[dim];
+        }
+
+        coords
     }
 
     /// Collect all chunk entries from a v1 B-tree.
@@ -765,7 +1431,15 @@ impl Dataset {
             }
         } else {
             // General N-dimensional copy
-            Self::copy_chunk_nd(chunk_data, coords, data_dims, chunk_dims, element_size, output, ndims);
+            Self::copy_chunk_nd(
+                chunk_data,
+                coords,
+                data_dims,
+                chunk_dims,
+                element_size,
+                output,
+                ndims,
+            );
         }
     }
 
@@ -833,4 +1507,86 @@ impl Dataset {
             }
         }
     }
+}
+
+fn read_le_uint(bytes: &[u8], size: usize) -> Result<u64> {
+    if size == 0 || size > 8 || bytes.len() < size {
+        return Err(Error::InvalidFormat(format!(
+            "invalid little-endian integer size {size}"
+        )));
+    }
+
+    let mut value = 0u64;
+    for (idx, byte) in bytes[..size].iter().enumerate() {
+        value |= (*byte as u64) << (idx * 8);
+    }
+    Ok(value)
+}
+
+fn read_unsigned_int(bytes: &[u8], little_endian: bool) -> u128 {
+    let mut value = 0u128;
+    let n = bytes.len().min(16);
+    if little_endian {
+        for (idx, byte) in bytes.iter().take(n).enumerate() {
+            value |= (*byte as u128) << (idx * 8);
+        }
+    } else {
+        for byte in bytes.iter().take(n) {
+            value = (value << 8) | (*byte as u128);
+        }
+    }
+    value
+}
+
+fn read_signed_int(bytes: &[u8], little_endian: bool) -> i128 {
+    let n = bytes.len().min(16);
+    let unsigned = read_unsigned_int(bytes, little_endian);
+    if n == 0 {
+        return 0;
+    }
+
+    let bits = n * 8;
+    if bits == 128 {
+        unsigned as i128
+    } else {
+        let sign_bit = 1u128 << (bits - 1);
+        if unsigned & sign_bit == 0 {
+            unsigned as i128
+        } else {
+            (unsigned as i128) - (1i128 << bits)
+        }
+    }
+}
+
+fn endian_array<const N: usize>(
+    bytes: &[u8],
+    byte_order: Option<crate::format::messages::datatype::ByteOrder>,
+) -> Result<[u8; N]> {
+    if bytes.len() < N {
+        return Err(Error::InvalidFormat(
+            "floating-point payload too short".into(),
+        ));
+    }
+
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(&bytes[..N]);
+    let need_swap = match byte_order {
+        Some(crate::format::messages::datatype::ByteOrder::BigEndian) => {
+            cfg!(target_endian = "little")
+        }
+        Some(crate::format::messages::datatype::ByteOrder::LittleEndian) | None => {
+            cfg!(target_endian = "big")
+        }
+    };
+    if need_swap {
+        arr.reverse();
+    }
+    Ok(arr)
+}
+
+fn decode_fixed_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end])
+        .trim_end()
+        .to_string()
 }

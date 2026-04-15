@@ -13,13 +13,17 @@ pub enum Selection {
 #[derive(Debug, Clone)]
 pub struct SliceInfo {
     pub start: u64,
-    pub end: u64,    // exclusive
-    pub step: u64,   // must be 1 for now
+    pub end: u64,  // exclusive
+    pub step: u64, // must be 1 for now
 }
 
 impl SliceInfo {
     pub fn new(start: u64, end: u64) -> Self {
-        Self { start, end, step: 1 }
+        Self {
+            start,
+            end,
+            step: 1,
+        }
     }
 
     pub fn count(&self) -> u64 {
@@ -86,18 +90,14 @@ impl Selection {
     pub fn output_shape(&self, ds_shape: &[u64]) -> Vec<u64> {
         match self {
             Selection::All => ds_shape.to_vec(),
-            Selection::Slice(slices) => {
-                slices.iter().map(|s| s.count()).collect()
-            }
+            Selection::Slice(slices) => slices.iter().map(|s| s.count()).collect(),
         }
     }
 
     /// Normalize into concrete SliceInfo per dimension.
     pub fn to_slices(&self, ds_shape: &[u64]) -> Vec<SliceInfo> {
         match self {
-            Selection::All => {
-                ds_shape.iter().map(|&d| SliceInfo::new(0, d)).collect()
-            }
+            Selection::All => ds_shape.iter().map(|&d| SliceInfo::new(0, d)).collect(),
             Selection::Slice(slices) => slices.clone(),
         }
     }

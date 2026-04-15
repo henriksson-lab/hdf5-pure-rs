@@ -27,9 +27,7 @@ impl LocalHeap {
         // Version
         let version = reader.read_u8()?;
         if version != 0 {
-            return Err(Error::Unsupported(format!(
-                "local heap version {version}"
-            )));
+            return Err(Error::Unsupported(format!("local heap version {version}")));
         }
 
         // Reserved

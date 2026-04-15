@@ -8,9 +8,9 @@ use crate::error::{Error, Result};
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = ZlibDecoder::new(data);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|e| {
-        Error::InvalidFormat(format!("deflate decompression failed: {e}"))
-    })?;
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| Error::InvalidFormat(format!("deflate decompression failed: {e}")))?;
     Ok(out)
 }
 
@@ -21,10 +21,10 @@ pub fn compress(data: &[u8], level: u32) -> Result<Vec<u8>> {
     use std::io::Write;
 
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data).map_err(|e| {
-        Error::InvalidFormat(format!("deflate compression failed: {e}"))
-    })?;
-    encoder.finish().map_err(|e| {
-        Error::InvalidFormat(format!("deflate compression finish failed: {e}"))
-    })
+    encoder
+        .write_all(data)
+        .map_err(|e| Error::InvalidFormat(format!("deflate compression failed: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| Error::InvalidFormat(format!("deflate compression finish failed: {e}")))
 }

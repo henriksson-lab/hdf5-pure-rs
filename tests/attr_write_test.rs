@@ -5,16 +5,19 @@ use hdf5_pure_rust::File;
 
 #[test]
 fn test_write_dataset_with_attrs() {
-    let path = "tests/data/written_with_attrs.h5";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_with_attrs.h5");
 
     {
-        let f = fs::File::create(path).unwrap();
+        let f = fs::File::create(&path).unwrap();
         let mut w = HdfFileWriter::new(f);
         w.begin().unwrap();
         w.create_root_group().unwrap();
 
         let data: Vec<u8> = vec![1.0f64, 2.0, 3.0]
-            .iter().flat_map(|v| v.to_le_bytes()).collect();
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
 
         let attr_data = 42i64.to_le_bytes().to_vec();
 
@@ -32,18 +35,20 @@ fn test_write_dataset_with_attrs() {
                 dtype: DtypeSpec::I64,
                 data: &attr_data,
             }],
-        ).unwrap();
+        )
+        .unwrap();
 
         w.finalize().unwrap();
     }
 
     {
-        let f = File::open(path).unwrap();
+        let f = File::open(&path).unwrap();
         let ds = f.dataset("data").unwrap();
 
         // Read dataset
         let raw = ds.read_raw().unwrap();
-        let values: Vec<f64> = raw.chunks_exact(8)
+        let values: Vec<f64> = raw
+            .chunks_exact(8)
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
@@ -58,7 +63,7 @@ fn test_write_dataset_with_attrs() {
 
     // Verify with h5dump
     {
-        let out = std::process::Command::new("h5dump").arg(path).output();
+        let out = std::process::Command::new("h5dump").arg(&path).output();
         if let Ok(out) = out {
             let stdout = String::from_utf8_lossy(&out.stdout);
             println!("h5dump:\n{stdout}");
@@ -66,16 +71,15 @@ fn test_write_dataset_with_attrs() {
             assert!(stdout.contains("count"));
         }
     }
-
-    fs::remove_file(path).ok();
 }
 
 #[test]
 fn test_write_root_attrs() {
-    let path = "tests/data/written_root_attrs.h5";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_root_attrs.h5");
 
     {
-        let f = fs::File::create(path).unwrap();
+        let f = fs::File::create(&path).unwrap();
         let mut w = HdfFileWriter::new(f);
         w.begin().unwrap();
         w.create_root_group().unwrap();
@@ -92,7 +96,7 @@ fn test_write_root_attrs() {
     }
 
     {
-        let f = File::open(path).unwrap();
+        let f = File::open(&path).unwrap();
         let attr_names = f.attr_names().unwrap();
         assert!(attr_names.contains(&"pi".to_string()));
 
@@ -100,6 +104,4 @@ fn test_write_root_attrs() {
         let val = attr.read_scalar_f64().unwrap();
         assert!((val - 3.14).abs() < 1e-10);
     }
-
-    fs::remove_file(path).ok();
 }

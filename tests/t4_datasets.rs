@@ -3,7 +3,9 @@
 use hdf5_pure_rust::File;
 
 const FILE: &str = "tests/data/hdf5_ref/layouts_and_filters.h5";
-fn open() -> File { File::open(FILE).unwrap() }
+fn open() -> File {
+    File::open(FILE).unwrap()
+}
 
 // T4a: Storage layouts
 
@@ -27,7 +29,9 @@ fn t4a_chunked_raw() {
     assert!(ds.is_chunked().unwrap());
     let vals: Vec<i32> = ds.read::<i32>().unwrap();
     assert_eq!(vals.len(), 200);
-    for (i, v) in vals.iter().enumerate() { assert_eq!(*v, i as i32); }
+    for (i, v) in vals.iter().enumerate() {
+        assert_eq!(*v, i as i32);
+    }
 }
 
 // T4b: Chunked with filters
@@ -39,7 +43,9 @@ fn t4b_deflate() {
     assert!(plist.is_compressed());
     let vals: Vec<f32> = ds.read::<f32>().unwrap();
     assert_eq!(vals.len(), 200);
-    for (i, v) in vals.iter().enumerate() { assert_eq!(*v, i as f32); }
+    for (i, v) in vals.iter().enumerate() {
+        assert_eq!(*v, i as f32);
+    }
 }
 
 #[test]
@@ -50,7 +56,9 @@ fn t4b_shuffle_deflate() {
     assert!(plist.is_compressed());
     let vals: Vec<i64> = ds.read::<i64>().unwrap();
     assert_eq!(vals.len(), 200);
-    for (i, v) in vals.iter().enumerate() { assert_eq!(*v, i as i64); }
+    for (i, v) in vals.iter().enumerate() {
+        assert_eq!(*v, i as i64);
+    }
 }
 
 #[test]
@@ -58,7 +66,9 @@ fn t4b_fletcher32() {
     let ds = open().dataset("chunked_fletcher").unwrap();
     let vals: Vec<f32> = ds.read::<f32>().unwrap();
     assert_eq!(vals.len(), 100);
-    for (i, v) in vals.iter().enumerate() { assert_eq!(*v, i as f32); }
+    for (i, v) in vals.iter().enumerate() {
+        assert_eq!(*v, i as f32);
+    }
 }
 
 #[test]

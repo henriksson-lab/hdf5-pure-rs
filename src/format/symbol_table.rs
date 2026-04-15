@@ -37,7 +37,9 @@ impl SymbolTableNode {
 
         let magic = reader.read_bytes(4)?;
         if magic != SNOD_MAGIC {
-            return Err(Error::InvalidFormat("invalid symbol table node magic".into()));
+            return Err(Error::InvalidFormat(
+                "invalid symbol table node magic".into(),
+            ));
         }
 
         let version = reader.read_u8()?;

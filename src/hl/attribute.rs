@@ -66,7 +66,9 @@ impl Attribute {
         // Use bytes_to_vec for alignment safety, then take first element
         let vec = self.read::<T>()?;
         if vec.is_empty() {
-            return Err(crate::Error::InvalidFormat("no data for scalar read".into()));
+            return Err(crate::Error::InvalidFormat(
+                "no data for scalar read".into(),
+            ));
         }
         Ok(vec[0])
     }

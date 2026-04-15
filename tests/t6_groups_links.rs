@@ -3,7 +3,9 @@
 use hdf5_pure_rust::File;
 
 const FILE: &str = "tests/data/hdf5_ref/groups_and_links.h5";
-fn open() -> File { File::open(FILE).unwrap() }
+fn open() -> File {
+    File::open(FILE).unwrap()
+}
 
 // T6a: Nested groups
 

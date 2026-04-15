@@ -28,7 +28,10 @@ impl FilterInfo {
             4 => "szip".to_string(),
             5 => "nbit".to_string(),
             6 => "scaleoffset".to_string(),
-            _ => desc.name.clone().unwrap_or_else(|| format!("filter_{}", desc.id)),
+            _ => desc
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("filter_{}", desc.id)),
         };
         Self {
             id: desc.id,

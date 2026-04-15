@@ -6,7 +6,10 @@ fn test_read_bigendian_float() {
     let ds = f.dataset("be_float").unwrap();
 
     let dtype = ds.dtype().unwrap();
-    assert_eq!(dtype.byte_order(), Some(hdf5_pure_rust::format::messages::datatype::ByteOrder::BigEndian));
+    assert_eq!(
+        dtype.byte_order(),
+        Some(hdf5_pure_rust::format::messages::datatype::ByteOrder::BigEndian)
+    );
 
     let vals: Vec<f64> = ds.read::<f64>().unwrap();
     assert_eq!(vals, vec![1.0, 2.0, 3.0]);

@@ -35,13 +35,29 @@ impl FilterPipelineMessage {
         let version = data[0];
         let nfilters = data[1] as usize;
 
-        match version {
+        let result = match version {
             1 => Self::decode_v1(data, nfilters),
             2 => Self::decode_v2(data, nfilters),
             _ => Err(Error::Unsupported(format!(
                 "filter pipeline version {version}"
             ))),
+        };
+
+        #[cfg(feature = "tracehash")]
+        if let Ok(message) = &result {
+            let mut th = tracehash::th_call!("hdf5.filter_pipeline.decode");
+            th.input_bytes(data);
+            th.output_u64(message.version as u64);
+            th.output_u64(message.filters.len() as u64);
+            for filter in &message.filters {
+                th.output_u64(filter.id as u64);
+                th.output_u64(filter.flags as u64);
+                th.output_u64(filter.client_data.len() as u64);
+            }
+            th.finish();
         }
+
+        result
     }
 
     fn decode_v1(data: &[u8], nfilters: usize) -> Result<Self> {
@@ -82,7 +98,8 @@ impl FilterPipelineMessage {
             // Client data values
             let mut client_data = Vec::with_capacity(cd_nelmts);
             for _ in 0..cd_nelmts {
-                let val = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let val =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 pos += 4;
                 client_data.push(val);
             }
@@ -145,7 +162,8 @@ impl FilterPipelineMessage {
 
             let mut client_data = Vec::with_capacity(cd_nelmts);
             for _ in 0..cd_nelmts {
-                let val = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let val =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 pos += 4;
                 client_data.push(val);
             }

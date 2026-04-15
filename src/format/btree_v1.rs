@@ -31,10 +31,7 @@ pub struct BTreeV1Node {
 
 impl BTreeV1Node {
     /// Read a v1 B-tree node at the given address.
-    pub fn read_at<R: Read + Seek>(
-        reader: &mut HdfReader<R>,
-        addr: u64,
-    ) -> Result<Self> {
+    pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr)?;
 
         let magic = reader.read_bytes(4)?;
@@ -109,9 +106,7 @@ impl BTreeV1Node {
         let node = Self::read_at(reader, btree_addr)?;
 
         if node.node_type != BTreeType::Group {
-            return Err(Error::InvalidFormat(
-                "expected group B-tree".into(),
-            ));
+            return Err(Error::InvalidFormat("expected group B-tree".into()));
         }
 
         if node.level == 0 {

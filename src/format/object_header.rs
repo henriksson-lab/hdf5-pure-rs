@@ -90,13 +90,30 @@ impl ObjectHeader {
         // V2 headers start with "OHDR" magic; v1 starts with version byte (1).
         let first_bytes = reader.read_bytes(4)?;
 
-        if first_bytes == OHDR_MAGIC {
+        let result = if first_bytes == OHDR_MAGIC {
             Self::read_v2(reader, addr)
         } else {
             // Seek back and re-read as v1. The first byte is the version.
             reader.seek(addr)?;
             Self::read_v1(reader)
+        };
+
+        #[cfg(feature = "tracehash")]
+        if let Ok(header) = &result {
+            let mut th = tracehash::th_call!("hdf5.object_header.read");
+            th.input_u64(addr);
+            th.output_u64(header.version as u64);
+            th.output_u64(header.flags as u64);
+            th.output_u64(header.refcount as u64);
+            th.output_u64(header.messages.len() as u64);
+            for message in &header.messages {
+                th.output_u64(message.msg_type as u64);
+                th.output_u64(message.data.len() as u64);
+            }
+            th.finish();
         }
+
+        result
     }
 
     /// Read a v1 object header.
@@ -127,7 +144,13 @@ impl ObjectHeader {
         let mut messages = Vec::new();
         let mut continuations = Vec::new();
 
-        Self::read_v1_messages(reader, chunk_end, num_messages, &mut messages, &mut continuations)?;
+        Self::read_v1_messages(
+            reader,
+            chunk_end,
+            num_messages,
+            &mut messages,
+            &mut continuations,
+        )?;
 
         // Process continuation chunks
         for (cont_addr, cont_len) in continuations {
@@ -179,7 +202,8 @@ impl ObjectHeader {
                 // Continuation message: contains offset + length
                 let cont_offset = reader.read_addr()?;
                 let cont_length = reader.read_length()?;
-                let remaining = aligned_size - reader.sizeof_addr() as u64 - reader.sizeof_size() as u64;
+                let remaining =
+                    aligned_size - reader.sizeof_addr() as u64 - reader.sizeof_size() as u64;
                 if remaining > 0 {
                     reader.skip(remaining)?;
                 }
@@ -288,7 +312,13 @@ impl ObjectHeader {
         let mut messages = Vec::new();
         let mut continuations = Vec::new();
 
-        Self::read_v2_messages(reader, chunk0_data_end, has_crt_order, &mut messages, &mut continuations)?;
+        Self::read_v2_messages(
+            reader,
+            chunk0_data_end,
+            has_crt_order,
+            &mut messages,
+            &mut continuations,
+        )?;
 
         // Process continuation chunks
         for (cont_addr, cont_len) in continuations {
@@ -384,7 +414,13 @@ impl ObjectHeader {
         let data_end = addr + length - 4; // minus checksum
 
         let mut continuations = Vec::new();
-        Self::read_v2_messages(reader, data_end, has_crt_order, messages, &mut continuations)?;
+        Self::read_v2_messages(
+            reader,
+            data_end,
+            has_crt_order,
+            messages,
+            &mut continuations,
+        )?;
 
         // Verify checksum
         reader.seek(data_end)?;
@@ -422,9 +458,17 @@ mod tests {
         let sb = crate::format::superblock::Superblock::read(&mut reader).unwrap();
 
         let oh = ObjectHeader::read_at(&mut reader, sb.root_addr).unwrap();
-        println!("v0 root OH: version={}, refcount={}, messages:", oh.version, oh.refcount);
+        println!(
+            "v0 root OH: version={}, refcount={}, messages:",
+            oh.version, oh.refcount
+        );
         for msg in &oh.messages {
-            println!("  type={:#06x}, flags={:#04x}, len={}", msg.msg_type, msg.flags, msg.data.len());
+            println!(
+                "  type={:#06x}, flags={:#04x}, len={}",
+                msg.msg_type,
+                msg.flags,
+                msg.data.len()
+            );
         }
 
         assert_eq!(oh.version, 1);
@@ -439,14 +483,28 @@ mod tests {
         let sb = crate::format::superblock::Superblock::read(&mut reader).unwrap();
 
         let oh = ObjectHeader::read_at(&mut reader, sb.root_addr).unwrap();
-        println!("v3 root OH: version={}, flags={:#04x}, messages:", oh.version, oh.flags);
+        println!(
+            "v3 root OH: version={}, flags={:#04x}, messages:",
+            oh.version, oh.flags
+        );
         for msg in &oh.messages {
-            println!("  type={:#06x}, flags={:#04x}, len={}", msg.msg_type, msg.flags, msg.data.len());
+            println!(
+                "  type={:#06x}, flags={:#04x}, len={}",
+                msg.msg_type,
+                msg.flags,
+                msg.data.len()
+            );
         }
 
         assert_eq!(oh.version, 2);
         // V2 root group should have link messages or link info
-        let has_links = oh.messages.iter().any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO);
-        assert!(has_links, "v2 root group should have link or link info messages");
+        let has_links = oh
+            .messages
+            .iter()
+            .any(|m| m.msg_type == MSG_LINK || m.msg_type == MSG_LINK_INFO);
+        assert!(
+            has_links,
+            "v2 root group should have link or link info messages"
+        );
     }
 }

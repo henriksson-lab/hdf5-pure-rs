@@ -33,8 +33,14 @@ fn main() {
     }
     let avg_read = total_read / iterations as u32;
 
-    println!("hdf5-pure-rust write: {:.1} ms", avg_write.as_secs_f64() * 1000.0);
-    println!("hdf5-pure-rust read:  {:.1} ms", avg_read.as_secs_f64() * 1000.0);
+    println!(
+        "hdf5-pure-rust write: {:.1} ms",
+        avg_write.as_secs_f64() * 1000.0
+    );
+    println!(
+        "hdf5-pure-rust read:  {:.1} ms",
+        avg_read.as_secs_f64() * 1000.0
+    );
     println!("Data: {} f64 elements, chunked 50000, deflate level 1", n);
 
     std::fs::remove_file("/tmp/bench_rust.h5").ok();

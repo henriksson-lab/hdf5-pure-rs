@@ -8,7 +8,9 @@ use parking_lot::Mutex;
 use crate::error::{Error, Result};
 use crate::format::checksum::checksum_metadata;
 use crate::format::messages::data_layout::LayoutClass;
-use crate::format::object_header::{self, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES, HDR_ATTR_STORE_PHASE_CHANGE};
+use crate::format::object_header::{
+    self, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES,
+};
 use crate::format::superblock::Superblock;
 use crate::hl::dataset::Dataset;
 use crate::hl::file::FileInner;
@@ -43,9 +45,7 @@ impl MutableFile {
         }));
 
         // Open separately for writing
-        let write_handle = fs::OpenOptions::new()
-            .write(true)
-            .open(&path)?;
+        let write_handle = fs::OpenOptions::new().write(true).open(&path)?;
 
         Ok(Self {
             inner,
@@ -162,12 +162,16 @@ impl MutableFile {
 
         let first_bytes = reader.read_bytes(4)?;
         if first_bytes != [b'O', b'H', b'D', b'R'] {
-            return Err(Error::InvalidFormat("expected v2 object header for resize".into()));
+            return Err(Error::InvalidFormat(
+                "expected v2 object header for resize".into(),
+            ));
         }
 
         let version = reader.read_u8()?;
         if version != 2 {
-            return Err(Error::Unsupported("resize only supported for v2 object headers".into()));
+            return Err(Error::Unsupported(
+                "resize only supported for v2 object headers".into(),
+            ));
         }
 
         let flags = reader.read_u8()?;
@@ -250,7 +254,8 @@ impl MutableFile {
 
         let checksum = checksum_metadata(&oh_data);
 
-        self.write_handle.seek(SeekFrom::Start(oh_start + check_len as u64))?;
+        self.write_handle
+            .seek(SeekFrom::Start(oh_start + check_len as u64))?;
         self.write_handle.write_all(&checksum.to_le_bytes())?;
 
         Ok(())
@@ -262,10 +267,7 @@ impl MutableFile {
         let mut reader = HdfReader::new(BufReader::new(read_file));
         let superblock = Superblock::read(&mut reader)?;
         self.superblock = superblock.clone();
-        *self.inner.lock() = FileInner {
-            reader,
-            superblock,
-        };
+        *self.inner.lock() = FileInner { reader, superblock };
         Ok(())
     }
 

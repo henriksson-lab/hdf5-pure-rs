@@ -120,10 +120,7 @@ fn impl_struct(
                         .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string())
                 })
                 .collect();
-            let field_idents: Vec<_> = fields
-                .iter()
-                .map(|f| f.ident.clone().unwrap())
-                .collect();
+            let field_idents: Vec<_> = fields.iter().map(|f| f.ident.clone().unwrap()).collect();
             let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
 
             quote! {
@@ -219,21 +216,22 @@ fn impl_struct(
     }
 }
 
-fn impl_enum(
-    _ty: &Ident,
-    data: &syn::DataEnum,
-    attrs: &[Attribute],
-) -> TokenStream {
+fn impl_enum(_ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> TokenStream {
     let variants = &data.variants;
 
-    if variants.iter().any(|v| v.fields != Fields::Unit || v.discriminant.is_none()) {
+    if variants
+        .iter()
+        .any(|v| v.fields != Fields::Unit || v.discriminant.is_none())
+    {
         panic!("`H5Type` can only be derived for enums with scalar discriminants");
     }
     if variants.is_empty() {
         panic!("cannot derive `H5Type` for empty enums");
     }
 
-    let enum_reprs = &["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize"];
+    let enum_reprs = &[
+        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize",
+    ];
     let repr = find_repr(attrs, enum_reprs);
     if repr.is_none() {
         panic!("`H5Type` requires explicit integer repr for enums");
@@ -261,9 +259,14 @@ fn impl_enum(
 
 fn is_phantom_data(ty: &Type) -> bool {
     match *ty {
-        Type::Path(TypePath { qself: None, ref path }) => {
-            path.segments.iter().last().map_or(false, |x| x.ident == "PhantomData")
-        }
+        Type::Path(TypePath {
+            qself: None,
+            ref path,
+        }) => path
+            .segments
+            .iter()
+            .last()
+            .map_or(false, |x| x.ident == "PhantomData"),
         _ => false,
     }
 }

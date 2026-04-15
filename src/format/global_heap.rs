@@ -26,7 +26,9 @@ impl GlobalHeapCollection {
 
         let magic = reader.read_bytes(4)?;
         if magic != GCOL_MAGIC {
-            return Err(Error::InvalidFormat("invalid global heap collection magic".into()));
+            return Err(Error::InvalidFormat(
+                "invalid global heap collection magic".into(),
+            ));
         }
 
         let version = reader.read_u8()?;
@@ -77,7 +79,8 @@ impl GlobalHeapCollection {
 
     /// Get an object by index from this collection.
     pub fn get_object(&self, index: u32) -> Option<&[u8]> {
-        self.objects.iter()
+        self.objects
+            .iter()
             .find(|(idx, _)| *idx == index)
             .map(|(_, data)| data.as_slice())
     }

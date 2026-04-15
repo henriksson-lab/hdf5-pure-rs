@@ -29,7 +29,11 @@ impl Dataspace {
     /// Total number of elements.
     pub fn size(&self) -> u64 {
         if self.msg.dims.is_empty() {
-            if self.msg.space_type == DataspaceType::Scalar { 1 } else { 0 }
+            if self.msg.space_type == DataspaceType::Scalar {
+                1
+            } else {
+                0
+            }
         } else {
             self.msg.dims.iter().product()
         }

@@ -11,6 +11,7 @@ struct Point {
 
 #[derive(Copy, Clone, DeriveH5Type)]
 #[repr(u8)]
+#[allow(dead_code)]
 enum Color {
     Red = 0,
     Green = 1,
@@ -76,10 +77,14 @@ fn test_derive_struct_can_read() {
     let data = vec![
         1.0f64.to_le_bytes(),
         2.0f64.to_le_bytes(),
-        42i32.to_le_bytes().to_vec().into_iter()
+        42i32
+            .to_le_bytes()
+            .to_vec()
+            .into_iter()
             .chain(std::iter::repeat(0).take(4)) // padding
             .collect::<Vec<u8>>()
-            .try_into().unwrap(),
+            .try_into()
+            .unwrap(),
     ];
     let bytes: Vec<u8> = data.into_iter().flat_map(|b: [u8; 8]| b).collect();
 

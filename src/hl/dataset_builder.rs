@@ -18,11 +18,7 @@ pub struct DatasetBuilder<'a> {
 }
 
 impl<'a> DatasetBuilder<'a> {
-    pub(crate) fn new(
-        writer: &'a mut HdfFileWriter<fs::File>,
-        parent: &str,
-        name: &str,
-    ) -> Self {
+    pub(crate) fn new(writer: &'a mut HdfFileWriter<fs::File>, parent: &str, name: &str) -> Self {
         Self {
             writer,
             parent: parent.to_string(),

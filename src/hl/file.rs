@@ -51,7 +51,10 @@ impl File {
 
         let superblock = Superblock::read(&mut reader)?;
 
-        let inner = Arc::new(Mutex::new(FileInner { reader, superblock: superblock.clone() }));
+        let inner = Arc::new(Mutex::new(FileInner {
+            reader,
+            superblock: superblock.clone(),
+        }));
 
         Ok(File { inner, superblock })
     }
@@ -115,12 +118,24 @@ impl File {
 
 /// Determine object type from an object header's messages.
 pub(crate) fn object_type_from_messages(messages: &[RawMessage]) -> ObjectType {
-    let has_dataspace = messages.iter().any(|m| m.msg_type == object_header::MSG_DATASPACE);
-    let has_layout = messages.iter().any(|m| m.msg_type == object_header::MSG_LAYOUT);
-    let has_datatype = messages.iter().any(|m| m.msg_type == object_header::MSG_DATATYPE);
-    let has_stab = messages.iter().any(|m| m.msg_type == object_header::MSG_SYMBOL_TABLE);
-    let has_link = messages.iter().any(|m| m.msg_type == object_header::MSG_LINK);
-    let has_link_info = messages.iter().any(|m| m.msg_type == object_header::MSG_LINK_INFO);
+    let has_dataspace = messages
+        .iter()
+        .any(|m| m.msg_type == object_header::MSG_DATASPACE);
+    let has_layout = messages
+        .iter()
+        .any(|m| m.msg_type == object_header::MSG_LAYOUT);
+    let has_datatype = messages
+        .iter()
+        .any(|m| m.msg_type == object_header::MSG_DATATYPE);
+    let has_stab = messages
+        .iter()
+        .any(|m| m.msg_type == object_header::MSG_SYMBOL_TABLE);
+    let has_link = messages
+        .iter()
+        .any(|m| m.msg_type == object_header::MSG_LINK);
+    let has_link_info = messages
+        .iter()
+        .any(|m| m.msg_type == object_header::MSG_LINK_INFO);
 
     if has_layout || (has_dataspace && has_datatype && !has_stab && !has_link && !has_link_info) {
         ObjectType::Dataset

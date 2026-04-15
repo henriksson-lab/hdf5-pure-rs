@@ -94,7 +94,9 @@ impl LinkMessage {
 
         // Link name
         if pos + name_len > data.len() {
-            return Err(Error::InvalidFormat("link name exceeds message bounds".into()));
+            return Err(Error::InvalidFormat(
+                "link name exceeds message bounds".into(),
+            ));
         }
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
         pos += name_len;
@@ -107,30 +109,40 @@ impl LinkMessage {
         match link_type {
             LinkType::Hard => {
                 if pos + sizeof_addr as usize > data.len() {
-                    return Err(Error::InvalidFormat("hard link addr exceeds message bounds".into()));
+                    return Err(Error::InvalidFormat(
+                        "hard link addr exceeds message bounds".into(),
+                    ));
                 }
                 hard_link_addr = Some(read_le_u64(&data[pos..], sizeof_addr as usize));
             }
             LinkType::Soft => {
                 if pos + 2 > data.len() {
-                    return Err(Error::InvalidFormat("soft link target length exceeds bounds".into()));
+                    return Err(Error::InvalidFormat(
+                        "soft link target length exceeds bounds".into(),
+                    ));
                 }
                 let target_len = read_le_u64(&data[pos..], 2) as usize;
                 pos += 2;
                 if pos + target_len > data.len() {
-                    return Err(Error::InvalidFormat("soft link target exceeds bounds".into()));
+                    return Err(Error::InvalidFormat(
+                        "soft link target exceeds bounds".into(),
+                    ));
                 }
                 soft_link_target =
                     Some(String::from_utf8_lossy(&data[pos..pos + target_len]).to_string());
             }
             LinkType::External => {
                 if pos + 2 > data.len() {
-                    return Err(Error::InvalidFormat("external link info length exceeds bounds".into()));
+                    return Err(Error::InvalidFormat(
+                        "external link info length exceeds bounds".into(),
+                    ));
                 }
                 let info_len = read_le_u64(&data[pos..], 2) as usize;
                 pos += 2;
                 if pos + info_len > data.len() || info_len < 2 {
-                    return Err(Error::InvalidFormat("external link info exceeds bounds".into()));
+                    return Err(Error::InvalidFormat(
+                        "external link info exceeds bounds".into(),
+                    ));
                 }
                 let ext_version = data[pos];
                 pos += 1;
@@ -143,12 +155,18 @@ impl LinkMessage {
                 let end = (pos + info_len - info_consumed).min(data.len());
 
                 // Filename (null-terminated)
-                let null_pos = data[pos..end].iter().position(|&b| b == 0).unwrap_or(end - pos);
+                let null_pos = data[pos..end]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(end - pos);
                 let filename = String::from_utf8_lossy(&data[pos..pos + null_pos]).to_string();
                 pos = (pos + null_pos + 1).min(end);
 
                 // Object path (null-terminated)
-                let null_pos2 = data[pos..end].iter().position(|&b| b == 0).unwrap_or(end - pos);
+                let null_pos2 = data[pos..end]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(end - pos);
                 let obj_path = String::from_utf8_lossy(&data[pos..pos + null_pos2]).to_string();
 
                 external_link = Some((filename, obj_path));
