@@ -11,6 +11,12 @@ Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/comm
 
 This is a reimplementation of the HDF5 format, not a wrapper around the C library. Output should be bitwise compatible with the original. Please report any deviations.
 
+**This crate is still under construction, with more testing and benchmarking needed. Be careful in using it for production**
+
+## Support
+
+This translation is not endored by the HDF5 group. Issues related to this translation should be raised on this Github page.
+
 ## Installation
 
 ```toml
@@ -94,6 +100,8 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 Write is faster due to less overhead (no C FFI, no HDF5 metadata cache management). Read is slightly slower due to the pure-Rust deflate implementation vs C zlib.
 
+**These benchmarks must be taken with a huge grain of salt. HDF5 is a large complex library with many features, so these benchmarks are primarily intentended to guide further development and track regression**
+
 ## Derive Macro
 
 ```rust
@@ -126,6 +134,21 @@ struct Measurement {
 - Write round-trips verified by h5dump and h5py
 - Cross-platform: big-endian, old formats, various file space strategies
 
+**This test suite need to be expanded before any claims of general compatibility**
+
+
+## How to Cite HDF5
+
+If you use HDF5 in your research, please cite it. See the original [original code](https://github.com/HDFGroup/hdf5) for details
+
+**Quick DOI:** [10.5281/zenodo.17808558](https://doi.org/10.5281/zenodo.17808558)
+
+
 ## License
 
-MIT OR Apache-2.0
+This is [derived work](https://github.com/HDFGroup/hdf5) and the license follows from the original HDF5 (BSD-3).
+See the LICENSE file
+
+
+
+
