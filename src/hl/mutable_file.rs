@@ -39,12 +39,29 @@ struct MutableExtensibleArrayHeader {
     realized_elements: u64,
     index_block_addr: u64,
     array_offset_size: u8,
+    index_block_super_blocks: usize,
+    index_block_data_block_addrs: usize,
     index_block_super_block_addrs: usize,
+    super_block_info: Vec<MutableExtensibleArraySuperBlockInfo>,
+    super_block_count: u64,
+    super_block_size: u64,
+    data_block_count: u64,
+    data_block_size: u64,
     checksum_pos: u64,
+    super_block_count_pos: u64,
+    super_block_size_pos: u64,
     data_block_count_pos: u64,
     data_block_size_pos: u64,
     max_index_set_pos: u64,
     realized_elements_pos: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MutableExtensibleArraySuperBlockInfo {
+    data_blocks: usize,
+    data_block_elements: usize,
+    start_index: u64,
+    start_data_block: u64,
 }
 
 /// A mutable HDF5 file opened for read-write access.
@@ -542,26 +559,20 @@ impl MutableFile {
                 header.max_index_set + 1,
                 header.realized_elements.max(header.max_index_set + 1),
                 None,
+                None,
             )?;
             return Ok(());
         }
-        if element_index == direct_count {
-            drop(guard);
-            self.append_first_extensible_array_data_block(
-                index_addr,
-                &header,
-                chunk_addr,
-                chunk_size,
-                filtered,
-                chunk_size_len,
-            )?;
-            return Ok(());
-        }
-
-        Err(Error::Unsupported(
-            "write_chunk cannot grow extensible-array indexes beyond the first data block yet"
-                .into(),
-        ))
+        drop(guard);
+        self.append_extensible_array_spillover_element(
+            index_addr,
+            &header,
+            element_index,
+            chunk_addr,
+            chunk_size,
+            filtered,
+            chunk_size_len,
+        )
     }
 
     fn read_extensible_array_header<R: Read + Seek>(
@@ -607,12 +618,14 @@ impl MutableFile {
         let super_block_min_data_ptrs = reader.read_u8()? as usize;
         let max_data_block_page_elements_bits = reader.read_u8()?;
 
-        let _super_block_count = reader.read_length()?;
-        let _super_block_size = reader.read_length()?;
+        let super_block_count_pos = reader.position()?;
+        let stored_super_block_count = reader.read_length()?;
+        let super_block_size_pos = reader.position()?;
+        let stored_super_block_size = reader.read_length()?;
         let data_block_count_pos = reader.position()?;
-        let _data_block_count = reader.read_length()?;
+        let data_block_count = reader.read_length()?;
         let data_block_size_pos = reader.position()?;
-        let _data_block_size = reader.read_length()?;
+        let data_block_size = reader.read_length()?;
         let max_index_set_pos = reader.position()?;
         let max_index_set = reader.read_length()?;
         let realized_elements_pos = reader.position()?;
@@ -652,11 +665,16 @@ impl MutableFile {
                     Error::InvalidFormat("invalid extensible array block parameters".into())
                 })?;
         let index_block_super_blocks = 2 * (super_block_min_data_ptrs.trailing_zeros() as usize);
+        let index_block_data_block_addrs = 2 * (super_block_min_data_ptrs - 1);
         let index_block_super_block_addrs = super_block_count
             .checked_sub(index_block_super_blocks)
             .ok_or_else(|| {
                 Error::InvalidFormat("invalid extensible array super block layout".into())
             })?;
+        let super_block_info = Self::build_mutable_extensible_array_super_block_info(
+            super_block_count,
+            data_block_min_elements,
+        )?;
         let max_data_block_page_elements = 1usize
             .checked_shl(max_data_block_page_elements_bits as u32)
             .ok_or_else(|| {
@@ -674,13 +692,99 @@ impl MutableFile {
             realized_elements,
             index_block_addr,
             array_offset_size,
+            index_block_super_blocks,
+            index_block_data_block_addrs,
             index_block_super_block_addrs,
+            super_block_info,
+            super_block_count: stored_super_block_count,
+            super_block_size: stored_super_block_size,
+            data_block_count,
+            data_block_size,
             checksum_pos,
+            super_block_count_pos,
+            super_block_size_pos,
             data_block_count_pos,
             data_block_size_pos,
             max_index_set_pos,
             realized_elements_pos,
         })
+    }
+
+    fn build_mutable_extensible_array_super_block_info(
+        count: usize,
+        min_data_block_elements: usize,
+    ) -> Result<Vec<MutableExtensibleArraySuperBlockInfo>> {
+        let mut infos = Vec::with_capacity(count);
+        let mut start_index = 0u64;
+        let mut start_data_block = 0u64;
+        for index in 0..count {
+            let data_blocks = 1usize.checked_shl((index / 2) as u32).ok_or_else(|| {
+                Error::InvalidFormat("extensible array data block count overflow".into())
+            })?;
+            let data_block_elements = min_data_block_elements
+                .checked_mul(
+                    1usize
+                        .checked_shl(index.div_ceil(2) as u32)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat(
+                                "extensible array data block element count overflow".into(),
+                            )
+                        })?,
+                )
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible array data block size overflow".into())
+                })?;
+            infos.push(MutableExtensibleArraySuperBlockInfo {
+                data_blocks,
+                data_block_elements,
+                start_index,
+                start_data_block,
+            });
+            start_index = start_index
+                .checked_add((data_blocks as u64) * (data_block_elements as u64))
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible array start index overflow".into())
+                })?;
+            start_data_block = start_data_block
+                .checked_add(data_blocks as u64)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("extensible array data block index overflow".into())
+                })?;
+        }
+        Ok(infos)
+    }
+
+    fn extensible_array_data_block_pages(
+        header: &MutableExtensibleArrayHeader,
+        data_block_elements: usize,
+    ) -> usize {
+        if data_block_elements > header.max_data_block_page_elements {
+            data_block_elements / header.max_data_block_page_elements
+        } else {
+            0
+        }
+    }
+
+    fn extensible_array_page_init_size(
+        header: &MutableExtensibleArrayHeader,
+        data_block_elements: usize,
+    ) -> usize {
+        let pages = Self::extensible_array_data_block_pages(header, data_block_elements);
+        if pages > 0 {
+            pages.div_ceil(8)
+        } else {
+            0
+        }
+    }
+
+    fn set_extensible_array_page_init_bit(bytes: &mut [u8], bit: usize) -> Result<()> {
+        let Some(byte) = bytes.get_mut(bit / 8) else {
+            return Err(Error::InvalidFormat(
+                "extensible array page-init bit index out of bounds".into(),
+            ));
+        };
+        *byte |= 0x80 >> (bit % 8);
+        Ok(())
     }
 
     fn locate_extensible_array_element<R: Read + Seek>(
@@ -790,10 +894,12 @@ impl MutableFile {
         Ok(())
     }
 
-    fn append_first_extensible_array_data_block(
+    #[allow(clippy::too_many_arguments)]
+    fn append_extensible_array_spillover_element(
         &mut self,
         header_addr: u64,
         header: &MutableExtensibleArrayHeader,
+        element_index: usize,
         chunk_addr: u64,
         chunk_size: u64,
         filtered: bool,
@@ -804,64 +910,754 @@ impl MutableFile {
                 "write_chunk cannot create a missing extensible-array index block yet".into(),
             ));
         }
-        if header.data_block_min_elements > header.max_data_block_page_elements {
-            return Err(Error::Unsupported(
-                "write_chunk cannot create paged extensible-array data blocks yet".into(),
+
+        let direct_count = header.index_block_elements as usize;
+        if element_index < direct_count {
+            return Err(Error::InvalidFormat(
+                "extensible-array spillover append called for index-block element".into(),
             ));
         }
+        let spillover_index = element_index - direct_count;
+        let Some((super_block_index, super_info)) = header
+            .super_block_info
+            .iter()
+            .enumerate()
+            .find(|(_, info)| {
+                let start = info.start_index as usize;
+                let end = start + info.data_blocks * info.data_block_elements;
+                spillover_index >= start && spillover_index < end
+            })
+        else {
+            return Err(Error::Unsupported(
+                "extensible-array append index exceeds supported array geometry".into(),
+            ));
+        };
 
-        let data_block_elements = header.data_block_min_elements;
-        let data_block_size = 4
+        let index_in_super = spillover_index - super_info.start_index as usize;
+        let local_data_block_index = index_in_super / super_info.data_block_elements;
+        let element_in_block = index_in_super % super_info.data_block_elements;
+        let block_offset = direct_count as u64
+            + super_info.start_index
+            + (local_data_block_index as u64 * super_info.data_block_elements as u64);
+
+        if super_block_index < header.index_block_super_blocks {
+            self.append_extensible_array_index_data_block_element(
+                header_addr,
+                header,
+                super_info,
+                local_data_block_index,
+                element_in_block,
+                block_offset,
+                chunk_addr,
+                chunk_size,
+                filtered,
+                chunk_size_len,
+            )
+        } else {
+            self.append_extensible_array_super_block_element(
+                header_addr,
+                header,
+                super_block_index,
+                super_info,
+                local_data_block_index,
+                element_in_block,
+                block_offset,
+                chunk_addr,
+                chunk_size,
+                filtered,
+                chunk_size_len,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_extensible_array_index_data_block_element(
+        &mut self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        local_data_block_index: usize,
+        element_in_block: usize,
+        block_offset: u64,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+    ) -> Result<()> {
+        let global_data_block_index = super_info.start_data_block as usize + local_data_block_index;
+        if global_data_block_index >= header.index_block_data_block_addrs {
+            return Err(Error::InvalidFormat(
+                "extensible-array index data-block address is out of bounds".into(),
+            ));
+        }
+        let sa = self.superblock.sizeof_addr as usize;
+        let index_prefix_size = 4 + 1 + 1 + sa;
+        let data_block_addr_pos = header.index_block_addr
+            + index_prefix_size as u64
+            + (header.index_block_elements as usize * header.raw_element_size) as u64
+            + (global_data_block_index * sa) as u64;
+
+        let mut guard = self.inner.lock();
+        guard.reader.seek(data_block_addr_pos)?;
+        let data_block_addr = guard.reader.read_addr()?;
+        drop(guard);
+
+        let data_block_size =
+            self.extensible_array_data_block_size(header, super_info.data_block_elements);
+        if crate::io::reader::is_undef_addr(data_block_addr) {
+            if element_in_block != 0 {
+                return Err(Error::Unsupported(
+                    "write_chunk cannot allocate a sparse extensible-array data block".into(),
+                ));
+            }
+            let new_addr = self.create_extensible_array_data_block(
+                header_addr,
+                header,
+                block_offset,
+                super_info.data_block_elements,
+                Some((
+                    element_in_block,
+                    chunk_addr,
+                    chunk_size,
+                    filtered,
+                    chunk_size_len,
+                )),
+                None,
+            )?;
+            self.write_handle
+                .seek(SeekFrom::Start(data_block_addr_pos))?;
+            self.write_handle.write_all(&new_addr.to_le_bytes()[..sa])?;
+            self.rewrite_extensible_array_index_block_checksum(
+                header,
+                Some((global_data_block_index, new_addr)),
+                None,
+            )?;
+            self.rewrite_extensible_array_header_counts(
+                header_addr,
+                header,
+                header.max_index_set + 1,
+                header
+                    .realized_elements
+                    .max(block_offset + super_info.data_block_elements as u64),
+                Some((
+                    header.data_block_count + 1,
+                    header.data_block_size + data_block_size as u64,
+                )),
+                None,
+            )?;
+            return Ok(());
+        }
+
+        self.write_extensible_array_data_block_element(
+            data_block_addr,
+            header,
+            super_info.data_block_elements,
+            element_in_block,
+            chunk_addr,
+            chunk_size,
+            filtered,
+            chunk_size_len,
+            None,
+        )?;
+        self.rewrite_extensible_array_header_counts(
+            header_addr,
+            header,
+            header.max_index_set + 1,
+            header.realized_elements,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_extensible_array_super_block_element(
+        &mut self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_block_index: usize,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        local_data_block_index: usize,
+        element_in_block: usize,
+        block_offset: u64,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+    ) -> Result<()> {
+        let super_block_addr_index = super_block_index - header.index_block_super_blocks;
+        if super_block_addr_index >= header.index_block_super_block_addrs {
+            return Err(Error::InvalidFormat(
+                "extensible-array super-block address is out of bounds".into(),
+            ));
+        }
+        let sa = self.superblock.sizeof_addr as usize;
+        let index_prefix_size = 4 + 1 + 1 + sa;
+        let super_block_addr_pos = header.index_block_addr
+            + index_prefix_size as u64
+            + (header.index_block_elements as usize * header.raw_element_size) as u64
+            + (header.index_block_data_block_addrs * sa) as u64
+            + (super_block_addr_index * sa) as u64;
+
+        let mut guard = self.inner.lock();
+        guard.reader.seek(super_block_addr_pos)?;
+        let super_block_addr = guard.reader.read_addr()?;
+        drop(guard);
+
+        let super_block_size = self.extensible_array_super_block_size(header, super_info);
+        let data_block_size =
+            self.extensible_array_data_block_size(header, super_info.data_block_elements);
+        if crate::io::reader::is_undef_addr(super_block_addr) {
+            if local_data_block_index != 0 || element_in_block != 0 {
+                return Err(Error::Unsupported(
+                    "write_chunk cannot allocate a sparse extensible-array super block".into(),
+                ));
+            }
+            let (new_super_addr, new_data_addr) = self.create_extensible_array_super_block(
+                header_addr,
+                header,
+                super_info,
+                super_block_index,
+                local_data_block_index,
+                element_in_block,
+                block_offset,
+                chunk_addr,
+                chunk_size,
+                filtered,
+                chunk_size_len,
+            )?;
+            self.write_handle
+                .seek(SeekFrom::Start(super_block_addr_pos))?;
+            self.write_handle
+                .write_all(&new_super_addr.to_le_bytes()[..sa])?;
+            self.rewrite_extensible_array_index_block_checksum(
+                header,
+                None,
+                Some((super_block_addr_index, new_super_addr)),
+            )?;
+            let _ = new_data_addr;
+            self.rewrite_extensible_array_header_counts(
+                header_addr,
+                header,
+                header.max_index_set + 1,
+                header
+                    .realized_elements
+                    .max(block_offset + super_info.data_block_elements as u64),
+                Some((
+                    header.data_block_count + 1,
+                    header.data_block_size + data_block_size as u64,
+                )),
+                Some((
+                    header.super_block_count + 1,
+                    header.super_block_size + super_block_size as u64,
+                )),
+            )?;
+            return Ok(());
+        }
+
+        let data_block_addr = self.read_extensible_array_super_block_data_addr(
+            super_block_addr,
+            header,
+            super_info,
+            local_data_block_index,
+        )?;
+        if crate::io::reader::is_undef_addr(data_block_addr) {
+            if element_in_block != 0 {
+                return Err(Error::Unsupported(
+                    "write_chunk cannot allocate a sparse extensible-array super-block data block"
+                        .into(),
+                ));
+            }
+            let page_index = self.extensible_array_page_index(
+                header,
+                super_info.data_block_elements,
+                element_in_block,
+            );
+            let new_data_addr = self.create_extensible_array_data_block(
+                header_addr,
+                header,
+                block_offset,
+                super_info.data_block_elements,
+                Some((
+                    element_in_block,
+                    chunk_addr,
+                    chunk_size,
+                    filtered,
+                    chunk_size_len,
+                )),
+                page_index,
+            )?;
+            self.rewrite_extensible_array_super_block(
+                super_block_addr,
+                header,
+                super_info,
+                Some((local_data_block_index, new_data_addr)),
+                page_index.map(|idx| (local_data_block_index, idx)),
+            )?;
+            self.rewrite_extensible_array_header_counts(
+                header_addr,
+                header,
+                header.max_index_set + 1,
+                header
+                    .realized_elements
+                    .max(block_offset + super_info.data_block_elements as u64),
+                Some((
+                    header.data_block_count + 1,
+                    header.data_block_size + data_block_size as u64,
+                )),
+                None,
+            )?;
+            return Ok(());
+        }
+
+        let page_index = self.extensible_array_page_index(
+            header,
+            super_info.data_block_elements,
+            element_in_block,
+        );
+        self.write_extensible_array_data_block_element(
+            data_block_addr,
+            header,
+            super_info.data_block_elements,
+            element_in_block,
+            chunk_addr,
+            chunk_size,
+            filtered,
+            chunk_size_len,
+            page_index,
+        )?;
+        if let Some(page_index) = page_index {
+            self.rewrite_extensible_array_super_block(
+                super_block_addr,
+                header,
+                super_info,
+                None,
+                Some((local_data_block_index, page_index)),
+            )?;
+        }
+        self.rewrite_extensible_array_header_counts(
+            header_addr,
+            header,
+            header.max_index_set + 1,
+            header.realized_elements,
+            None,
+            None,
+        )
+    }
+
+    fn extensible_array_data_block_size(
+        &self,
+        header: &MutableExtensibleArrayHeader,
+        data_block_elements: usize,
+    ) -> usize {
+        let pages = Self::extensible_array_data_block_pages(header, data_block_elements);
+        let prefix_size = 4
             + 1
             + 1
             + self.superblock.sizeof_addr as usize
             + header.array_offset_size as usize
-            + data_block_elements * header.raw_element_size
             + 4;
+        if pages == 0 {
+            prefix_size + data_block_elements * header.raw_element_size
+        } else {
+            prefix_size
+                + pages * (header.max_data_block_page_elements * header.raw_element_size + 4)
+        }
+    }
+
+    fn extensible_array_super_block_size(
+        &self,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+    ) -> usize {
+        let page_init_size =
+            Self::extensible_array_page_init_size(header, super_info.data_block_elements);
+        4 + 1
+            + 1
+            + self.superblock.sizeof_addr as usize
+            + header.array_offset_size as usize
+            + super_info.data_blocks * page_init_size
+            + super_info.data_blocks * self.superblock.sizeof_addr as usize
+            + 4
+    }
+
+    fn extensible_array_page_index(
+        &self,
+        header: &MutableExtensibleArrayHeader,
+        data_block_elements: usize,
+        element_in_block: usize,
+    ) -> Option<usize> {
+        if Self::extensible_array_data_block_pages(header, data_block_elements) == 0 {
+            None
+        } else {
+            Some(element_in_block / header.max_data_block_page_elements)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_extensible_array_data_block(
+        &mut self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        block_offset: u64,
+        data_block_elements: usize,
+        initial: Option<(usize, u64, u64, bool, usize)>,
+        initialized_page: Option<usize>,
+    ) -> Result<u64> {
+        let data_block_size = self.extensible_array_data_block_size(header, data_block_elements);
         let data_block_addr = self.append_aligned_zeros(data_block_size, 8)?;
-        let block_offset = header.index_block_elements as u64;
-        let mut block = Vec::with_capacity(data_block_size - 4);
-        block.extend_from_slice(b"EADB");
+        let pages = Self::extensible_array_data_block_pages(header, data_block_elements);
+        let prefix_size =
+            4 + 1 + 1 + self.superblock.sizeof_addr as usize + header.array_offset_size as usize;
+
+        let mut prefix = Vec::with_capacity(
+            prefix_size
+                + if pages == 0 {
+                    data_block_elements * header.raw_element_size
+                } else {
+                    0
+                },
+        );
+        prefix.extend_from_slice(b"EADB");
+        prefix.push(0);
+        prefix.push(header.class_id);
+        prefix
+            .extend_from_slice(&header_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize]);
+        prefix.extend_from_slice(&block_offset.to_le_bytes()[..header.array_offset_size as usize]);
+
+        if pages == 0 {
+            let fill_addr = crate::io::reader::UNDEF_ADDR.to_le_bytes();
+            for idx in 0..data_block_elements {
+                if let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) =
+                    initial
+                {
+                    if idx == initial_idx {
+                        prefix.extend_from_slice(
+                            &chunk_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize],
+                        );
+                        if filtered {
+                            prefix.extend_from_slice(&chunk_size.to_le_bytes()[..chunk_size_len]);
+                            prefix.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                        continue;
+                    }
+                }
+                prefix.extend_from_slice(&fill_addr[..self.superblock.sizeof_addr as usize]);
+                if initial
+                    .map(|(_, _, _, filtered, _)| filtered)
+                    .unwrap_or(false)
+                {
+                    let chunk_size_len = initial.map(|(_, _, _, _, len)| len).unwrap_or(0);
+                    prefix.extend_from_slice(&0u64.to_le_bytes()[..chunk_size_len]);
+                    prefix.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            let checksum = checksum_metadata(&prefix);
+            prefix.extend_from_slice(&checksum.to_le_bytes());
+            self.write_handle.seek(SeekFrom::Start(data_block_addr))?;
+            self.write_handle.write_all(&prefix)?;
+            return Ok(data_block_addr);
+        }
+
+        let checksum = checksum_metadata(&prefix);
+        prefix.extend_from_slice(&checksum.to_le_bytes());
+        self.write_handle.seek(SeekFrom::Start(data_block_addr))?;
+        self.write_handle.write_all(&prefix)?;
+
+        if let Some(page_index) = initialized_page {
+            let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) = initial
+            else {
+                return Err(Error::InvalidFormat(
+                    "initialized extensible-array page requires an initial element".into(),
+                ));
+            };
+            self.write_extensible_array_page(
+                data_block_addr,
+                header,
+                page_index,
+                Some((
+                    initial_idx % header.max_data_block_page_elements,
+                    chunk_addr,
+                    chunk_size,
+                    filtered,
+                    chunk_size_len,
+                )),
+            )?;
+        }
+
+        Ok(data_block_addr)
+    }
+
+    fn write_extensible_array_page(
+        &mut self,
+        data_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        page_index: usize,
+        initial: Option<(usize, u64, u64, bool, usize)>,
+    ) -> Result<()> {
+        let page_size = header.max_data_block_page_elements * header.raw_element_size + 4;
+        let prefix_size = 4
+            + 1
+            + 1
+            + self.superblock.sizeof_addr as usize
+            + header.array_offset_size as usize
+            + 4;
+        let page_addr = data_block_addr + prefix_size as u64 + (page_index * page_size) as u64;
+        let mut page = Vec::with_capacity(page_size);
+        let fill_addr = crate::io::reader::UNDEF_ADDR.to_le_bytes();
+        for idx in 0..header.max_data_block_page_elements {
+            if let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) = initial {
+                if idx == initial_idx {
+                    page.extend_from_slice(
+                        &chunk_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize],
+                    );
+                    if filtered {
+                        page.extend_from_slice(&chunk_size.to_le_bytes()[..chunk_size_len]);
+                        page.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    continue;
+                }
+            }
+            page.extend_from_slice(&fill_addr[..self.superblock.sizeof_addr as usize]);
+            if initial
+                .map(|(_, _, _, filtered, _)| filtered)
+                .unwrap_or(false)
+            {
+                let chunk_size_len = initial.map(|(_, _, _, _, len)| len).unwrap_or(0);
+                page.extend_from_slice(&0u64.to_le_bytes()[..chunk_size_len]);
+                page.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        let checksum = checksum_metadata(&page);
+        page.extend_from_slice(&checksum.to_le_bytes());
+        self.write_handle.seek(SeekFrom::Start(page_addr))?;
+        self.write_handle.write_all(&page)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_extensible_array_data_block_element(
+        &mut self,
+        data_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        data_block_elements: usize,
+        element_in_block: usize,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+        page_index: Option<usize>,
+    ) -> Result<()> {
+        if let Some(page_index) = page_index {
+            let page_size = header.max_data_block_page_elements * header.raw_element_size + 4;
+            let page_prefix_size = 4
+                + 1
+                + 1
+                + self.superblock.sizeof_addr as usize
+                + header.array_offset_size as usize
+                + 4;
+            let page_addr =
+                data_block_addr + page_prefix_size as u64 + (page_index * page_size) as u64;
+            let local_index = element_in_block % header.max_data_block_page_elements;
+            let element_pos = page_addr + (local_index * header.raw_element_size) as u64;
+            self.write_extensible_array_element(
+                element_pos,
+                chunk_addr,
+                chunk_size,
+                filtered,
+                chunk_size_len,
+            )?;
+            self.rewrite_extensible_array_page_checksum(page_addr, header)?;
+            return Ok(());
+        }
+
+        if data_block_elements > header.max_data_block_page_elements {
+            return Err(Error::Unsupported(
+                "write_chunk cannot update an unpaged view of a paged extensible-array data block"
+                    .into(),
+            ));
+        }
+        let element_pos = data_block_addr
+            + (4 + 1 + 1 + self.superblock.sizeof_addr as usize + header.array_offset_size as usize)
+                as u64
+            + (element_in_block * header.raw_element_size) as u64;
+        self.write_extensible_array_element(
+            element_pos,
+            chunk_addr,
+            chunk_size,
+            filtered,
+            chunk_size_len,
+        )?;
+        self.rewrite_extensible_array_data_block_checksum(
+            data_block_addr,
+            header,
+            data_block_elements,
+        )
+    }
+
+    fn rewrite_extensible_array_data_block_checksum(
+        &mut self,
+        data_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        data_block_elements: usize,
+    ) -> Result<()> {
+        let check_len = 4
+            + 1
+            + 1
+            + self.superblock.sizeof_addr as usize
+            + header.array_offset_size as usize
+            + data_block_elements * header.raw_element_size;
+        self.write_handle.flush()?;
+        let mut bytes = self.read_fresh_bytes(data_block_addr, check_len)?;
+        let checksum = checksum_metadata(&bytes);
+        self.write_handle
+            .seek(SeekFrom::Start(data_block_addr + check_len as u64))?;
+        self.write_handle.write_all(&checksum.to_le_bytes())?;
+        bytes.clear();
+        Ok(())
+    }
+
+    fn rewrite_extensible_array_page_checksum(
+        &mut self,
+        page_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+    ) -> Result<()> {
+        let check_len = header.max_data_block_page_elements * header.raw_element_size;
+        self.write_handle.flush()?;
+        let bytes = self.read_fresh_bytes(page_addr, check_len)?;
+        let checksum = checksum_metadata(&bytes);
+        self.write_handle
+            .seek(SeekFrom::Start(page_addr + check_len as u64))?;
+        self.write_handle.write_all(&checksum.to_le_bytes())?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_extensible_array_super_block(
+        &mut self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        _super_block_index: usize,
+        local_data_block_index: usize,
+        element_in_block: usize,
+        block_offset: u64,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+    ) -> Result<(u64, u64)> {
+        let page_index = self.extensible_array_page_index(
+            header,
+            super_info.data_block_elements,
+            element_in_block,
+        );
+        let data_block_addr = self.create_extensible_array_data_block(
+            header_addr,
+            header,
+            block_offset,
+            super_info.data_block_elements,
+            Some((
+                element_in_block,
+                chunk_addr,
+                chunk_size,
+                filtered,
+                chunk_size_len,
+            )),
+            page_index,
+        )?;
+
+        let super_block_size = self.extensible_array_super_block_size(header, super_info);
+        let super_block_addr = self.append_aligned_zeros(super_block_size, 8)?;
+        let page_init_size =
+            Self::extensible_array_page_init_size(header, super_info.data_block_elements);
+        let mut block = Vec::with_capacity(super_block_size);
+        block.extend_from_slice(b"EASB");
         block.push(0);
         block.push(header.class_id);
         block.extend_from_slice(&header_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize]);
-        block.extend_from_slice(&block_offset.to_le_bytes()[..header.array_offset_size as usize]);
-        block.extend_from_slice(&chunk_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize]);
-        if filtered {
-            block.extend_from_slice(&chunk_size.to_le_bytes()[..chunk_size_len]);
-            block.extend_from_slice(&0u32.to_le_bytes());
+        block.extend_from_slice(
+            &(header.index_block_elements as u64 + super_info.start_index).to_le_bytes()
+                [..header.array_offset_size as usize],
+        );
+        let mut page_init = vec![0u8; super_info.data_blocks * page_init_size];
+        if let Some(page_index) = page_index {
+            let start = local_data_block_index * page_init_size;
+            Self::set_extensible_array_page_init_bit(
+                &mut page_init[start..start + page_init_size],
+                page_index,
+            )?;
         }
+        block.extend_from_slice(&page_init);
         let fill_addr = crate::io::reader::UNDEF_ADDR.to_le_bytes();
-        for _ in 1..data_block_elements {
-            block.extend_from_slice(&fill_addr[..self.superblock.sizeof_addr as usize]);
-            if filtered {
-                block.extend_from_slice(&0u64.to_le_bytes()[..chunk_size_len]);
-                block.extend_from_slice(&0u32.to_le_bytes());
+        for idx in 0..super_info.data_blocks {
+            if idx == local_data_block_index {
+                block.extend_from_slice(
+                    &data_block_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize],
+                );
+            } else {
+                block.extend_from_slice(&fill_addr[..self.superblock.sizeof_addr as usize]);
             }
         }
         let checksum = checksum_metadata(&block);
-        self.write_handle.seek(SeekFrom::Start(data_block_addr))?;
+        block.extend_from_slice(&checksum.to_le_bytes());
+        self.write_handle.seek(SeekFrom::Start(super_block_addr))?;
+        self.write_handle.write_all(&block)?;
+        Ok((super_block_addr, data_block_addr))
+    }
+
+    fn read_extensible_array_super_block_data_addr(
+        &mut self,
+        super_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        local_data_block_index: usize,
+    ) -> Result<u64> {
+        let page_init_size =
+            Self::extensible_array_page_init_size(header, super_info.data_block_elements);
+        let addr_pos = super_block_addr
+            + (4 + 1 + 1 + self.superblock.sizeof_addr as usize + header.array_offset_size as usize)
+                as u64
+            + (super_info.data_blocks * page_init_size) as u64
+            + (local_data_block_index * self.superblock.sizeof_addr as usize) as u64;
+        let mut guard = self.inner.lock();
+        guard.reader.seek(addr_pos)?;
+        guard.reader.read_addr()
+    }
+
+    fn rewrite_extensible_array_super_block(
+        &mut self,
+        super_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        data_block_addr: Option<(usize, u64)>,
+        page_init_bit: Option<(usize, usize)>,
+    ) -> Result<()> {
+        let block_size = self.extensible_array_super_block_size(header, super_info);
+        let check_len = block_size - 4;
+        self.write_handle.flush()?;
+        let mut block = self.read_fresh_bytes(super_block_addr, check_len)?;
+
+        let page_init_size =
+            Self::extensible_array_page_init_size(header, super_info.data_block_elements);
+        let page_init_start =
+            4 + 1 + 1 + self.superblock.sizeof_addr as usize + header.array_offset_size as usize;
+        if let Some((data_block_index, page_index)) = page_init_bit {
+            let start = page_init_start + data_block_index * page_init_size;
+            Self::set_extensible_array_page_init_bit(
+                &mut block[start..start + page_init_size],
+                page_index,
+            )?;
+        }
+        if let Some((data_block_index, addr)) = data_block_addr {
+            let addr_start = page_init_start + super_info.data_blocks * page_init_size;
+            let pos = addr_start + data_block_index * self.superblock.sizeof_addr as usize;
+            block[pos..pos + self.superblock.sizeof_addr as usize]
+                .copy_from_slice(&addr.to_le_bytes()[..self.superblock.sizeof_addr as usize]);
+        }
+        let checksum = checksum_metadata(&block);
+        self.write_handle.seek(SeekFrom::Start(super_block_addr))?;
         self.write_handle.write_all(&block)?;
         self.write_handle.write_all(&checksum.to_le_bytes())?;
-
-        let data_block_addr_pos = header.index_block_addr
-            + (4 + 1 + 1 + self.superblock.sizeof_addr as usize) as u64
-            + (header.index_block_elements as usize * header.raw_element_size) as u64;
-        self.write_handle
-            .seek(SeekFrom::Start(data_block_addr_pos))?;
-        self.write_handle
-            .write_all(&data_block_addr.to_le_bytes()[..self.superblock.sizeof_addr as usize])?;
-        self.rewrite_extensible_array_index_block_checksum(header, Some((0, data_block_addr)))?;
-
-        let new_max_index_set = header.max_index_set + 1;
-        let new_realized = block_offset + data_block_elements as u64;
-        self.rewrite_extensible_array_header_counts(
-            header_addr,
-            header,
-            new_max_index_set,
-            new_realized,
-            Some((1, data_block_size as u64)),
-        )?;
         Ok(())
     }
 
@@ -886,7 +1682,8 @@ impl MutableFile {
     fn rewrite_extensible_array_index_block_checksum(
         &mut self,
         header: &MutableExtensibleArrayHeader,
-        first_data_block_addr: Option<(usize, u64)>,
+        data_block_addr: Option<(usize, u64)>,
+        super_block_addr: Option<(usize, u64)>,
     ) -> Result<()> {
         let sa = self.superblock.sizeof_addr as usize;
         let index_prefix_size = 4 + 1 + 1 + sa;
@@ -894,16 +1691,22 @@ impl MutableFile {
             + header.index_block_elements as usize * header.raw_element_size
             + 2 * (header.super_block_min_data_ptrs - 1) * sa
             + header.index_block_super_block_addrs * sa;
-        let mut guard = self.inner.lock();
-        guard.reader.seek(header.index_block_addr)?;
-        let mut index_bytes = guard.reader.read_bytes(check_len)?;
-        drop(guard);
-        if let Some((data_block_index, data_block_addr)) = first_data_block_addr {
+        self.write_handle.flush()?;
+        let mut index_bytes = self.read_fresh_bytes(header.index_block_addr, check_len)?;
+        if let Some((data_block_index, data_block_addr)) = data_block_addr {
             let data_block_addr_offset = index_prefix_size
                 + header.index_block_elements as usize * header.raw_element_size
                 + data_block_index * sa;
             index_bytes[data_block_addr_offset..data_block_addr_offset + sa]
                 .copy_from_slice(&data_block_addr.to_le_bytes()[..sa]);
+        }
+        if let Some((super_block_index, super_block_addr)) = super_block_addr {
+            let super_block_addr_offset = index_prefix_size
+                + header.index_block_elements as usize * header.raw_element_size
+                + header.index_block_data_block_addrs * sa
+                + super_block_index * sa;
+            index_bytes[super_block_addr_offset..super_block_addr_offset + sa]
+                .copy_from_slice(&super_block_addr.to_le_bytes()[..sa]);
         }
         let checksum = checksum_metadata(&index_bytes);
         self.write_handle
@@ -919,8 +1722,17 @@ impl MutableFile {
         new_max_index_set: u64,
         new_realized_elements: u64,
         data_block_counts: Option<(u64, u64)>,
+        super_block_counts: Option<(u64, u64)>,
     ) -> Result<()> {
         let ss = self.superblock.sizeof_size as usize;
+        if let Some((super_block_count, super_block_size)) = super_block_counts {
+            self.write_handle
+                .seek(SeekFrom::Start(header.super_block_count_pos))?;
+            self.write_uint_le(super_block_count, ss)?;
+            self.write_handle
+                .seek(SeekFrom::Start(header.super_block_size_pos))?;
+            self.write_uint_le(super_block_size, ss)?;
+        }
         if let Some((data_block_count, data_block_size)) = data_block_counts {
             self.write_handle
                 .seek(SeekFrom::Start(header.data_block_count_pos))?;
@@ -939,10 +1751,16 @@ impl MutableFile {
         let check_len = usize::try_from(header.checksum_pos - header_addr).map_err(|_| {
             Error::InvalidFormat("extensible array header checksum span is too large".into())
         })?;
-        let mut guard = self.inner.lock();
-        guard.reader.seek(header_addr)?;
-        let mut header_bytes = guard.reader.read_bytes(check_len)?;
-        drop(guard);
+        self.write_handle.flush()?;
+        let mut header_bytes = self.read_fresh_bytes(header_addr, check_len)?;
+        if let Some((super_block_count, super_block_size)) = super_block_counts {
+            let offset = usize::try_from(header.super_block_count_pos - header_addr).unwrap();
+            header_bytes[offset..offset + ss]
+                .copy_from_slice(&super_block_count.to_le_bytes()[..ss]);
+            let offset = usize::try_from(header.super_block_size_pos - header_addr).unwrap();
+            header_bytes[offset..offset + ss]
+                .copy_from_slice(&super_block_size.to_le_bytes()[..ss]);
+        }
         if let Some((data_block_count, data_block_size)) = data_block_counts {
             let offset = usize::try_from(header.data_block_count_pos - header_addr).unwrap();
             header_bytes[offset..offset + ss]
@@ -991,26 +1809,23 @@ impl MutableFile {
         let expected_record_size =
             sa + (chunk_size_len + 4) * usize::from(filtered) + 8 * scaled_coords.len();
 
+        let new_record = Self::encode_btree_v2_chunk_record(
+            chunk_addr,
+            chunk_size,
+            &scaled_coords,
+            filtered,
+            chunk_size_len,
+            sa,
+        )?;
+
         let mut guard = self.inner.lock();
         let reader = &mut guard.reader;
         let header = BTreeV2Header::read_at(reader, index_addr)?;
-        if header.depth != 0 {
-            return Err(Error::Unsupported(
-                "write_chunk cannot append to multi-level v2 B-tree chunk indexes yet".into(),
-            ));
-        }
         if header.record_size as usize != expected_record_size {
             return Err(Error::InvalidFormat(format!(
                 "v2 B-tree chunk record size {} does not match expected {expected_record_size}",
                 header.record_size
             )));
-        }
-        let max_records = Self::btree_v2_leaf_capacity(&header)?;
-        let root_nrecords = header.root_nrecords as usize;
-        if root_nrecords > max_records {
-            return Err(Error::InvalidFormat(
-                "v2 B-tree root leaf has more records than its node capacity".into(),
-            ));
         }
         if header.tree_type != 10 && header.tree_type != 11 {
             return Err(Error::Unsupported(format!(
@@ -1019,22 +1834,10 @@ impl MutableFile {
             )));
         }
 
-        reader.seek(header.root_addr)?;
-        if reader.read_bytes(4)? != [b'B', b'T', b'L', b'F'] {
-            return Err(Error::InvalidFormat("invalid v2 B-tree leaf magic".into()));
-        }
-        let leaf_version = reader.read_u8()?;
-        let leaf_type = reader.read_u8()?;
-        if leaf_version != 0 || leaf_type != header.tree_type {
-            return Err(Error::InvalidFormat(
-                "v2 B-tree leaf header does not match tree header".into(),
-            ));
-        }
-
-        let mut records = Vec::with_capacity(root_nrecords + 1);
+        let raw_records = crate::format::btree_v2::collect_all_records(reader, index_addr)?;
+        let mut sortable_records = Vec::with_capacity(raw_records.len() + 1);
         let mut replacing = false;
-        for _ in 0..root_nrecords {
-            let record = reader.read_bytes(header.record_size as usize)?;
+        for record in raw_records {
             let existing_scaled = Self::decode_btree_v2_scaled_coords(
                 &record,
                 filtered,
@@ -1043,71 +1846,248 @@ impl MutableFile {
                 scaled_coords.len(),
             )?;
             if existing_scaled == scaled_coords {
-                records.push(Self::encode_btree_v2_chunk_record(
-                    chunk_addr,
-                    chunk_size,
-                    &scaled_coords,
-                    filtered,
-                    chunk_size_len,
-                    sa,
-                )?);
+                sortable_records.push((existing_scaled, new_record.clone()));
                 replacing = true;
             } else {
-                records.push(record);
+                sortable_records.push((existing_scaled, record));
             }
         }
+        if !replacing {
+            sortable_records.push((scaled_coords, new_record));
+        }
+        sortable_records.sort_by(|a, b| a.0.cmp(&b.0));
+        let records: Vec<Vec<u8>> = sortable_records
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect();
         drop(guard);
 
-        if !replacing {
-            if root_nrecords >= max_records {
-                return Err(Error::Unsupported(
-                    "write_chunk cannot split full v2 B-tree leaf nodes yet".into(),
-                ));
-            }
-            records.push(Self::encode_btree_v2_chunk_record(
-                chunk_addr,
-                chunk_size,
-                &scaled_coords,
-                filtered,
-                chunk_size_len,
-                sa,
-            )?);
-            let mut sortable_records = Vec::with_capacity(records.len());
-            for record in records {
-                let record_scaled = Self::decode_btree_v2_scaled_coords(
-                    &record,
-                    filtered,
-                    chunk_size_len,
-                    sa,
-                    scaled_coords.len(),
-                )?;
-                sortable_records.push((record_scaled, record));
-            }
-            sortable_records.sort_by(|a, b| a.0.cmp(&b.0));
-            records = sortable_records
-                .into_iter()
-                .map(|(_, record)| record)
-                .collect();
+        self.rebuild_btree_v2_chunk_tree(index_addr, &header, &records)
+    }
+
+    fn rebuild_btree_v2_chunk_tree(
+        &mut self,
+        header_addr: u64,
+        header: &BTreeV2Header,
+        records: &[Vec<u8>],
+    ) -> Result<()> {
+        let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
+        if records.len() <= leaf_capacity {
+            let root_addr = self.append_btree_v2_leaf(header, records)?;
+            self.rewrite_btree_v2_header_root(
+                header_addr,
+                header,
+                0,
+                root_addr,
+                records.len() as u16,
+                records.len() as u64,
+            )?;
+            return Ok(());
         }
 
-        let new_nrecords = records.len();
-        let mut leaf = Vec::with_capacity(6 + new_nrecords * header.record_size as usize);
+        let internal_capacity = self.btree_v2_depth1_internal_capacity(header)?;
+        let mut leaf_count = 2usize;
+        while records.len() > leaf_count * (leaf_capacity + 1) - 1 {
+            leaf_count += 1;
+        }
+        if leaf_count - 1 > internal_capacity {
+            return Err(Error::Unsupported(
+                "write_chunk cannot rebuild v2 B-tree chunk indexes beyond a depth-1 root yet"
+                    .into(),
+            ));
+        }
+
+        let leaf_record_total = records.len() - (leaf_count - 1);
+        let mut record_pos = 0usize;
+        let mut remaining_leaf_records = leaf_record_total;
+        let mut children = Vec::with_capacity(leaf_count);
+        let mut separators = Vec::with_capacity(leaf_count - 1);
+
+        for leaf_index in 0..leaf_count {
+            let remaining_leaves = leaf_count - leaf_index;
+            let take = remaining_leaf_records.div_ceil(remaining_leaves);
+            if take == 0 || take > leaf_capacity {
+                return Err(Error::InvalidFormat(
+                    "invalid v2 B-tree chunk leaf distribution".into(),
+                ));
+            }
+            let leaf_records = &records[record_pos..record_pos + take];
+            let leaf_addr = self.append_btree_v2_leaf(header, leaf_records)?;
+            children.push((leaf_addr, take as u16));
+            record_pos += take;
+            remaining_leaf_records -= take;
+            if leaf_index + 1 < leaf_count {
+                separators.push(records[record_pos].clone());
+                record_pos += 1;
+            }
+        }
+        if record_pos != records.len() {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree chunk rebuild did not consume all records".into(),
+            ));
+        }
+
+        let root_addr = self.append_btree_v2_depth1_internal(header, &separators, &children)?;
+        self.rewrite_btree_v2_header_root(
+            header_addr,
+            header,
+            1,
+            root_addr,
+            separators.len() as u16,
+            records.len() as u64,
+        )
+    }
+
+    fn append_btree_v2_leaf(&mut self, header: &BTreeV2Header, records: &[Vec<u8>]) -> Result<u64> {
+        if records.len() > u16::MAX as usize {
+            return Err(Error::Unsupported(
+                "v2 B-tree leaf record count exceeds u16".into(),
+            ));
+        }
+        let mut leaf = Vec::with_capacity(6 + records.len() * header.record_size as usize + 4);
         leaf.extend_from_slice(b"BTLF");
         leaf.push(0);
         leaf.push(header.tree_type);
-        for record in &records {
+        for record in records {
+            if record.len() != header.record_size as usize {
+                return Err(Error::InvalidFormat(
+                    "v2 B-tree leaf record has wrong size".into(),
+                ));
+            }
             leaf.extend_from_slice(record);
         }
-        let leaf_checksum = checksum_metadata(&leaf);
-
-        self.write_handle.seek(SeekFrom::Start(header.root_addr))?;
+        let checksum = checksum_metadata(&leaf);
+        leaf.extend_from_slice(&checksum.to_le_bytes());
+        let addr = self.append_aligned_zeros(leaf.len(), 8)?;
+        self.write_handle.seek(SeekFrom::Start(addr))?;
         self.write_handle.write_all(&leaf)?;
-        self.write_handle.write_all(&leaf_checksum.to_le_bytes())?;
+        Ok(addr)
+    }
 
-        if !replacing {
-            self.rewrite_btree_v2_header_counts(index_addr, &header, new_nrecords as u16)?;
+    fn append_btree_v2_depth1_internal(
+        &mut self,
+        header: &BTreeV2Header,
+        separators: &[Vec<u8>],
+        children: &[(u64, u16)],
+    ) -> Result<u64> {
+        if children.len() != separators.len() + 1 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal child/record count mismatch".into(),
+            ));
         }
+        if separators.len() > u16::MAX as usize {
+            return Err(Error::Unsupported(
+                "v2 B-tree internal record count exceeds u16".into(),
+            ));
+        }
+        let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
+        let child_nrecords_size = Self::bytes_needed(leaf_capacity as u64);
+        let sa = self.superblock.sizeof_addr as usize;
 
+        let mut node = Vec::new();
+        node.extend_from_slice(b"BTIN");
+        node.push(0);
+        node.push(header.tree_type);
+        for record in separators {
+            if record.len() != header.record_size as usize {
+                return Err(Error::InvalidFormat(
+                    "v2 B-tree internal separator has wrong size".into(),
+                ));
+            }
+            node.extend_from_slice(record);
+        }
+        for &(child_addr, child_nrecords) in children {
+            node.extend_from_slice(&child_addr.to_le_bytes()[..sa]);
+            node.extend_from_slice(&(child_nrecords as u64).to_le_bytes()[..child_nrecords_size]);
+        }
+        let checksum = checksum_metadata(&node);
+        node.extend_from_slice(&checksum.to_le_bytes());
+        let addr = self.append_aligned_zeros(node.len(), 8)?;
+        self.write_handle.seek(SeekFrom::Start(addr))?;
+        self.write_handle.write_all(&node)?;
+        Ok(addr)
+    }
+
+    fn btree_v2_depth1_internal_capacity(&self, header: &BTreeV2Header) -> Result<usize> {
+        let node_size = header.node_size as usize;
+        let record_size = header.record_size as usize;
+        let leaf_capacity = Self::btree_v2_leaf_capacity(header)?;
+        let max_nrec_size = Self::bytes_needed(leaf_capacity as u64);
+        let pointer_size = self.superblock.sizeof_addr as usize + max_nrec_size;
+        if node_size <= 10 + pointer_size || record_size == 0 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal node cannot hold records".into(),
+            ));
+        }
+        let capacity = (node_size - (10 + pointer_size)) / (record_size + pointer_size);
+        if capacity == 0 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal node cannot hold records".into(),
+            ));
+        }
+        Ok(capacity)
+    }
+
+    fn bytes_needed(mut value: u64) -> usize {
+        let mut bytes = 1usize;
+        while value > 0xff {
+            value >>= 8;
+            bytes += 1;
+        }
+        bytes
+    }
+
+    fn rewrite_btree_v2_header_root(
+        &mut self,
+        header_addr: u64,
+        header: &BTreeV2Header,
+        new_depth: u16,
+        new_root_addr: u64,
+        new_root_nrecords: u16,
+        new_total_records: u64,
+    ) -> Result<()> {
+        let sa = self.superblock.sizeof_addr as usize;
+        let ss = self.superblock.sizeof_size as usize;
+        let depth_pos = header_addr + (4 + 1 + 1 + 4 + 2) as u64;
+        let root_addr_pos = header_addr + (4 + 1 + 1 + 4 + 2 + 2 + 1 + 1) as u64;
+        let root_nrecords_pos = root_addr_pos + sa as u64;
+        let total_records_pos = root_nrecords_pos + 2;
+        let checksum_pos = total_records_pos + ss as u64;
+
+        self.write_handle.seek(SeekFrom::Start(depth_pos))?;
+        self.write_handle.write_all(&new_depth.to_le_bytes())?;
+        self.write_handle.seek(SeekFrom::Start(root_addr_pos))?;
+        self.write_handle
+            .write_all(&new_root_addr.to_le_bytes()[..sa])?;
+        self.write_handle.seek(SeekFrom::Start(root_nrecords_pos))?;
+        self.write_handle
+            .write_all(&new_root_nrecords.to_le_bytes())?;
+        self.write_handle.seek(SeekFrom::Start(total_records_pos))?;
+        self.write_uint_le(new_total_records, ss)?;
+
+        let check_len = usize::try_from(checksum_pos - header_addr).map_err(|_| {
+            Error::InvalidFormat("v2 B-tree header checksum span is too large".into())
+        })?;
+        let mut guard = self.inner.lock();
+        guard.reader.seek(header_addr)?;
+        let mut header_bytes = guard.reader.read_bytes(check_len)?;
+        drop(guard);
+        let depth_offset = usize::try_from(depth_pos - header_addr).unwrap();
+        let root_addr_offset = usize::try_from(root_addr_pos - header_addr).unwrap();
+        let root_nrecords_offset = usize::try_from(root_nrecords_pos - header_addr).unwrap();
+        let total_offset = usize::try_from(total_records_pos - header_addr).unwrap();
+        header_bytes[depth_offset..depth_offset + 2].copy_from_slice(&new_depth.to_le_bytes());
+        header_bytes[root_addr_offset..root_addr_offset + sa]
+            .copy_from_slice(&new_root_addr.to_le_bytes()[..sa]);
+        header_bytes[root_nrecords_offset..root_nrecords_offset + 2]
+            .copy_from_slice(&new_root_nrecords.to_le_bytes());
+        header_bytes[total_offset..total_offset + ss]
+            .copy_from_slice(&new_total_records.to_le_bytes()[..ss]);
+        let checksum = checksum_metadata(&header_bytes);
+        self.write_handle.seek(SeekFrom::Start(checksum_pos))?;
+        self.write_handle.write_all(&checksum.to_le_bytes())?;
+
+        let _ = header;
         Ok(())
     }
 
@@ -1124,50 +2104,6 @@ impl MutableFile {
             ));
         }
         Ok(capacity)
-    }
-
-    fn rewrite_btree_v2_header_counts(
-        &mut self,
-        header_addr: u64,
-        header: &BTreeV2Header,
-        new_root_nrecords: u16,
-    ) -> Result<()> {
-        let sa = self.superblock.sizeof_addr as usize;
-        let ss = self.superblock.sizeof_size as usize;
-        let root_nrecords_pos = header_addr + (4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + sa) as u64;
-        let total_records_pos = root_nrecords_pos + 2;
-        let checksum_pos = total_records_pos + ss as u64;
-        let old_root_nrecords = header.root_nrecords as u64;
-        let new_total_records = header
-            .total_records
-            .checked_add(new_root_nrecords as u64)
-            .and_then(|value| value.checked_sub(old_root_nrecords))
-            .ok_or_else(|| Error::InvalidFormat("v2 B-tree record count overflow".into()))?;
-
-        self.write_handle.seek(SeekFrom::Start(root_nrecords_pos))?;
-        self.write_handle
-            .write_all(&new_root_nrecords.to_le_bytes())?;
-        self.write_handle.seek(SeekFrom::Start(total_records_pos))?;
-        self.write_uint_le(new_total_records, ss)?;
-
-        let check_len = usize::try_from(checksum_pos - header_addr).map_err(|_| {
-            Error::InvalidFormat("v2 B-tree header checksum span is too large".into())
-        })?;
-        let mut guard = self.inner.lock();
-        guard.reader.seek(header_addr)?;
-        let mut header_bytes = guard.reader.read_bytes(check_len)?;
-        drop(guard);
-        let root_offset = usize::try_from(root_nrecords_pos - header_addr).unwrap();
-        let total_offset = usize::try_from(total_records_pos - header_addr).unwrap();
-        header_bytes[root_offset..root_offset + 2]
-            .copy_from_slice(&new_root_nrecords.to_le_bytes());
-        header_bytes[total_offset..total_offset + ss]
-            .copy_from_slice(&new_total_records.to_le_bytes()[..ss]);
-        let checksum = checksum_metadata(&header_bytes);
-        self.write_handle.seek(SeekFrom::Start(checksum_pos))?;
-        self.write_handle.write_all(&checksum.to_le_bytes())?;
-
-        Ok(())
     }
 
     fn encode_btree_v2_chunk_record(
@@ -1582,6 +2518,14 @@ impl MutableFile {
         let max_entries = 64usize;
         let header_size = 4 + 1 + 1 + 2 + sizeof_addr * 2;
         header_size + (max_entries + 1) * key_size + max_entries * sizeof_addr
+    }
+
+    fn read_fresh_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut file = fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 
     fn append_aligned_zeros(&mut self, size: usize, align: u64) -> Result<u64> {

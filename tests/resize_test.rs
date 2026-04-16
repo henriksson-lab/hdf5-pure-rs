@@ -359,6 +359,54 @@ fn test_resize_then_write_appended_v4_extensible_array_chunk() {
 }
 
 #[test]
+fn test_resize_then_write_v4_extensible_array_into_super_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("append_v4_extensible_array_super_block.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[4_900]).unwrap();
+        for chunk_start in (80..4_900).step_by(20) {
+            let chunk: Vec<f64> = (chunk_start..chunk_start + 20)
+                .map(|value| value as f64)
+                .collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    chunk.as_ptr() as *const u8,
+                    chunk.len() * std::mem::size_of::<f64>(),
+                )
+            };
+            mf.write_chunk("extensible_array", &[chunk_start as u64], bytes)
+                .unwrap();
+        }
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<f64> = f
+            .dataset("extensible_array")
+            .unwrap()
+            .read::<f64>()
+            .unwrap();
+        let expected: Vec<f64> = (0..4_900).map(|value| value as f64).collect();
+        assert_eq!(vals, expected);
+    }
+
+    let out = std::process::Command::new("h5dump")
+        .arg("-H")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -H failed on super-block extensible-array append file: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn test_write_chunk_replaces_filtered_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replace_filtered_chunk.h5");

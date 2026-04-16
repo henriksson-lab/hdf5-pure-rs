@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - default
+          - no-default-features
+          - derive
+          - blosc
+          - tracehash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install HDF5 tools
+        run: sudo apt-get update && sudo apt-get install -y hdf5-tools
+      - name: Test default features
+        if: matrix.features == 'default'
+        run: cargo test --workspace
+      - name: Test no default features
+        if: matrix.features == 'no-default-features'
+        run: cargo test --workspace --no-default-features
+      - name: Test selected feature
+        if: matrix.features != 'default' && matrix.features != 'no-default-features'
+        run: cargo test --workspace --no-default-features --features ${{ matrix.features }}
+
+  miri:
+    name: miri parser units
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - run: cargo miri test --lib format::
+
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+
+  semver:
+    name: cargo semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - run: cargo semver-checks check-release

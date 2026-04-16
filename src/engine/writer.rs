@@ -18,8 +18,10 @@ pub struct HdfFileWriter<W: Write + Seek> {
     groups: HashMap<String, u64>,
     /// Pending links: (parent_path, child_name, child_addr).
     links: Vec<(String, String, u64)>,
-    /// Pending attribute messages for the root group.
+    /// Pending pre-encoded attribute messages for the root group.
     pending_root_attrs: Vec<(u16, Vec<u8>)>,
+    /// Pending root attributes added through the typed writer API.
+    pending_root_attr_specs: Vec<OwnedAttrSpec>,
     /// Pre-encoded link messages (for soft/external links): (parent_path, encoded_link_msg).
     special_links: Vec<(String, Vec<u8>)>,
 }
@@ -30,6 +32,25 @@ pub struct AttrSpec<'a> {
     pub shape: &'a [u64],
     pub dtype: DtypeSpec,
     pub data: &'a [u8],
+}
+
+#[derive(Clone)]
+struct OwnedAttrSpec {
+    name: String,
+    shape: Vec<u64>,
+    dtype: DtypeSpec,
+    data: Vec<u8>,
+}
+
+impl OwnedAttrSpec {
+    fn as_attr_spec(&self) -> AttrSpec<'_> {
+        AttrSpec {
+            name: &self.name,
+            shape: &self.shape,
+            dtype: self.dtype.clone(),
+            data: &self.data,
+        }
+    }
 }
 
 /// Describes a dataset to create.
@@ -331,6 +352,32 @@ fn encode_dataspace(shape: &[u64]) -> Vec<u8> {
     buf
 }
 
+/// Encode a dense hard link message. Libhdf5 stores ASCII dense-link
+/// names without the optional character-set field when possible.
+fn encode_dense_link_message(name: &str, target_addr: u64, sizeof_addr: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len();
+    let (size_flag, len_bytes) = if name_len < 256 {
+        (0u8, 1usize)
+    } else if name_len < 65536 {
+        (1u8, 2usize)
+    } else {
+        (2u8, 4usize)
+    };
+    buf.push(1);
+    buf.push(size_flag);
+    match len_bytes {
+        1 => buf.push(name_len as u8),
+        2 => buf.extend_from_slice(&(name_len as u16).to_le_bytes()),
+        4 => buf.extend_from_slice(&(name_len as u32).to_le_bytes()),
+        _ => unreachable!(),
+    }
+    buf.extend_from_slice(name_bytes);
+    buf.extend_from_slice(&target_addr.to_le_bytes()[..sizeof_addr as usize]);
+    buf
+}
+
 /// Encode a link message (v1, hard link).
 fn encode_link_message(name: &str, target_addr: u64, sizeof_addr: u8) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -558,6 +605,28 @@ fn encode_attribute_message(name: &str, dtype: &DtypeSpec, shape: &[u64], data: 
     buf
 }
 
+fn encode_link_info_message(heap_addr: u64, name_btree_addr: u64, sizeof_addr: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&heap_addr.to_le_bytes()[..sizeof_addr as usize]);
+    buf.extend_from_slice(&name_btree_addr.to_le_bytes()[..sizeof_addr as usize]);
+    buf
+}
+
+fn encode_attr_info_message(heap_addr: u64, name_btree_addr: u64, sizeof_addr: u8) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&heap_addr.to_le_bytes()[..sizeof_addr as usize]);
+    buf.extend_from_slice(&name_btree_addr.to_le_bytes()[..sizeof_addr as usize]);
+    buf
+}
+
+fn dense_name_hash(name: &str) -> u32 {
+    crate::format::checksum::checksum_lookup3(name.as_bytes(), 0)
+}
+
 /// Build a v2 object header from a list of messages.
 fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Vec<u8> {
     // Calculate chunk 0 data size
@@ -609,7 +678,8 @@ fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Vec<u8> {
     for (msg_type, data) in messages {
         buf.push(*msg_type as u8); // type (1 byte in v2)
         buf.extend_from_slice(&(data.len() as u16).to_le_bytes()); // size
-        buf.push(0); // flags
+        let msg_flags = if *msg_type == MSG_GROUP_INFO { 0x01 } else { 0 };
+        buf.push(msg_flags);
         buf.extend_from_slice(data);
     }
 
@@ -736,6 +806,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             groups: HashMap::new(),
             links: Vec::new(),
             pending_root_attrs: Vec::new(),
+            pending_root_attr_specs: Vec::new(),
             special_links: Vec::new(),
         }
     }
@@ -982,10 +1053,18 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             (MSG_LAYOUT, layout_bytes),
         ];
 
-        for attr in attrs {
-            let attr_bytes =
-                encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
-            messages.push((MSG_ATTRIBUTE, attr_bytes));
+        if attrs.len() > 8 {
+            let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
+            messages.push((
+                MSG_ATTR_INFO,
+                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr),
+            ));
+        } else {
+            for attr in attrs {
+                let attr_bytes =
+                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
+                messages.push((MSG_ATTRIBUTE, attr_bytes));
+            }
         }
 
         let msg_refs: Vec<(u16, &[u8])> =
@@ -1011,8 +1090,12 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
     /// Create a root group attribute from spec.
     pub fn add_root_attr(&mut self, attr: &AttrSpec) {
-        let attr_bytes = encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
-        self.pending_root_attrs.push((MSG_ATTRIBUTE, attr_bytes));
+        self.pending_root_attr_specs.push(OwnedAttrSpec {
+            name: attr.name.to_string(),
+            shape: attr.shape.to_vec(),
+            dtype: attr.dtype.clone(),
+            data: attr.data.to_vec(),
+        });
     }
 
     /// Create a chunked dataset with optional compression.
@@ -1274,6 +1357,249 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(btree_addr)
     }
 
+    fn write_dense_link_storage(&mut self, links: &[(String, u64)]) -> Result<(u64, u64)> {
+        let mut payloads = Vec::with_capacity(links.len());
+        let mut managed_size = 0u64;
+        for (name, addr) in links {
+            let link_bytes = encode_dense_link_message(name, *addr, self.sizeof_addr);
+            managed_size = managed_size
+                .checked_add(link_bytes.len() as u64)
+                .ok_or_else(|| Error::InvalidFormat("dense link heap size overflow".into()))?;
+            payloads.push((name.as_str(), link_bytes));
+        }
+
+        let (heap_addr, heap_ids) = self.write_managed_fractal_heap(&payloads, 7)?;
+        let mut records = Vec::with_capacity(payloads.len());
+        for ((name, _), heap_id) in payloads.iter().zip(heap_ids) {
+            let mut record = Vec::with_capacity(4 + heap_id.len());
+            record.extend_from_slice(&dense_name_hash(name).to_le_bytes());
+            record.extend_from_slice(&heap_id);
+            records.push(record);
+        }
+        records
+            .sort_by_key(|record| u32::from_le_bytes([record[0], record[1], record[2], record[3]]));
+
+        let btree_addr = self.write_dense_name_btree(5, &records)?;
+        Ok((heap_addr, btree_addr))
+    }
+
+    fn write_dense_attribute_storage(&mut self, attrs: &[AttrSpec<'_>]) -> Result<(u64, u64)> {
+        let mut payloads = Vec::with_capacity(attrs.len());
+        for attr in attrs {
+            let attr_bytes =
+                encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
+            payloads.push((attr.name, attr_bytes));
+        }
+
+        let (heap_addr, heap_ids) = self.write_managed_fractal_heap(&payloads, 8)?;
+        let mut records = Vec::with_capacity(payloads.len());
+        for (creation_order, ((name, _), heap_id)) in payloads.iter().zip(heap_ids).enumerate() {
+            let mut record = Vec::with_capacity(heap_id.len() + 9);
+            record.extend_from_slice(&heap_id);
+            record.push(0);
+            record.extend_from_slice(&(creation_order as u32).to_le_bytes());
+            record.extend_from_slice(&dense_name_hash(name).to_le_bytes());
+            records.push(record);
+        }
+        records.sort_by_key(|record| {
+            let hash_pos = record.len() - 4;
+            u32::from_le_bytes([
+                record[hash_pos],
+                record[hash_pos + 1],
+                record[hash_pos + 2],
+                record[hash_pos + 3],
+            ])
+        });
+
+        let btree_addr = self.write_dense_name_btree(8, &records)?;
+        Ok((heap_addr, btree_addr))
+    }
+
+    fn write_managed_fractal_heap(
+        &mut self,
+        payloads: &[(&str, Vec<u8>)],
+        heap_id_len: u16,
+    ) -> Result<(u64, Vec<Vec<u8>>)> {
+        let offset_bytes = 4usize;
+        let length_bytes = heap_id_len
+            .checked_sub(1 + offset_bytes as u16)
+            .ok_or_else(|| Error::InvalidFormat("managed heap ID length is too short".into()))?
+            as usize;
+        if length_bytes == 0 || length_bytes > 8 {
+            return Err(Error::Unsupported(format!(
+                "managed heap ID length {heap_id_len} leaves unsupported length byte count {length_bytes}"
+            )));
+        }
+        let needed_block_size = 25
+            + payloads
+                .iter()
+                .map(|(_, payload)| payload.len())
+                .sum::<usize>();
+        let block_size = 512usize.max(needed_block_size.next_power_of_two());
+        let heap_header_len = self.minimal_fractal_heap_header_len();
+        let heap_addr = self.allocator.allocate(heap_header_len as u64, 8);
+        let direct_addr = self.allocator.allocate(block_size as u64, 8);
+
+        let mut direct = Vec::with_capacity(block_size);
+        direct.extend_from_slice(b"FHDB");
+        direct.push(0);
+        direct.extend_from_slice(&heap_addr.to_le_bytes()[..self.sizeof_addr as usize]);
+        direct.extend_from_slice(&0u32.to_le_bytes());
+        direct.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut heap_ids = Vec::with_capacity(payloads.len());
+        for (_, payload) in payloads {
+            let offset = direct.len() as u32;
+            direct.extend_from_slice(payload);
+            let len = payload.len() as u64;
+            let max_len = if length_bytes == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (length_bytes * 8)) - 1
+            };
+            if len > max_len {
+                return Err(Error::Unsupported(format!(
+                    "dense heap payload length {len} exceeds {length_bytes}-byte managed heap ID length"
+                )));
+            }
+            let mut heap_id = Vec::with_capacity(heap_id_len as usize);
+            heap_id.push(0);
+            heap_id.extend_from_slice(&offset.to_le_bytes()[..offset_bytes]);
+            heap_id.extend_from_slice(&len.to_le_bytes()[..length_bytes]);
+            heap_ids.push(heap_id);
+        }
+        direct.resize(block_size, 0);
+        let checksum = checksum_metadata(&direct);
+        direct[17..21].copy_from_slice(&checksum.to_le_bytes());
+        self.write_at(direct_addr, &direct)?;
+
+        let used_managed_space =
+            direct.iter().rposition(|byte| *byte != 0).unwrap_or(20) as u64 + 1;
+        let heap = self.encode_minimal_fractal_heap(
+            heap_id_len,
+            payloads.len(),
+            used_managed_space,
+            block_size as u64,
+            direct_addr,
+        );
+        debug_assert_eq!(heap.len(), heap_header_len);
+        self.write_at(heap_addr, &heap)?;
+        Ok((heap_addr, heap_ids))
+    }
+
+    fn minimal_fractal_heap_header_len(&self) -> usize {
+        4 + 1
+            + 2
+            + 2
+            + 1
+            + 4
+            + self.sizeof_size as usize
+            + self.sizeof_addr as usize
+            + self.sizeof_size as usize
+            + self.sizeof_addr as usize
+            + self.sizeof_size as usize * 8
+            + 2
+            + self.sizeof_size as usize * 2
+            + 2
+            + 2
+            + self.sizeof_addr as usize
+            + 2
+            + 4
+    }
+
+    fn encode_minimal_fractal_heap(
+        &self,
+        heap_id_len: u16,
+        managed_nobjs: usize,
+        _managed_size: u64,
+        managed_alloc_size: u64,
+        root_block_addr: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let undef = UNDEF_ADDR.to_le_bytes();
+        let sa = self.sizeof_addr as usize;
+        let ss = self.sizeof_size as usize;
+        let free_space = 0u64;
+
+        buf.extend_from_slice(b"FRHP");
+        buf.push(0);
+        buf.extend_from_slice(&heap_id_len.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.push(0x02);
+        buf.extend_from_slice(&4096u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&undef[..sa]);
+        buf.extend_from_slice(&free_space.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&undef[..sa]);
+        buf.extend_from_slice(&managed_alloc_size.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&managed_alloc_size.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&(managed_nobjs as u64).to_le_bytes()[..ss]);
+        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&0u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(&managed_alloc_size.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&65536u64.to_le_bytes()[..ss]);
+        buf.extend_from_slice(&32u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&root_block_addr.to_le_bytes()[..sa]);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        let checksum = checksum_metadata(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    fn write_dense_name_btree(&mut self, tree_type: u8, records: &[Vec<u8>]) -> Result<u64> {
+        let record_size = records
+            .first()
+            .map(|record| record.len())
+            .ok_or_else(|| Error::InvalidFormat("cannot write empty dense name B-tree".into()))?;
+        if records.iter().any(|record| record.len() != record_size) {
+            return Err(Error::InvalidFormat(
+                "dense name B-tree records have inconsistent sizes".into(),
+            ));
+        }
+        if records.len() > u16::MAX as usize {
+            return Err(Error::Unsupported(
+                "dense name B-tree writer supports at most 65535 records".into(),
+            ));
+        }
+
+        let node_size = 512usize.max(10 + records.len() * record_size);
+        let mut leaf = Vec::with_capacity(6 + records.len() * record_size + 4);
+        leaf.extend_from_slice(b"BTLF");
+        leaf.push(0);
+        leaf.push(tree_type);
+        for record in records {
+            leaf.extend_from_slice(record);
+        }
+        let leaf_checksum = checksum_metadata(&leaf);
+        leaf.extend_from_slice(&leaf_checksum.to_le_bytes());
+        let root_addr = self.allocator.allocate(leaf.len() as u64, 8);
+        self.write_at(root_addr, &leaf)?;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(b"BTHD");
+        header.push(0);
+        header.push(tree_type);
+        header.extend_from_slice(&(node_size as u32).to_le_bytes());
+        header.extend_from_slice(&(record_size as u16).to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.push(100);
+        header.push(40);
+        header.extend_from_slice(&root_addr.to_le_bytes()[..self.sizeof_addr as usize]);
+        header.extend_from_slice(&(records.len() as u16).to_le_bytes());
+        header
+            .extend_from_slice(&(records.len() as u64).to_le_bytes()[..self.sizeof_size as usize]);
+        let checksum = checksum_metadata(&header);
+        header.extend_from_slice(&checksum.to_le_bytes());
+        let header_addr = self.allocator.allocate(header.len() as u64, 8);
+        self.write_at(header_addr, &header)?;
+        Ok(header_addr)
+    }
+
     /// Finalize the file: update root group with links and write superblock.
     pub fn finalize(&mut self) -> Result<()> {
         // Sort groups by depth (deepest first) so child groups are written
@@ -1307,21 +1633,27 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 continue;
             }
 
-            // Build messages: link info + link messages
+            // Build messages: link info + link messages. Groups above the
+            // compact threshold use dense link storage, backed by a v2 B-tree
+            // name index and heap IDs that point directly at link payloads.
             let mut messages: Vec<(u16, Vec<u8>)> = Vec::new();
 
-            // Link info message (v0): flags=0, fractal_heap=UNDEF, name_btree=UNDEF
-            let mut link_info = Vec::new();
-            link_info.push(0); // version
-            link_info.push(0); // flags
-            let undef_bytes = UNDEF_ADDR.to_le_bytes();
-            link_info.extend_from_slice(&undef_bytes[..self.sizeof_addr as usize]); // fractal heap
-            link_info.extend_from_slice(&undef_bytes[..self.sizeof_addr as usize]); // name btree
-            messages.push((MSG_LINK_INFO, link_info));
+            if group_links.len() > 8 {
+                let (heap_addr, btree_addr) = self.write_dense_link_storage(&group_links)?;
+                messages.push((MSG_GROUP_INFO, vec![0, 0]));
+                messages.push((
+                    MSG_LINK_INFO,
+                    encode_link_info_message(heap_addr, btree_addr, self.sizeof_addr),
+                ));
+            } else {
+                messages.push((MSG_GROUP_INFO, vec![0, 0]));
+                let link_info = encode_link_info_message(UNDEF_ADDR, UNDEF_ADDR, self.sizeof_addr);
+                messages.push((MSG_LINK_INFO, link_info));
 
-            for (name, addr) in &group_links {
-                let link_bytes = encode_link_message(name, *addr, self.sizeof_addr);
-                messages.push((MSG_LINK, link_bytes));
+                for (name, addr) in &group_links {
+                    let link_bytes = encode_link_message(name, *addr, self.sizeof_addr);
+                    messages.push((MSG_LINK, link_bytes));
+                }
             }
 
             // Add special links (soft/external) for this group
@@ -1331,10 +1663,35 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 }
             }
 
-            // Add pending root attributes
+            // Add pending root attributes. Attributes added through the typed
+            // API can spill to dense storage; pre-encoded messages remain compact.
             if path == "/" {
                 for (msg_type, attr_data) in &self.pending_root_attrs {
                     messages.push((*msg_type, attr_data.clone()));
+                }
+
+                if self.pending_root_attr_specs.len() > 8 {
+                    let owned_attrs = self.pending_root_attr_specs.clone();
+                    let attr_specs: Vec<AttrSpec<'_>> = owned_attrs
+                        .iter()
+                        .map(OwnedAttrSpec::as_attr_spec)
+                        .collect();
+                    let (heap_addr, btree_addr) =
+                        self.write_dense_attribute_storage(&attr_specs)?;
+                    messages.push((
+                        MSG_ATTR_INFO,
+                        encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr),
+                    ));
+                } else {
+                    for attr in &self.pending_root_attr_specs {
+                        let attr_bytes = encode_attribute_message(
+                            &attr.name,
+                            &attr.dtype,
+                            &attr.shape,
+                            &attr.data,
+                        );
+                        messages.push((MSG_ATTRIBUTE, attr_bytes));
+                    }
                 }
             }
 
