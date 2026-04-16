@@ -36,7 +36,7 @@ This blurb might be out of date. Go to [this page](https://github.com/henriksson
 
 ```toml
 [dependencies]
-hdf5-pure-rust = "0.2.2"
+hdf5-pure-rust = "0.3.0"
 ```
 
 ## Quick Start
@@ -153,7 +153,7 @@ struct Measurement {
 |---------|---------|-------------|
 | `derive` | yes | `#[derive(H5Type)]` proc macro |
 | `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs). Manually verified with `cargo test --features blosc blosc`. |
-| `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. See `analysis/tracehash_divergence.md`. |
+| `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. Requires an external `tracehash` checkout at `tools/tracehash` or a local manifest patch; it is not needed for normal builds. See `analysis/tracehash_divergence.md`. |
 
 ## Test Suite
 
@@ -164,6 +164,16 @@ The checked test count changes frequently; use `cargo test -- --list` for the cu
 - Corrupt file handling (zero panics, CVE regressions)
 - Write round-trips verified by h5dump and h5py
 - Cross-platform: big-endian, old formats, various file space strategies
+- Optional real-world smoke tests for AnnData `.h5ad`, 10x Genomics feature-barcode matrices, Keras/TensorFlow `.h5`, h5py files, netCDF4-like files, MATLAB v7.3-like files, NeXus files, and pandas/PyTables HDFStore files
+
+Real-world fixture payloads are intentionally not checked in. To populate them locally:
+
+```bash
+scripts/download-real-world-fixtures.py
+cargo test --test real_world_test -- --nocapture
+```
+
+Use `scripts/download-real-world-fixtures.py --no-download` to regenerate only local producer fixtures without fetching public files. The pandas/PyTables fixture requires the Python `tables` package.
 
 **This test suite needs to be expanded before any claims of general compatibility.**
 
