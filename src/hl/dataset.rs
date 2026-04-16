@@ -9,14 +9,17 @@ use crate::error::{Error, Result};
 use crate::filters;
 // B-tree types used for chunk reading
 use crate::format::messages::data_layout::{ChunkIndexType, DataLayoutMessage, LayoutClass};
-use crate::format::messages::dataspace::DataspaceMessage;
+use crate::format::messages::dataspace::{DataspaceMessage, DataspaceType};
 use crate::format::messages::datatype::DatatypeMessage;
-use crate::format::messages::fill_value::FillValueMessage;
+use crate::format::messages::fill_value::{FillValueMessage, FILL_TIME_NEVER};
 use crate::format::messages::filter_pipeline::FilterPipelineMessage;
 use crate::format::object_header::{self, ObjectHeader, RawMessage};
 use crate::hl::file::FileInner;
 use crate::hl::value::H5Value;
 use crate::io::reader::HdfReader;
+
+const MAX_VDS_MAPPINGS: usize = 65_536;
+const MAX_VDS_SELECTION_RANK: usize = 32;
 
 /// An HDF5 dataset.
 pub struct Dataset {
@@ -109,6 +112,7 @@ impl Dataset {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
+        let mut has_external_file_list = false;
 
         for msg in messages {
             match msg.msg_type {
@@ -134,8 +138,17 @@ impl Dataset {
                 object_header::MSG_FILL_VALUE_OLD => {
                     fill_value = Some(FillValueMessage::decode_old(&msg.data)?);
                 }
+                object_header::MSG_EXTERNAL_FILE_LIST => {
+                    has_external_file_list = true;
+                }
                 _ => {}
             }
+        }
+
+        if has_external_file_list {
+            return Err(Error::Unsupported(
+                "external raw data storage is not implemented".into(),
+            ));
         }
 
         Ok(DatasetInfo {
@@ -184,12 +197,12 @@ impl Dataset {
 
     /// Get the total number of elements.
     pub fn size(&self) -> Result<u64> {
-        let shape = self.shape()?;
-        if shape.is_empty() {
-            Ok(1) // scalar
-        } else {
-            Ok(shape.iter().product())
+        let info = self.info()?;
+        if info.layout.layout_class == LayoutClass::Virtual {
+            let shape = self.virtual_shape_with_info(&info)?;
+            return Self::dataspace_element_count(info.dataspace.space_type, &shape);
         }
+        Self::dataspace_element_count(info.dataspace.space_type, &info.dataspace.dims)
     }
 
     /// Get the element size in bytes.
@@ -204,12 +217,22 @@ impl Dataset {
         Ok(crate::hl::datatype::Datatype::from_message(info.datatype))
     }
 
+    /// Return the parsed low-level datatype message.
+    pub fn raw_datatype_message(&self) -> Result<DatatypeMessage> {
+        Ok(self.info()?.datatype)
+    }
+
     /// Get the dataspace.
     pub fn space(&self) -> Result<crate::hl::dataspace::Dataspace> {
         let info = self.info()?;
         Ok(crate::hl::dataspace::Dataspace::from_message(
             info.dataspace,
         ))
+    }
+
+    /// Return the parsed low-level dataspace message.
+    pub fn raw_dataspace_message(&self) -> Result<DataspaceMessage> {
+        Ok(self.info()?.dataspace)
     }
 
     /// Whether the dataset uses chunked storage.
@@ -292,6 +315,7 @@ impl Dataset {
                         &gh_ref,
                     ) {
                         Ok(data) => {
+                            trace_vlen_read(data.len() as u64, &data);
                             let s = String::from_utf8_lossy(&data).to_string();
                             // Trim trailing nulls
                             strings.push(s.trim_end_matches('\0').to_string());
@@ -304,13 +328,10 @@ impl Dataset {
         }
 
         // Fixed-length strings
+        let padding = info.datatype.string_padding().unwrap_or(1);
         let mut strings = Vec::new();
         for chunk in raw.chunks_exact(elem_size) {
-            // Find null terminator or end of chunk
-            let end = chunk.iter().position(|&b| b == 0).unwrap_or(elem_size);
-            let s = String::from_utf8_lossy(&chunk[..end]).to_string();
-            // Also trim trailing spaces (space-padded strings)
-            strings.push(s.trim_end().to_string());
+            strings.push(decode_fixed_string_with_padding(chunk, padding));
         }
         Ok(strings)
     }
@@ -376,7 +397,9 @@ impl Dataset {
     ///
     /// This is useful for compound members whose HDF5 datatype is not directly
     /// representable as a primitive Rust `H5Type`, such as nested compound,
-    /// array, variable-length, or reference members.
+    /// array, variable-length, or reference members. No recursive typed
+    /// conversion is performed; callers must interpret each returned byte
+    /// vector using the field datatype from [`Dataset::compound_fields`].
     pub fn read_field_raw(&self, field_name: &str) -> Result<Vec<Vec<u8>>> {
         let fields = self.compound_fields()?;
         let field = fields
@@ -410,7 +433,8 @@ impl Dataset {
     ///
     /// This handles nested compound, array, variable-length, and reference
     /// members. Datatype classes without a richer public representation are
-    /// returned as `H5Value::Raw`.
+    /// returned as `H5Value::Raw`. This API is intended for inspection and
+    /// simple extraction, not full libhdf5 typed conversion parity.
     pub fn read_field_values(&self, field_name: &str) -> Result<Vec<H5Value>> {
         let fields = self.compound_fields()?;
         let field = fields
@@ -569,6 +593,7 @@ impl Dataset {
                 object_index: index,
             },
         )?;
+        trace_vlen_read(data.len() as u64, &data);
 
         let Some(base) = base else {
             return Ok(H5Value::Raw(data));
@@ -653,15 +678,13 @@ impl Dataset {
 
     pub(crate) fn read_raw_with_info(&self, info: DatasetInfo) -> Result<Vec<u8>> {
         let element_size = info.datatype.size as usize;
-        let total_elements: u64 = if info.dataspace.dims.is_empty() {
-            1
-        } else {
-            info.dataspace.dims.iter().try_fold(1u64, |acc, &d| {
-                acc.checked_mul(d)
-                    .ok_or_else(|| Error::InvalidFormat("dimension product overflow".into()))
-            })?
-        };
-        let total_bytes = (total_elements as usize)
+        if element_size == 0 {
+            return Err(Error::InvalidFormat("zero-sized datatype".into()));
+        }
+        let total_elements =
+            Self::dataspace_element_count(info.dataspace.space_type, &info.dataspace.dims)?;
+        let total_elements_usize = usize_from_u64(total_elements, "dimension product")?;
+        let total_bytes = total_elements_usize
             .checked_mul(element_size)
             .ok_or_else(|| Error::InvalidFormat("total data size overflow".into()))?;
 
@@ -680,16 +703,25 @@ impl Dataset {
                     .layout
                     .compact_data
                     .ok_or_else(|| Error::InvalidFormat("compact dataset missing data".into()))?;
-                Ok(data)
+                if data.len() < total_bytes {
+                    return Err(Error::InvalidFormat(format!(
+                        "compact dataset data size {} is smaller than expected {total_bytes}",
+                        data.len()
+                    )));
+                }
+                Ok(data[..total_bytes].to_vec())
             }
             LayoutClass::Contiguous => {
                 let addr = info.layout.contiguous_addr.ok_or_else(|| {
                     Error::InvalidFormat("contiguous dataset missing address".into())
                 })?;
-                let size = info.layout.contiguous_size.unwrap_or(total_bytes as u64) as usize;
+                let size = usize_from_u64(
+                    info.layout.contiguous_size.unwrap_or(total_bytes as u64),
+                    "contiguous dataset size",
+                )?;
 
                 if crate::io::reader::is_undef_addr(addr) {
-                    return Self::filled_data(total_elements as usize, element_size, &info);
+                    return Self::filled_data(total_elements_usize, element_size, &info);
                 }
 
                 guard.reader.seek(addr)?;
@@ -724,11 +756,17 @@ impl Dataset {
         element_size: usize,
         info: &DatasetInfo,
     ) -> Result<Vec<u8>> {
+        let total_bytes = total_elements
+            .checked_mul(element_size)
+            .ok_or_else(|| Error::InvalidFormat("fill buffer size overflow".into()))?;
         let Some(fill) = &info.fill_value else {
-            return Ok(vec![0u8; total_elements * element_size]);
+            return Ok(vec![0u8; total_bytes]);
         };
+        if fill.fill_time == FILL_TIME_NEVER {
+            return Ok(vec![0u8; total_bytes]);
+        }
         let Some(value) = fill.value.as_deref() else {
-            return Ok(vec![0u8; total_elements * element_size]);
+            return Ok(vec![0u8; total_bytes]);
         };
         if value.len() != element_size {
             return Err(Error::Unsupported(format!(
@@ -738,7 +776,7 @@ impl Dataset {
             )));
         }
 
-        let mut out = vec![0u8; total_elements * element_size];
+        let mut out = vec![0u8; total_bytes];
         for chunk in out.chunks_exact_mut(element_size) {
             chunk.copy_from_slice(value);
         }
@@ -746,22 +784,36 @@ impl Dataset {
     }
 
     /// Read all data as a typed Vec.
+    ///
+    /// This uses the crate's supported conversion table, not the full libhdf5
+    /// conversion matrix. Unsupported or lossy HDF5 datatype conversions return
+    /// an error rather than attempting C-library parity.
     pub fn read<T: crate::hl::types::H5Type>(&self) -> Result<Vec<T>> {
-        let mut raw = self.read_raw()?;
-        // Byte-swap if file byte order != host byte order
-        self.maybe_byte_swap(&mut raw)?;
-        crate::hl::types::bytes_to_vec(raw)
+        let info = self.info()?;
+        let conversion = crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
+        let raw = self.read_raw()?;
+        conversion.bytes_to_vec(raw)
     }
 
     /// Read a scalar value.
     pub fn read_scalar<T: crate::hl::types::H5Type>(&self) -> Result<T> {
-        let mut raw = self.read_raw()?;
-        self.maybe_byte_swap(&mut raw)?;
-        let slice = crate::hl::types::bytes_to_slice::<T>(&raw)?;
-        if slice.is_empty() {
-            return Err(Error::InvalidFormat("no data for scalar read".into()));
+        let info = self.info()?;
+        let conversion = crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
+        let raw = self.read_raw()?;
+        conversion.bytes_to_scalar(raw)
+    }
+
+    fn dataspace_element_count(space_type: DataspaceType, dims: &[u64]) -> Result<u64> {
+        if space_type == DataspaceType::Null {
+            return Ok(0);
         }
-        Ok(slice[0])
+        if dims.is_empty() {
+            return Ok(1);
+        }
+        dims.iter().try_fold(1u64, |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| Error::InvalidFormat("dimension product overflow".into()))
+        })
     }
 
     /// Read data as a 1D ndarray.
@@ -784,6 +836,18 @@ impl Dataset {
             .map_err(|e| Error::Other(format!("ndarray shape error: {e}")))
     }
 
+    /// Read data as an N-dimensional ndarray (row-major).
+    pub fn read_dyn<T: crate::hl::types::H5Type>(&self) -> Result<ndarray::ArrayD<T>> {
+        let shape = self.shape()?;
+        let dims: Vec<usize> = shape
+            .iter()
+            .map(|&dim| usize_from_u64(dim, "ndarray dimension"))
+            .collect::<Result<Vec<_>>>()?;
+        let vec = self.read::<T>()?;
+        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&dims), vec)
+            .map_err(|e| Error::Other(format!("ndarray shape error: {e}")))
+    }
+
     /// Read a subset of the dataset using a selection.
     ///
     /// Example: `ds.read_slice::<f64>(10..20)` reads elements 10-19 from a 1D dataset.
@@ -795,7 +859,16 @@ impl Dataset {
         let selection = sel.into_selection(&shape);
         let slices = selection.to_slices(&shape);
         let out_shape = selection.output_shape(&shape);
-        let total_out: u64 = out_shape.iter().product::<u64>().max(1);
+        let total_out = if out_shape.is_empty() {
+            1
+        } else {
+            out_shape.iter().try_fold(1u64, |acc, &dim| {
+                acc.checked_mul(dim)
+                    .ok_or_else(|| Error::InvalidFormat("selection element count overflow".into()))
+            })?
+        }
+        .max(1);
+        let total_out_usize = usize_from_u64(total_out, "selection element count")?;
         let elem_size = T::type_size();
 
         // For 1D contiguous selections, optimize with direct seek+read
@@ -804,10 +877,21 @@ impl Dataset {
             if info.layout.layout_class == LayoutClass::Contiguous {
                 if let Some(addr) = info.layout.contiguous_addr {
                     if !crate::io::reader::is_undef_addr(addr) {
-                        let start_byte = slices[0].start as usize * elem_size;
-                        let nbytes = slices[0].count() as usize * elem_size;
+                        let start_byte = usize_from_u64(slices[0].start, "selection start")?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| {
+                                Error::InvalidFormat("selection byte offset overflow".into())
+                            })?;
+                        let nbytes = usize_from_u64(slices[0].count(), "selection count")?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| {
+                                Error::InvalidFormat("selection byte count overflow".into())
+                            })?;
                         let mut guard = self.inner.lock();
-                        guard.reader.seek(addr + start_byte as u64)?;
+                        let read_addr = addr.checked_add(start_byte as u64).ok_or_else(|| {
+                            Error::InvalidFormat("selection read address overflow".into())
+                        })?;
+                        guard.reader.seek(read_addr)?;
                         let raw = guard.reader.read_bytes(nbytes)?;
                         return crate::hl::types::bytes_to_vec(raw);
                     }
@@ -820,29 +904,41 @@ impl Dataset {
 
         if shape.len() == 1 && slices.len() == 1 {
             let s = &slices[0];
-            let start = s.start as usize;
-            let end = s.end as usize;
+            let start = usize_from_u64(s.start, "selection start")?;
+            let end = usize_from_u64(s.end, "selection end")?;
+            if start > all_data.len() {
+                return Ok(Vec::new());
+            }
             return Ok(all_data[start..end.min(all_data.len())].to_vec());
         }
 
         // N-D extraction
-        let mut result = Vec::with_capacity(total_out as usize);
+        let mut result = Vec::with_capacity(total_out_usize);
         let ndims = shape.len();
 
         // Compute input strides
         let mut in_strides = vec![1usize; ndims];
         for d in (0..ndims - 1).rev() {
-            in_strides[d] = in_strides[d + 1] * shape[d + 1] as usize;
+            in_strides[d] = in_strides[d + 1]
+                .checked_mul(usize_from_u64(shape[d + 1], "selection shape")?)
+                .ok_or_else(|| Error::InvalidFormat("selection stride overflow".into()))?;
         }
 
         // Iterate over output elements
         let mut out_idx = vec![0u64; ndims];
         for _ in 0..total_out {
             // Map output index to input index
-            let mut in_linear = 0;
+            let mut in_linear = 0usize;
             for d in 0..ndims {
                 let in_d = slices[d].start + out_idx[d] * slices[d].step;
-                in_linear += in_d as usize * in_strides[d];
+                let term = usize_from_u64(in_d, "selection input index")?
+                    .checked_mul(in_strides[d])
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("selection linear index overflow".into())
+                    })?;
+                in_linear = in_linear.checked_add(term).ok_or_else(|| {
+                    Error::InvalidFormat("selection linear index overflow".into())
+                })?;
             }
 
             if in_linear < all_data.len() {
@@ -860,33 +956,6 @@ impl Dataset {
         }
 
         Ok(result)
-    }
-
-    /// Byte-swap the raw data in-place if the file byte order differs from native.
-    fn maybe_byte_swap(&self, data: &mut [u8]) -> Result<()> {
-        use crate::format::messages::datatype::ByteOrder;
-
-        let info = self.info()?;
-        let elem_size = info.datatype.size as usize;
-
-        if elem_size <= 1 {
-            return Ok(()); // no swapping needed for single-byte types
-        }
-
-        let file_order = info.datatype.byte_order();
-        let need_swap = match file_order {
-            Some(ByteOrder::BigEndian) => cfg!(target_endian = "little"),
-            Some(ByteOrder::LittleEndian) => cfg!(target_endian = "big"),
-            None => false, // non-numeric types
-        };
-
-        if need_swap {
-            for chunk in data.chunks_exact_mut(elem_size) {
-                chunk.reverse();
-            }
-        }
-
-        Ok(())
     }
 
     fn read_chunked<R: Read + Seek>(
@@ -917,19 +986,19 @@ impl Dataset {
 
         // Calculate chunk size in bytes
         let chunk_bytes = if chunk_dims.len() == ndims + 1 {
-            chunk_dims
+            let bytes = chunk_dims
                 .iter()
                 .copied()
                 .try_fold(1u64, |a, b| a.checked_mul(b))
-                .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?
-                as usize
+                .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?;
+            usize_from_u64(bytes, "chunk byte size")?
         } else {
             let chunk_elements: u64 = chunk_data_dims
                 .iter()
                 .copied()
                 .try_fold(1u64, |a, b| a.checked_mul(b))
                 .ok_or_else(|| Error::InvalidFormat("chunk dimension product overflow".into()))?;
-            (chunk_elements as usize)
+            usize_from_u64(chunk_elements, "chunk element count")?
                 .checked_mul(element_size)
                 .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?
         };
@@ -964,47 +1033,63 @@ impl Dataset {
                 } else {
                     // Single chunk: data is at the index address
                     reader.seek(idx_addr)?;
-                    let mut raw = reader.read_bytes(
+                    let read_size = usize_from_u64(
                         info.layout
                             .single_chunk_filtered_size
-                            .unwrap_or(chunk_bytes as u64) as usize,
+                            .unwrap_or(chunk_bytes as u64),
+                        "single-chunk size",
                     )?;
+                    let mut raw = reader.read_bytes(read_size)?;
 
                     if let Some(ref pipeline) = info.filter_pipeline {
                         if !pipeline.filters.is_empty() {
-                            raw = filters::apply_pipeline_reverse_with_mask(
+                            raw = filters::apply_pipeline_reverse_with_mask_expected(
                                 &raw,
                                 pipeline,
                                 element_size,
                                 info.layout.single_chunk_filter_mask.unwrap_or(0),
+                                chunk_bytes,
                             )?;
                         }
                     }
 
+                    if raw.len() < total_bytes {
+                        return Err(Error::InvalidFormat(
+                            "single-chunk data shorter than dataset size".into(),
+                        ));
+                    }
                     Ok(raw[..total_bytes].to_vec())
                 }
             }
             Some(ChunkIndexType::SingleChunk) => {
                 // V4 single chunk
                 reader.seek(idx_addr)?;
-                let read_size = info
-                    .layout
-                    .single_chunk_filtered_size
-                    .unwrap_or(chunk_bytes as u64) as usize;
+                let read_size = usize_from_u64(
+                    info.layout
+                        .single_chunk_filtered_size
+                        .unwrap_or(chunk_bytes as u64),
+                    "single-chunk size",
+                )?;
                 let mut raw = reader.read_bytes(read_size)?;
 
                 if let Some(ref pipeline) = info.filter_pipeline {
                     if !pipeline.filters.is_empty() {
-                        raw = filters::apply_pipeline_reverse_with_mask(
+                        raw = filters::apply_pipeline_reverse_with_mask_expected(
                             &raw,
                             pipeline,
                             element_size,
                             info.layout.single_chunk_filter_mask.unwrap_or(0),
+                            chunk_bytes,
                         )?;
                     }
                 }
 
-                Ok(raw[..total_bytes.min(raw.len())].to_vec())
+                if raw.len() < total_bytes {
+                    return Err(Error::InvalidFormat(
+                        "single-chunk data shorter than dataset size".into(),
+                    ));
+                }
+                Ok(raw[..total_bytes].to_vec())
             }
             Some(ChunkIndexType::BTreeV1) => Self::read_chunked_btree_v1(
                 reader,
@@ -1068,7 +1153,7 @@ impl Dataset {
         info: &DatasetInfo,
         data_dims: &[u64],
         chunk_dims: &[u64],
-        _chunk_bytes: usize,
+        chunk_bytes: usize,
         element_size: usize,
         total_bytes: usize,
     ) -> Result<Vec<u8>> {
@@ -1079,21 +1164,32 @@ impl Dataset {
         let chunks = Self::collect_btree_v1_chunks(reader, btree_addr, ndims)?;
 
         for (coords, chunk_addr, chunk_size, filter_mask) in &chunks {
+            let scaled = Self::scaled_chunk_coords(coords, chunk_dims)?;
+            Self::trace_btree1_chunk_lookup(
+                btree_addr,
+                &scaled,
+                *chunk_addr,
+                *chunk_size,
+                *filter_mask,
+            );
+
             if crate::io::reader::is_undef_addr(*chunk_addr) {
                 continue;
             }
 
             reader.seek(*chunk_addr)?;
-            let mut raw = reader.read_bytes(*chunk_size as usize)?;
+            let read_size = usize_from_u64(*chunk_size, "v1 B-tree chunk size")?;
+            let mut raw = reader.read_bytes(read_size)?;
 
             // Apply filter pipeline if present (respecting filter mask)
             if let Some(ref pipeline) = info.filter_pipeline {
                 if !pipeline.filters.is_empty() {
-                    raw = filters::apply_pipeline_reverse_with_mask(
+                    raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
                         element_size,
                         *filter_mask,
+                        chunk_bytes,
                     )?;
                 }
             }
@@ -1106,7 +1202,7 @@ impl Dataset {
                 chunk_dims,
                 element_size,
                 &mut output,
-            );
+            )?;
         }
 
         Ok(output)
@@ -1122,10 +1218,10 @@ impl Dataset {
         let element_size = info.datatype.size as usize;
 
         let output_dims = Self::virtual_output_dims(&mappings, file_path, info)?;
-        let total_elements = output_dims.iter().try_fold(1usize, |acc, &dim| {
-            acc.checked_mul(dim as usize)
-                .ok_or_else(|| Error::InvalidFormat("virtual dataset size overflow".into()))
-        })?;
+        let total_elements = usize_from_u64(
+            Self::dataspace_element_count(info.dataspace.space_type, &output_dims)?,
+            "virtual dataset element count",
+        )?;
         let mut output = Self::filled_data(total_elements, element_size, info)?;
 
         for mapping in mappings {
@@ -1156,10 +1252,18 @@ impl Dataset {
             for (src, dst) in source_points.iter().zip(virtual_points.iter()) {
                 let src_index = Self::linear_index(src, &source_strides)?;
                 let dst_index = Self::linear_index(dst, &virtual_strides)?;
-                let src_start = src_index * element_size;
-                let dst_start = dst_index * element_size;
-                if src_start + element_size <= source_raw.len()
-                    && dst_start + element_size <= output.len()
+                let src_start = src_index.checked_mul(element_size).ok_or_else(|| {
+                    Error::InvalidFormat("virtual source byte offset overflow".into())
+                })?;
+                let dst_start = dst_index.checked_mul(element_size).ok_or_else(|| {
+                    Error::InvalidFormat("virtual destination byte offset overflow".into())
+                })?;
+                if src_start
+                    .checked_add(element_size)
+                    .is_some_and(|end| end <= source_raw.len())
+                    && dst_start
+                        .checked_add(element_size)
+                        .is_some_and(|end| end <= output.len())
                 {
                     output[dst_start..dst_start + element_size]
                         .copy_from_slice(&source_raw[src_start..src_start + element_size]);
@@ -1209,7 +1313,15 @@ impl Dataset {
                 "virtual dataset heap encoding version {version}"
             )));
         }
-        let count = read_le_uint_at(heap_data, &mut pos, sizeof_size)? as usize;
+        let count = usize_from_u64(
+            read_le_uint_at(heap_data, &mut pos, sizeof_size)?,
+            "virtual dataset mapping count",
+        )?;
+        if count > MAX_VDS_MAPPINGS {
+            return Err(Error::InvalidFormat(format!(
+                "virtual dataset mapping count {count} exceeds supported maximum {MAX_VDS_MAPPINGS}"
+            )));
+        }
         let mut mappings = Vec::with_capacity(count);
         let mut file_names: Vec<String> = Vec::with_capacity(count);
         let mut dataset_names: Vec<String> = Vec::with_capacity(count);
@@ -1228,7 +1340,10 @@ impl Dataset {
             let file_name = if flags & 0x04 != 0 {
                 ".".to_string()
             } else if flags & 0x01 != 0 {
-                let origin = read_le_uint_at(heap_data, &mut pos, sizeof_size)? as usize;
+                let origin = usize_from_u64(
+                    read_le_uint_at(heap_data, &mut pos, sizeof_size)?,
+                    "virtual dataset shared file-name index",
+                )?;
                 file_names.get(origin).cloned().ok_or_else(|| {
                     Error::InvalidFormat("invalid shared VDS source file reference".into())
                 })?
@@ -1237,7 +1352,10 @@ impl Dataset {
             };
 
             let dataset_name = if flags & 0x02 != 0 {
-                let origin = read_le_uint_at(heap_data, &mut pos, sizeof_size)? as usize;
+                let origin = usize_from_u64(
+                    read_le_uint_at(heap_data, &mut pos, sizeof_size)?,
+                    "virtual dataset shared dataset-name index",
+                )?;
                 dataset_names.get(origin).cloned().ok_or_else(|| {
                     Error::InvalidFormat("invalid shared VDS source dataset reference".into())
                 })?
@@ -1247,6 +1365,7 @@ impl Dataset {
 
             let source_select = Self::decode_virtual_selection(heap_data, &mut pos)?;
             let virtual_select = Self::decode_virtual_selection(heap_data, &mut pos)?;
+            trace_vds_source_resolve(&file_name, &dataset_name);
             file_names.push(file_name.clone());
             dataset_names.push(dataset_name.clone());
             mappings.push(VirtualMapping {
@@ -1261,10 +1380,12 @@ impl Dataset {
     }
 
     fn decode_virtual_selection(data: &[u8], pos: &mut usize) -> Result<VirtualSelection> {
+        const H5S_SEL_POINTS: u32 = 1;
         const H5S_SEL_HYPERSLABS: u32 = 2;
         const H5S_SEL_ALL: u32 = 3;
         const H5S_HYPER_REGULAR: u8 = 0x01;
 
+        let start_pos = *pos;
         let sel_type = read_le_u32_at(data, pos)?;
         if sel_type == H5S_SEL_ALL {
             let version = read_le_u32_at(data, pos)?;
@@ -1281,7 +1402,13 @@ impl Dataset {
                     "truncated virtual all-selection header".into(),
                 ));
             }
+            trace_selection_deserialize(&data[start_pos..*pos], sel_type);
             return Ok(VirtualSelection::All);
+        }
+        if sel_type == H5S_SEL_POINTS {
+            return Err(Error::Unsupported(
+                "point virtual dataset selections are not implemented".into(),
+            ));
         }
         if sel_type != H5S_SEL_HYPERSLABS {
             return Err(Error::Unsupported(format!(
@@ -1306,7 +1433,12 @@ impl Dataset {
             )));
         };
 
-        let rank = read_le_u32_at(data, pos)? as usize;
+        let rank = usize_from_u64(read_le_u32_at(data, pos)? as u64, "virtual selection rank")?;
+        if rank > MAX_VDS_SELECTION_RANK {
+            return Err(Error::InvalidFormat(format!(
+                "virtual selection rank {rank} exceeds supported maximum {MAX_VDS_SELECTION_RANK}"
+            )));
+        }
         if flags & H5S_HYPER_REGULAR == 0 {
             return Err(Error::Unsupported(
                 "irregular virtual hyperslab selections are not implemented".into(),
@@ -1330,6 +1462,7 @@ impl Dataset {
             ));
         }
 
+        trace_selection_deserialize(&data[start_pos..*pos], sel_type);
         Ok(VirtualSelection::Regular(RegularHyperslab {
             start,
             stride,
@@ -1470,7 +1603,7 @@ impl Dataset {
         let mut strides = vec![1usize; dims.len()];
         for dim in (0..dims.len().saturating_sub(1)).rev() {
             strides[dim] = strides[dim + 1]
-                .checked_mul(dims[dim + 1] as usize)
+                .checked_mul(usize_from_u64(dims[dim + 1], "dataspace dimension")?)
                 .ok_or_else(|| Error::InvalidFormat("dataspace stride overflow".into()))?;
         }
         Ok(strides)
@@ -1481,7 +1614,11 @@ impl Dataset {
             .iter()
             .zip(strides)
             .try_fold(0usize, |acc, (&coord, &stride)| {
-                acc.checked_add((coord as usize).checked_mul(stride)?)
+                acc.checked_add(
+                    usize_from_u64(coord, "dataspace coordinate")
+                        .ok()?
+                        .checked_mul(stride)?,
+                )
             })
             .ok_or_else(|| Error::InvalidFormat("linear index overflow".into()))
     }
@@ -1505,16 +1642,15 @@ impl Dataset {
         }
 
         let ndims = data_dims.len();
-        let total_chunks: usize = data_dims
+        let chunks_per_dim = Self::chunks_per_dim(data_dims, chunk_dims)?;
+        let total_chunks: usize = chunks_per_dim
             .iter()
-            .zip(chunk_dims)
-            .map(|(&dim, &chunk)| ((dim + chunk - 1) / chunk) as usize)
-            .try_fold(1usize, |acc, count| acc.checked_mul(count))
+            .try_fold(1usize, |acc, &count| acc.checked_mul(count))
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
 
         let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
         for chunk_index in 0..total_chunks {
-            let coords = Self::implicit_chunk_coords(chunk_index, data_dims, chunk_dims);
+            let coords = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim);
             let offset = (chunk_index as u64)
                 .checked_mul(chunk_bytes as u64)
                 .and_then(|off| base_addr.checked_add(off))
@@ -1528,7 +1664,7 @@ impl Dataset {
                 chunk_dims,
                 element_size,
                 &mut output,
-            );
+            )?;
         }
 
         if ndims == 0 {
@@ -1564,6 +1700,7 @@ impl Dataset {
             filtered,
             chunk_size_len,
         )?;
+        let chunks_per_dim = Self::chunks_per_dim(data_dims, chunk_dims)?;
         let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
 
         for (chunk_index, element) in elements.iter().enumerate() {
@@ -1580,9 +1717,12 @@ impl Dataset {
                 continue;
             }
 
-            let coords = Self::implicit_chunk_coords(chunk_index, data_dims, chunk_dims);
+            let coords = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim);
             reader.seek(element.addr)?;
-            let read_size = element.nbytes.unwrap_or(chunk_bytes as u64) as usize;
+            let read_size = usize_from_u64(
+                element.nbytes.unwrap_or(chunk_bytes as u64),
+                "fixed-array chunk size",
+            )?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to read fixed-array chunk {chunk_index} at address {} with size {read_size}: {err}",
@@ -1592,11 +1732,12 @@ impl Dataset {
 
             if let Some(ref pipeline) = info.filter_pipeline {
                 if !pipeline.filters.is_empty() {
-                    raw = filters::apply_pipeline_reverse_with_mask(
+                    raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
                         element_size,
                         element.filter_mask,
+                        chunk_bytes,
                     )?;
                 }
             }
@@ -1608,7 +1749,7 @@ impl Dataset {
                 chunk_dims,
                 element_size,
                 &mut output,
-            );
+            )?;
         }
 
         Ok(output)
@@ -1641,6 +1782,7 @@ impl Dataset {
             filtered,
             chunk_size_len,
         )?;
+        let chunks_per_dim = Self::chunks_per_dim(data_dims, chunk_dims)?;
         let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
 
         for (chunk_index, element) in elements.iter().enumerate() {
@@ -1657,9 +1799,12 @@ impl Dataset {
                 continue;
             }
 
-            let coords = Self::implicit_chunk_coords(chunk_index, data_dims, chunk_dims);
+            let coords = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim);
             reader.seek(element.addr)?;
-            let read_size = element.nbytes.unwrap_or(chunk_bytes as u64) as usize;
+            let read_size = usize_from_u64(
+                element.nbytes.unwrap_or(chunk_bytes as u64),
+                "extensible-array chunk size",
+            )?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to read extensible-array chunk {chunk_index} at address {} with size {read_size}: {err}",
@@ -1669,11 +1814,12 @@ impl Dataset {
 
             if let Some(ref pipeline) = info.filter_pipeline {
                 if !pipeline.filters.is_empty() {
-                    raw = filters::apply_pipeline_reverse_with_mask(
+                    raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
                         element_size,
                         element.filter_mask,
+                        chunk_bytes,
                     )?;
                 }
             }
@@ -1685,7 +1831,7 @@ impl Dataset {
                 chunk_dims,
                 element_size,
                 &mut output,
-            );
+            )?;
         }
 
         Ok(output)
@@ -1731,14 +1877,19 @@ impl Dataset {
             let coords: Vec<u64> = scaled
                 .iter()
                 .zip(chunk_dims)
-                .map(|(&coord, &chunk)| coord * chunk)
-                .collect();
+                .map(|(&coord, &chunk)| {
+                    coord.checked_mul(chunk).ok_or_else(|| {
+                        Error::InvalidFormat("v2-B-tree chunk coordinate overflow".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             reader.seek(addr).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to seek to v2-B-tree chunk address {addr}: {err}"
                 ))
             })?;
-            let mut raw = reader.read_bytes(nbytes as usize).map_err(|err| {
+            let read_size = usize_from_u64(nbytes, "v2-B-tree chunk size")?;
+            let mut raw = reader.read_bytes(read_size).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to read v2-B-tree chunk at address {addr} with size {nbytes}: {err}"
                 ))
@@ -1746,11 +1897,12 @@ impl Dataset {
 
             if let Some(ref pipeline) = info.filter_pipeline {
                 if !pipeline.filters.is_empty() {
-                    raw = filters::apply_pipeline_reverse_with_mask(
+                    raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
                         element_size,
                         filter_mask,
+                        chunk_bytes,
                     )?;
                 }
             }
@@ -1762,7 +1914,7 @@ impl Dataset {
                 chunk_dims,
                 element_size,
                 &mut output,
-            );
+            )?;
         }
 
         Ok(output)
@@ -1803,6 +1955,40 @@ impl Dataset {
     }
 
     #[cfg(feature = "tracehash")]
+    fn trace_btree1_chunk_lookup(
+        index_addr: u64,
+        scaled: &[u64],
+        addr: u64,
+        nbytes: u64,
+        filter_mask: u32,
+    ) {
+        let mut th = tracehash::th_call!("hdf5.chunk_index.btree1.lookup");
+        th.input_u64(index_addr);
+        for coord in scaled {
+            th.input_u64(*coord);
+        }
+        th.output_bool(true);
+        th.output_u64(addr);
+        th.output_u64(if crate::io::reader::is_undef_addr(addr) {
+            0
+        } else {
+            nbytes
+        });
+        th.output_u64(filter_mask as u64);
+        th.finish();
+    }
+
+    #[cfg(not(feature = "tracehash"))]
+    fn trace_btree1_chunk_lookup(
+        _index_addr: u64,
+        _scaled: &[u64],
+        _addr: u64,
+        _nbytes: u64,
+        _filter_mask: u32,
+    ) {
+    }
+
+    #[cfg(feature = "tracehash")]
     fn trace_btree2_chunk_lookup(
         index_addr: u64,
         scaled: &[u64],
@@ -1836,6 +2022,60 @@ impl Dataset {
     ) {
     }
 
+    #[cfg(feature = "tracehash")]
+    fn trace_btree2_record_decode(
+        record: &[u8],
+        addr: u64,
+        nbytes: u64,
+        filter_mask: u32,
+        scaled: &[u64],
+    ) {
+        let mut th = tracehash::th_call!("hdf5.chunk_index.btree2.record_decode");
+        th.input_bytes(record);
+        th.output_bool(true);
+        th.output_u64(addr);
+        th.output_u64(nbytes);
+        th.output_u64(filter_mask as u64);
+        th.output_u64(scaled.len() as u64);
+        for coord in scaled {
+            th.output_u64(*coord);
+        }
+        th.finish();
+    }
+
+    #[cfg(not(feature = "tracehash"))]
+    fn trace_btree2_record_decode(
+        _record: &[u8],
+        _addr: u64,
+        _nbytes: u64,
+        _filter_mask: u32,
+        _scaled: &[u64],
+    ) {
+    }
+
+    fn scaled_chunk_coords(coords: &[u64], chunk_dims: &[u64]) -> Result<Vec<u64>> {
+        if coords.len() != chunk_dims.len() {
+            return Err(Error::InvalidFormat(
+                "chunk coordinate rank does not match chunk dimensions".into(),
+            ));
+        }
+        coords
+            .iter()
+            .zip(chunk_dims)
+            .map(|(&coord, &dim)| {
+                if dim == 0 {
+                    return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+                }
+                if coord % dim != 0 {
+                    return Err(Error::InvalidFormat(
+                        "chunk coordinate is not aligned to chunk dimension".into(),
+                    ));
+                }
+                Ok(coord / dim)
+            })
+            .collect()
+    }
+
     fn decode_btree_v2_chunk_record(
         record: &[u8],
         filtered: bool,
@@ -1856,7 +2096,7 @@ impl Dataset {
                     "truncated v2-B-tree filter mask".into(),
                 ));
             }
-            let filter_mask = u32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
+            let filter_mask = read_le_u32(record, pos)?;
             pos += 4;
             (nbytes, filter_mask)
         } else {
@@ -1869,6 +2109,8 @@ impl Dataset {
             pos += 8;
             scaled.push(coord);
         }
+
+        Self::trace_btree2_record_decode(record, addr, nbytes, filter_mask, &scaled);
 
         Ok((addr, nbytes, filter_mask, scaled))
     }
@@ -1890,17 +2132,29 @@ impl Dataset {
         Ok((1 + ((bits + 8) / 8)).min(8))
     }
 
-    fn implicit_chunk_coords(
-        chunk_index: usize,
-        data_dims: &[u64],
-        chunk_dims: &[u64],
-    ) -> Vec<u64> {
-        let ndims = data_dims.len();
-        let chunks_per_dim: Vec<usize> = data_dims
+    fn chunks_per_dim(data_dims: &[u64], chunk_dims: &[u64]) -> Result<Vec<usize>> {
+        data_dims
             .iter()
             .zip(chunk_dims)
-            .map(|(&dim, &chunk)| ((dim + chunk - 1) / chunk) as usize)
-            .collect();
+            .map(|(&dim, &chunk)| {
+                if chunk == 0 {
+                    return Err(Error::InvalidFormat("zero chunk dimension".into()));
+                }
+                let count = dim
+                    .checked_add(chunk - 1)
+                    .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?
+                    / chunk;
+                usize_from_u64(count, "chunks per dimension")
+            })
+            .collect()
+    }
+
+    fn implicit_chunk_coords(
+        chunk_index: usize,
+        chunk_dims: &[u64],
+        chunks_per_dim: &[usize],
+    ) -> Vec<u64> {
+        let ndims = chunk_dims.len();
         let mut remaining = chunk_index;
         let mut coords = vec![0u64; ndims];
 
@@ -2012,20 +2266,31 @@ impl Dataset {
         chunk_dims: &[u64],
         element_size: usize,
         output: &mut [u8],
-    ) {
+    ) -> Result<()> {
         let ndims = data_dims.len();
 
         if ndims == 1 {
             // Fast path for 1D
-            let start = coords[0] as usize;
-            let chunk_size = chunk_dims[0] as usize;
-            let data_size = data_dims[0] as usize;
+            let start = usize_from_u64(coords[0], "chunk coordinate")?;
+            let chunk_size = usize_from_u64(chunk_dims[0], "chunk dimension")?;
+            let data_size = usize_from_u64(data_dims[0], "dataset dimension")?;
+            if start >= data_size {
+                return Ok(());
+            }
 
             let n_copy = chunk_size.min(data_size - start);
-            let src_bytes = n_copy * element_size;
-            let dst_offset = start * element_size;
+            let src_bytes = n_copy
+                .checked_mul(element_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk copy size overflow".into()))?;
+            let dst_offset = start
+                .checked_mul(element_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk copy offset overflow".into()))?;
 
-            if dst_offset + src_bytes <= output.len() && src_bytes <= chunk_data.len() {
+            if dst_offset
+                .checked_add(src_bytes)
+                .is_some_and(|end| end <= output.len())
+                && src_bytes <= chunk_data.len()
+            {
                 output[dst_offset..dst_offset + src_bytes]
                     .copy_from_slice(&chunk_data[..src_bytes]);
             }
@@ -2039,8 +2304,9 @@ impl Dataset {
                 element_size,
                 output,
                 ndims,
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn copy_chunk_nd(
@@ -2051,29 +2317,38 @@ impl Dataset {
         element_size: usize,
         output: &mut [u8],
         ndims: usize,
-    ) {
+    ) -> Result<()> {
         // Calculate strides for the output array
         let mut out_strides = vec![0usize; ndims];
         out_strides[ndims - 1] = element_size;
         for i in (0..ndims - 1).rev() {
-            out_strides[i] = out_strides[i + 1] * data_dims[i + 1] as usize;
+            out_strides[i] = out_strides[i + 1]
+                .checked_mul(usize_from_u64(data_dims[i + 1], "dataset dimension")?)
+                .ok_or_else(|| Error::InvalidFormat("chunk output stride overflow".into()))?;
         }
 
         // Calculate strides for the chunk
         let mut chunk_strides = vec![0usize; ndims];
         chunk_strides[ndims - 1] = element_size;
         for i in (0..ndims - 1).rev() {
-            chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1] as usize;
+            chunk_strides[i] = chunk_strides[i + 1]
+                .checked_mul(usize_from_u64(chunk_dims[i + 1], "chunk dimension")?)
+                .ok_or_else(|| Error::InvalidFormat("chunk stride overflow".into()))?;
         }
 
         // Precompute suffix products for chunk index decomposition
         let mut chunk_suffix_products = vec![1usize; ndims];
         for d in (0..ndims - 1).rev() {
-            chunk_suffix_products[d] = chunk_suffix_products[d + 1] * chunk_dims[d + 1] as usize;
+            chunk_suffix_products[d] = chunk_suffix_products[d + 1]
+                .checked_mul(usize_from_u64(chunk_dims[d + 1], "chunk dimension")?)
+                .ok_or_else(|| Error::InvalidFormat("chunk suffix product overflow".into()))?;
         }
 
         // Iterate over elements in the chunk
-        let total_chunk_elements: usize = chunk_dims.iter().map(|&d| d as usize).product();
+        let total_chunk_elements = chunk_dims.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(usize_from_u64(dim, "chunk dimension")?)
+                .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
+        })?;
         let mut idx = vec![0usize; ndims];
 
         for elem_idx in 0..total_chunk_elements {
@@ -2086,26 +2361,41 @@ impl Dataset {
 
             // Compute global position
             let mut in_bounds = true;
-            let mut out_offset = 0;
-            let mut chunk_offset = 0;
+            let mut out_offset = 0usize;
+            let mut chunk_offset = 0usize;
             for d in 0..ndims {
-                let global = coords[d] as usize + idx[d];
-                if global >= data_dims[d] as usize {
+                let global = usize_from_u64(coords[d], "chunk coordinate")?
+                    .checked_add(idx[d])
+                    .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+                if global >= usize_from_u64(data_dims[d], "dataset dimension")? {
                     in_bounds = false;
                     break;
                 }
-                out_offset += global * out_strides[d];
-                chunk_offset += idx[d] * chunk_strides[d];
+                out_offset = out_offset
+                    .checked_add(global.checked_mul(out_strides[d]).ok_or_else(|| {
+                        Error::InvalidFormat("chunk output offset overflow".into())
+                    })?)
+                    .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))?;
+                chunk_offset = chunk_offset
+                    .checked_add(idx[d].checked_mul(chunk_strides[d]).ok_or_else(|| {
+                        Error::InvalidFormat("chunk input offset overflow".into())
+                    })?)
+                    .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
             }
 
             if in_bounds
-                && out_offset + element_size <= output.len()
-                && chunk_offset + element_size <= chunk_data.len()
+                && out_offset
+                    .checked_add(element_size)
+                    .is_some_and(|end| end <= output.len())
+                && chunk_offset
+                    .checked_add(element_size)
+                    .is_some_and(|end| end <= chunk_data.len())
             {
                 output[out_offset..out_offset + element_size]
                     .copy_from_slice(&chunk_data[chunk_offset..chunk_offset + element_size]);
             }
         }
+        Ok(())
     }
 }
 
@@ -2123,6 +2413,49 @@ fn read_le_uint(bytes: &[u8], size: usize) -> Result<u64> {
     Ok(value)
 }
 
+#[cfg(feature = "tracehash")]
+fn trace_selection_deserialize(data: &[u8], sel_type: u32) {
+    let mut th = tracehash::th_call!("hdf5.selection.deserialize");
+    th.input_bytes(data);
+    th.output_bool(true);
+    th.output_u64(sel_type as u64);
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_selection_deserialize(_data: &[u8], _sel_type: u32) {}
+
+#[cfg(feature = "tracehash")]
+fn trace_vlen_read(len: u64, data: &[u8]) {
+    let mut th = tracehash::th_call!("hdf5.vlen.read");
+    th.input_u64(len);
+    th.output_bool(true);
+    th.output_bytes(data);
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_vlen_read(_len: u64, _data: &[u8]) {}
+
+#[cfg(feature = "tracehash")]
+fn trace_vds_source_resolve(file_name: &str, dataset_name: &str) {
+    let mut th = tracehash::th_call!("hdf5.vds.source.resolve");
+    th.input_bytes(file_name.as_bytes());
+    th.input_bytes(dataset_name.as_bytes());
+    th.output_bool(file_name == ".");
+    th.output_bytes(file_name.as_bytes());
+    th.output_bytes(dataset_name.as_bytes());
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_vds_source_resolve(_file_name: &str, _dataset_name: &str) {}
+
+fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
+}
+
 fn read_u8_at(bytes: &[u8], pos: &mut usize) -> Result<u8> {
     let value = *bytes
         .get(*pos)
@@ -2135,9 +2468,18 @@ fn read_le_u32_at(bytes: &[u8], pos: &mut usize) -> Result<u32> {
     if *pos + 4 > bytes.len() {
         return Err(Error::InvalidFormat("truncated u32 field".into()));
     }
-    let value = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+    let value = read_le_u32(bytes, *pos)?;
     *pos += 4;
     Ok(value)
+}
+
+fn read_le_u32(bytes: &[u8], pos: usize) -> Result<u32> {
+    let window = bytes
+        .get(pos..pos + 4)
+        .ok_or_else(|| Error::InvalidFormat("truncated u32 field".into()))?;
+    Ok(u32::from_le_bytes([
+        window[0], window[1], window[2], window[3],
+    ]))
 }
 
 fn read_le_uint_at(bytes: &[u8], pos: &mut usize, size: usize) -> Result<u64> {
@@ -2233,8 +2575,168 @@ fn endian_array<const N: usize>(
 }
 
 fn decode_fixed_string(bytes: &[u8]) -> String {
+    decode_fixed_string_with_padding(bytes, 1)
+}
+
+fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end])
-        .trim_end()
-        .to_string()
+    let bytes = &bytes[..end];
+    let s = String::from_utf8_lossy(bytes);
+    if padding == 2 {
+        s.trim_end().to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn le_u32(value: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn virtual_point_selection_is_explicitly_unsupported() {
+        let mut encoded = Vec::new();
+        le_u32(1, &mut encoded); // H5S_SEL_POINTS
+        let mut pos = 0;
+
+        let err = Dataset::decode_virtual_selection(&encoded, &mut pos)
+            .expect_err("point VDS selections should be rejected at decode time");
+
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string().contains("point virtual dataset selections"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_irregular_hyperslab_selection_is_explicitly_unsupported() {
+        let mut encoded = Vec::new();
+        le_u32(2, &mut encoded); // H5S_SEL_HYPERSLABS
+        le_u32(3, &mut encoded); // hyperslab selection version
+        encoded.push(0); // flags without H5S_HYPER_REGULAR
+        encoded.push(8); // encoded integer size
+        le_u32(1, &mut encoded); // rank
+
+        let mut pos = 0;
+        let err = Dataset::decode_virtual_selection(&encoded, &mut pos)
+            .expect_err("irregular VDS hyperslabs should be rejected at decode time");
+
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string()
+                .contains("irregular virtual hyperslab selections"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_source_resolution_requires_base_path_for_relative_and_same_file_sources() {
+        for source in [".", "relative-source.h5"] {
+            let err = Dataset::resolve_virtual_source_path(None, source)
+                .expect_err("VDS source resolution without a base file should fail");
+            assert!(matches!(err, Error::Unsupported(_)));
+        }
+    }
+
+    #[test]
+    fn btree_v1_chunk_records_preserve_8_byte_chunk_addresses() {
+        use std::io::Cursor;
+
+        let mut node = Vec::new();
+        node.extend_from_slice(b"TREE");
+        node.push(1); // raw data B-tree
+        node.push(0); // leaf
+        node.extend_from_slice(&1u16.to_le_bytes()); // entries used
+        node.extend_from_slice(&u64::MAX.to_le_bytes()); // left sibling
+        node.extend_from_slice(&u64::MAX.to_le_bytes()); // right sibling
+
+        node.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+        node.extend_from_slice(&0u32.to_le_bytes()); // filter mask
+        node.extend_from_slice(&4u64.to_le_bytes()); // dim 0 chunk offset
+        node.extend_from_slice(&8u64.to_le_bytes()); // dim 1 chunk offset
+        node.extend_from_slice(&0u64.to_le_bytes()); // extra element-size dimension
+        let large_chunk_addr = 0x1_0000_0040u64;
+        node.extend_from_slice(&large_chunk_addr.to_le_bytes());
+
+        node.extend_from_slice(&0u32.to_le_bytes()); // final key chunk size
+        node.extend_from_slice(&0u32.to_le_bytes()); // final key filter mask
+        node.extend_from_slice(&0u64.to_le_bytes()); // final dim 0 key
+        node.extend_from_slice(&0u64.to_le_bytes()); // final dim 1 key
+        node.extend_from_slice(&0u64.to_le_bytes()); // final extra key
+
+        let mut reader = HdfReader::new(Cursor::new(node));
+        reader.set_sizeof_addr(8);
+        let chunks = Dataset::collect_btree_v1_chunks(&mut reader, 0, 2).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, vec![4, 8]);
+        assert_eq!(chunks[0].1, large_chunk_addr);
+        assert_eq!(chunks[0].2, 16);
+        assert_eq!(chunks[0].3, 0);
+    }
+
+    #[test]
+    fn filtered_implicit_chunk_index_is_rejected() {
+        use std::io::Cursor;
+
+        let info = DatasetInfo {
+            dataspace: DataspaceMessage {
+                version: 2,
+                space_type: DataspaceType::Simple,
+                ndims: 1,
+                dims: vec![4],
+                max_dims: None,
+            },
+            datatype: DatatypeMessage {
+                version: 1,
+                class: crate::format::messages::datatype::DatatypeClass::FixedPoint,
+                class_bits: [0, 0, 0],
+                size: 4,
+                properties: Vec::new(),
+            },
+            layout: DataLayoutMessage {
+                version: 4,
+                layout_class: LayoutClass::Chunked,
+                compact_data: None,
+                contiguous_addr: None,
+                contiguous_size: None,
+                chunk_dims: Some(vec![2]),
+                chunk_index_addr: Some(0),
+                chunk_index_type: Some(ChunkIndexType::Implicit),
+                chunk_element_size: None,
+                chunk_flags: None,
+                chunk_encoded_dims: None,
+                single_chunk_filtered_size: None,
+                single_chunk_filter_mask: None,
+                data_addr: Some(0),
+                virtual_heap_addr: None,
+                virtual_heap_index: None,
+            },
+            filter_pipeline: Some(FilterPipelineMessage {
+                version: 2,
+                filters: vec![crate::format::messages::filter_pipeline::FilterDesc {
+                    id: crate::format::messages::filter_pipeline::FILTER_DEFLATE,
+                    name: None,
+                    flags: 0,
+                    client_data: vec![4],
+                }],
+            }),
+            fill_value: None,
+        };
+        let mut reader = HdfReader::new(Cursor::new(Vec::<u8>::new()));
+        let err = Dataset::read_chunked_implicit(&mut reader, 0, &info, &[4], &[2], 8, 4, 16)
+            .expect_err("filtered implicit chunk indexes should be rejected");
+
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string()
+                .contains("v4 implicit chunk index with filters"),
+            "unexpected error: {err}"
+        );
+    }
 }

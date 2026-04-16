@@ -1,5 +1,7 @@
 use crate::error::{Error, Result};
 
+const MAX_LAYOUT_RANK: usize = 32;
+
 /// Storage layout type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutClass {
@@ -66,7 +68,7 @@ impl DataLayoutMessage {
             1 | 2 => Self::decode_v1_v2(data, version, sizeof_addr),
             3 => Self::decode_v3(data, sizeof_addr, sizeof_size),
             4 => Self::decode_v4(data, sizeof_addr, sizeof_size),
-            _ => Err(Error::Unsupported(format!(
+            _ => Err(Error::InvalidFormat(format!(
                 "data layout message version {version}"
             ))),
         };
@@ -89,6 +91,11 @@ impl DataLayoutMessage {
         let sa = sizeof_addr as usize;
         ensure_available(data, 0, 8, "data layout v1/v2 header")?;
         let ndims = data[1] as usize;
+        if ndims > MAX_LAYOUT_RANK {
+            return Err(Error::InvalidFormat(format!(
+                "data layout rank {ndims} exceeds supported maximum {MAX_LAYOUT_RANK}"
+            )));
+        }
         let layout_class_val = data[2];
         // 5 reserved bytes in v1/v2
         let mut pos = 8;
@@ -148,7 +155,13 @@ impl DataLayoutMessage {
                 // For v1/v2, size is in the dimensions
                 result.contiguous_addr = data_addr;
                 if !dims.is_empty() {
-                    result.contiguous_size = Some(dims.iter().product());
+                    result.contiguous_size = Some(dims.iter().try_fold(1u64, |acc, &dim| {
+                        acc.checked_mul(dim).ok_or_else(|| {
+                            Error::InvalidFormat(
+                                "data layout v1/v2 contiguous size overflow".into(),
+                            )
+                        })
+                    })?);
                 }
             }
             LayoutClass::Chunked => {
@@ -218,6 +231,11 @@ impl DataLayoutMessage {
             LayoutClass::Chunked => {
                 // v3 chunked: ndims(1) + dims(ndims*4) + btree_addr(sizeof_addr)
                 let ndims = read_u8(data, &mut pos, "data layout v3 chunk rank")? as usize;
+                if ndims > MAX_LAYOUT_RANK {
+                    return Err(Error::InvalidFormat(format!(
+                        "data layout v3 chunk rank {ndims} exceeds supported maximum {MAX_LAYOUT_RANK}"
+                    )));
+                }
                 let addr = read_le_u64(data, &mut pos, sa, "data layout v3 chunk index address")?;
 
                 let mut dims = Vec::with_capacity(ndims);
@@ -301,6 +319,11 @@ impl DataLayoutMessage {
             LayoutClass::Chunked => {
                 let flags = read_u8(data, &mut pos, "data layout v4 chunk flags")?;
                 let ndims = read_u8(data, &mut pos, "data layout v4 chunk rank")? as usize;
+                if ndims > MAX_LAYOUT_RANK {
+                    return Err(Error::InvalidFormat(format!(
+                        "data layout v4 chunk rank {ndims} exceeds supported maximum {MAX_LAYOUT_RANK}"
+                    )));
+                }
                 let enc_bytes_per_dim =
                     read_u8(data, &mut pos, "data layout v4 encoded dimension size")? as usize;
 

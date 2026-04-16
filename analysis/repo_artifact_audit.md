@@ -11,16 +11,18 @@ before committing the HDF5 faithfulness work.
 - `scripts/`: contains tracehash runners and C-library fixture generation.
 - `tools/tracehash/`: vendored local tracehash crate used by the optional
   `tracehash` feature.
-- `hdf5/`: vendored HDF5 C source used for source-level comparison and probe
-  target selection. Commit only if the repository is intended to carry the C
-  reference source; otherwise replace it with a documented external checkout
-  requirement.
+- `hdf5/`: vendored HDF5 C source used for source-level comparison, patched-C
+  tracehash probe target selection, and fixture-generation parity checks. The
+  exact source revision is recorded in `hdf5-source.json`.
 
 ## Do Not Commit Without Review
 
 - `.codex`: local agent metadata.
 - `.README.md.swp`: editor swap file. This should be removed by the owner of
   the editing session or deliberately ignored.
+- Local tracehash outputs such as `rust.tsv`, `c.tsv`, and divergence reports
+  regenerated during development.
+- Temporary HDF5 files outside `tests/data/hdf5_ref/`.
 - `target/`: build output, already ignored.
 - `Cargo.lock`: ignored for the root crate in this repository.
 

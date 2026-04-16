@@ -24,7 +24,7 @@ impl AttributeMessage {
             1 => Self::decode_v1(raw),
             2 => Self::decode_v2(raw),
             3 => Self::decode_v3(raw),
-            _ => Err(Error::Unsupported(format!(
+            _ => Err(Error::InvalidFormat(format!(
                 "attribute message version {version}"
             ))),
         }
@@ -151,17 +151,24 @@ impl AttributeMessage {
     }
 
     /// Get total number of elements.
-    pub fn num_elements(&self) -> u64 {
+    pub fn num_elements(&self) -> Result<u64> {
         if self.dataspace.dims.is_empty() {
-            1 // scalar
+            Ok(1) // scalar
         } else {
-            self.dataspace.dims.iter().product()
+            self.dataspace.dims.iter().try_fold(1u64, |acc, &dim| {
+                acc.checked_mul(dim)
+                    .ok_or_else(|| Error::InvalidFormat("attribute element count overflow".into()))
+            })
         }
     }
 
     /// Get total data size in bytes.
-    pub fn data_size(&self) -> usize {
-        self.num_elements() as usize * self.datatype.size as usize
+    pub fn data_size(&self) -> Result<usize> {
+        let elements = usize::try_from(self.num_elements()?)
+            .map_err(|_| Error::InvalidFormat("attribute element count overflow".into()))?;
+        elements
+            .checked_mul(self.datatype.size as usize)
+            .ok_or_else(|| Error::InvalidFormat("attribute data size overflow".into()))
     }
 }
 

@@ -48,6 +48,14 @@ impl<R: Read + Seek> HdfReader<R> {
         Ok(self.inner.stream_position()?)
     }
 
+    /// Get the stream length while preserving the current position.
+    pub fn len(&mut self) -> Result<u64> {
+        let pos = self.inner.stream_position()?;
+        let len = self.inner.seek(SeekFrom::End(0))?;
+        self.inner.seek(SeekFrom::Start(pos))?;
+        Ok(len)
+    }
+
     /// Seek to an absolute position.
     pub fn seek(&mut self, pos: u64) -> Result<u64> {
         Ok(self.inner.seek(SeekFrom::Start(pos))?)

@@ -26,7 +26,7 @@ impl LinkInfoMessage {
 
         let version = read_u8(data, &mut pos, "link info message version")?;
         if version != 0 {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidFormat(format!(
                 "link info message version {version}"
             )));
         }

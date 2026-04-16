@@ -1,6 +1,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::format::messages::filter_pipeline::FilterPipelineMessage;
 use crate::io::reader::HdfReader;
 
@@ -12,10 +13,12 @@ const FRHP_MAGIC: [u8; 4] = [b'F', b'R', b'H', b'P'];
 const FHDB_MAGIC: [u8; 4] = [b'F', b'H', b'D', b'B'];
 /// Indirect block magic: "FHIB"
 const FHIB_MAGIC: [u8; 4] = [b'F', b'H', b'I', b'B'];
+const MAX_HEAP_OBJECT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// Fractal heap header.
 #[derive(Debug, Clone)]
 pub struct FractalHeapHeader {
+    pub heap_addr: u64,
     pub heap_id_len: u16,
     pub io_filter_len: u16,
     pub flags: u8,
@@ -113,6 +116,7 @@ impl FractalHeapHeader {
 
         Ok(Self {
             heap_id_len,
+            heap_addr: addr,
             io_filter_len,
             flags,
             max_managed_obj_size,
@@ -175,7 +179,9 @@ impl FractalHeapHeader {
                 ));
             }
             reader.seek(addr)?;
-            return reader.read_bytes(len as usize);
+            let data = reader.read_bytes(heap_object_len(len, "huge heap object length")?)?;
+            self.trace_huge_object(heap_id, addr, len, len, 0, false);
+            return Ok(data);
         }
 
         if self.io_filter_len > 0 && heap_id.len() >= 1 + addr_size + len_size + 4 + len_size {
@@ -184,7 +190,7 @@ impl FractalHeapHeader {
             p += addr_size;
             let len = read_le_uint(&heap_id[p..p + len_size]);
             p += len_size;
-            let _filter_mask =
+            let filter_mask =
                 u32::from_le_bytes([heap_id[p], heap_id[p + 1], heap_id[p + 2], heap_id[p + 3]]);
             p += 4;
             let obj_size = read_le_uint(&heap_id[p..p + len_size]);
@@ -197,9 +203,11 @@ impl FractalHeapHeader {
                 Error::InvalidFormat("filtered huge object missing filter pipeline".into())
             })?;
             reader.seek(addr)?;
-            let filtered = reader.read_bytes(len as usize)?;
+            let filtered =
+                reader.read_bytes(heap_object_len(len, "filtered huge heap object length")?)?;
             let mut data = crate::filters::apply_pipeline_reverse(&filtered, pipeline, 1)?;
-            data.truncate(obj_size as usize);
+            data.truncate(heap_object_len(obj_size, "filtered huge heap object size")?);
+            self.trace_huge_object(heap_id, addr, len, obj_size, filter_mask, true);
             return Ok(data);
         }
 
@@ -215,14 +223,26 @@ impl FractalHeapHeader {
             let huge = self.decode_huge_record(&record)?;
             if huge.id == Some(id) {
                 reader.seek(huge.addr)?;
-                let mut data = reader.read_bytes(huge.len as usize)?;
+                let mut data =
+                    reader.read_bytes(heap_object_len(huge.len, "huge heap object length")?)?;
                 if huge.filtered {
                     let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {
                         Error::InvalidFormat("filtered huge object missing filter pipeline".into())
                     })?;
                     data = crate::filters::apply_pipeline_reverse(&data, pipeline, 1)?;
-                    data.truncate(huge.obj_size.unwrap_or(data.len() as u64) as usize);
+                    data.truncate(heap_object_len(
+                        huge.obj_size.unwrap_or(data.len() as u64),
+                        "filtered huge heap object size",
+                    )?);
                 }
+                self.trace_huge_object(
+                    heap_id,
+                    huge.addr,
+                    huge.len,
+                    huge.obj_size.unwrap_or(huge.len),
+                    0,
+                    huge.filtered,
+                );
                 return Ok(data);
             }
         }
@@ -312,6 +332,7 @@ impl FractalHeapHeader {
             self.read_from_direct_block(
                 reader,
                 self.root_block_addr,
+                self.start_block_size,
                 self.root_direct_filtered_size,
                 self.root_direct_filter_mask,
                 offset,
@@ -327,32 +348,47 @@ impl FractalHeapHeader {
         &self,
         reader: &mut HdfReader<R>,
         block_addr: u64,
+        block_size: u64,
         filtered_size: Option<u64>,
-        _filter_mask: u32,
+        filter_mask: u32,
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>> {
         if let Some(filtered_size) = filtered_size {
             reader.seek(block_addr)?;
-            let filtered = reader.read_bytes(filtered_size as usize)?;
+            let filtered = reader.read_bytes(heap_object_len(
+                filtered_size,
+                "filtered fractal heap block size",
+            )?)?;
             let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {
                 Error::InvalidFormat("filtered fractal heap missing filter pipeline".into())
             })?;
             let data = crate::filters::apply_pipeline_reverse(&filtered, pipeline, 1)?;
-            let start = offset as usize;
+            let start = heap_object_len(offset, "fractal heap object offset")?;
             let end = start
-                .checked_add(length as usize)
+                .checked_add(heap_object_len(length, "fractal heap object length")?)
                 .ok_or_else(|| Error::InvalidFormat("fractal heap object range overflow".into()))?;
-            return data
+            let out = data
                 .get(start..end)
                 .map(|slice| slice.to_vec())
                 .ok_or_else(|| {
                     Error::InvalidFormat("fractal heap object exceeds filtered direct block".into())
-                });
+                })?;
+            self.trace_managed_object(block_addr, block_size, offset, length, filter_mask, true);
+            return Ok(out);
         }
 
-        reader.seek(block_addr + offset)?;
-        reader.read_bytes(length as usize)
+        if self.has_checksum && self.heap_addr == 0 {
+            verify_direct_block_checksum(reader, block_addr, self.max_heap_size, block_size)?;
+        }
+
+        let addr = block_addr
+            .checked_add(offset)
+            .ok_or_else(|| Error::InvalidFormat("fractal heap object address overflow".into()))?;
+        reader.seek(addr)?;
+        let data = reader.read_bytes(heap_object_len(length, "fractal heap object length")?)?;
+        self.trace_managed_object(block_addr, block_size, offset, length, 0, false);
+        Ok(data)
     }
 
     fn read_from_indirect_block<R: Read + Seek>(
@@ -399,6 +435,30 @@ impl FractalHeapHeader {
 
         let block_offset_bytes = ((self.max_heap_size as usize) + 7) / 8;
         let _block_offset = read_le_uint(&reader.read_bytes(block_offset_bytes)?);
+        if self.has_checksum {
+            let checksum_span = 4usize
+                .checked_add(1)
+                .and_then(|n| n.checked_add(self.sizeof_addr as usize))
+                .and_then(|n| n.checked_add(block_offset_bytes))
+                .and_then(|n| {
+                    n.checked_add(
+                        nrows
+                            .checked_mul(self.table_width as usize)?
+                            .checked_mul(self.sizeof_addr as usize)?,
+                    )
+                })
+                .ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "fractal heap indirect block checksum span overflow".into(),
+                    )
+                })?;
+            verify_metadata_checksum(
+                reader,
+                block_addr,
+                checksum_span as u64,
+                "fractal heap indirect block",
+            )?;
+        }
 
         let width = self.table_width as usize;
         let max_direct_rows = self.max_direct_rows();
@@ -420,6 +480,7 @@ impl FractalHeapHeader {
                         return self.read_from_direct_block(
                             reader,
                             child_addr,
+                            block_span,
                             None,
                             0,
                             local_offset,
@@ -556,6 +617,7 @@ impl FractalHeapHeader {
                     return self.read_from_direct_block(
                         reader,
                         child_addr,
+                        block_size,
                         Some(filtered_size),
                         filter_mask,
                         offset - current_heap_offset,
@@ -576,8 +638,94 @@ impl FractalHeapHeader {
         if heap_id.len() < 1 + length {
             return Err(Error::InvalidFormat("tiny heap ID too short".into()));
         }
-        Ok(heap_id[1..1 + length].to_vec())
+        let data = heap_id[1..1 + length].to_vec();
+        self.trace_tiny_object(heap_id, length as u64);
+        Ok(data)
     }
+
+    #[cfg(feature = "tracehash")]
+    fn trace_managed_object(
+        &self,
+        block_addr: u64,
+        block_size: u64,
+        block_offset: u64,
+        object_len: u64,
+        _filter_mask: u32,
+        filtered: bool,
+    ) {
+        let mut th = tracehash::th_call!("hdf5.fractal_heap.managed_object");
+        th.input_u64(self.heap_addr);
+        th.input_u64(block_addr);
+        th.input_u64(block_offset);
+        th.input_u64(object_len);
+        th.output_bool(true);
+        th.output_u64(block_addr);
+        th.output_u64(block_size);
+        th.output_u64(block_offset);
+        th.output_u64(object_len);
+        th.output_u64(0);
+        th.output_bool(filtered);
+        th.finish();
+    }
+
+    #[cfg(not(feature = "tracehash"))]
+    fn trace_managed_object(
+        &self,
+        _block_addr: u64,
+        _block_size: u64,
+        _block_offset: u64,
+        _object_len: u64,
+        _filter_mask: u32,
+        _filtered: bool,
+    ) {
+    }
+
+    #[cfg(feature = "tracehash")]
+    fn trace_huge_object(
+        &self,
+        heap_id: &[u8],
+        addr: u64,
+        stored_len: u64,
+        object_len: u64,
+        filter_mask: u32,
+        filtered: bool,
+    ) {
+        let mut th = tracehash::th_call!("hdf5.fractal_heap.huge_object");
+        th.input_u64(self.heap_addr);
+        th.input_bytes(heap_id);
+        th.output_bool(true);
+        th.output_u64(addr);
+        th.output_u64(stored_len);
+        th.output_u64(object_len);
+        th.output_u64(filter_mask as u64);
+        th.output_bool(filtered);
+        th.finish();
+    }
+
+    #[cfg(not(feature = "tracehash"))]
+    fn trace_huge_object(
+        &self,
+        _heap_id: &[u8],
+        _addr: u64,
+        _stored_len: u64,
+        _object_len: u64,
+        _filter_mask: u32,
+        _filtered: bool,
+    ) {
+    }
+
+    #[cfg(feature = "tracehash")]
+    fn trace_tiny_object(&self, heap_id: &[u8], object_len: u64) {
+        let mut th = tracehash::th_call!("hdf5.fractal_heap.tiny_object");
+        th.input_u64(self.heap_addr);
+        th.input_bytes(heap_id);
+        th.output_bool(true);
+        th.output_u64(object_len);
+        th.finish();
+    }
+
+    #[cfg(not(feature = "tracehash"))]
+    fn trace_tiny_object(&self, _heap_id: &[u8], _object_len: u64) {}
 }
 
 fn read_le_uint(bytes: &[u8]) -> u64 {
@@ -586,6 +734,76 @@ fn read_le_uint(bytes: &[u8]) -> u64 {
         value |= (*byte as u64) << (idx * 8);
     }
     value
+}
+
+fn verify_metadata_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    check_len: u64,
+    context: &str,
+) -> Result<()> {
+    let restore = reader.position()?;
+    let check_len_usize = heap_object_len(check_len, context)?;
+    reader.seek(start)?;
+    let bytes = reader.read_bytes(check_len_usize)?;
+    let stored = reader.read_u32()?;
+    let computed = checksum_metadata(&bytes);
+    reader.seek(restore)?;
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_direct_block_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    max_heap_size: u16,
+    block_size: u64,
+) -> Result<()> {
+    let restore = reader.position()?;
+    let block_offset_bytes = ((max_heap_size as usize) + 7) / 8;
+    let check_len = 4usize
+        .checked_add(1)
+        .and_then(|n| n.checked_add(reader.sizeof_addr() as usize))
+        .and_then(|n| n.checked_add(block_offset_bytes))
+        .ok_or_else(|| {
+            Error::InvalidFormat("fractal heap direct block checksum span overflow".into())
+        })?;
+    reader.seek(start)?;
+    let bytes = reader.read_bytes(check_len)?;
+    let stored = reader.read_u32()?;
+    let payload_len = heap_object_len(block_size, "fractal heap direct block size")?;
+    let payload = reader.read_bytes(payload_len)?;
+    reader.seek(restore)?;
+
+    let computed = checksum_metadata(&bytes);
+    let mut with_zero_checksum = bytes.clone();
+    with_zero_checksum.extend_from_slice(&0u32.to_le_bytes());
+    let computed_with_zero_checksum = checksum_metadata(&with_zero_checksum);
+    let mut whole_block = with_zero_checksum;
+    whole_block.extend_from_slice(&payload);
+    let computed_whole_block = checksum_metadata(&whole_block);
+    if stored != computed && stored != computed_with_zero_checksum && stored != computed_whole_block
+    {
+        return Err(Error::InvalidFormat(format!(
+            "fractal heap direct block checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    Ok(())
+}
+
+fn heap_object_len(value: u64, context: &str) -> Result<usize> {
+    let len = usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))?;
+    if len > MAX_HEAP_OBJECT_BYTES {
+        return Err(Error::InvalidFormat(format!(
+            "{context} {len} exceeds supported maximum {MAX_HEAP_OBJECT_BYTES}"
+        )));
+    }
+    Ok(len)
 }
 
 fn log2_power2(value: u64) -> u32 {

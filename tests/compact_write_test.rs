@@ -54,3 +54,37 @@ fn test_write_compact_dataset() {
         }
     }
 }
+
+#[test]
+fn test_compact_zero_sized_dataset_read() {
+    let f = File::open("tests/data/hdf5_ref/compact_read_cases.h5").unwrap();
+    let ds = f.dataset("compact_zero").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), vec![0]);
+    assert_eq!(ds.size().unwrap(), 0);
+    assert!(ds.read_raw().unwrap().is_empty());
+
+    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    assert!(vals.is_empty());
+}
+
+#[test]
+fn test_compact_scalar_compound_payload_read() {
+    let f = File::open("tests/data/hdf5_ref/compact_read_cases.h5").unwrap();
+    let ds = f.dataset("compact_compound_scalar").unwrap();
+
+    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    assert_eq!(ds.size().unwrap(), 1);
+    assert_eq!(ds.read_raw().unwrap().len(), 12);
+
+    let fields = ds.compound_fields().unwrap();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].name, "x");
+    assert_eq!(fields[1].name, "label");
+
+    let x_vals: Vec<f64> = ds.read_field("x").unwrap();
+    assert_eq!(x_vals, vec![1.5]);
+
+    let labels: Vec<i32> = ds.read_field("label").unwrap();
+    assert_eq!(labels, vec![7]);
+}

@@ -5,6 +5,7 @@ use crate::io::reader::HdfReader;
 
 /// Local heap magic: "HEAP"
 const HEAP_MAGIC: [u8; 4] = [b'H', b'E', b'A', b'P'];
+const MAX_LOCAL_HEAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// A local heap stores variable-length strings (link names) for v1 groups.
 #[derive(Debug, Clone)]
@@ -44,23 +45,38 @@ impl LocalHeap {
 
         // Read the data segment
         reader.seek(data_addr)?;
-        let data = reader.read_bytes(data_size as usize)?;
+        let data = reader.read_bytes(heap_len(data_size, "local heap data size")?)?;
 
         Ok(Self { data })
     }
 
     /// Get a null-terminated string at the given offset in the heap data.
-    pub fn get_string(&self, offset: usize) -> Option<String> {
+    pub fn get_string(&self, offset: usize) -> Result<String> {
         if offset >= self.data.len() {
-            return None;
+            return Err(Error::InvalidFormat(
+                "local heap string offset is out of bounds".into(),
+            ));
         }
 
         let end = self.data[offset..]
             .iter()
             .position(|&b| b == 0)
             .map(|p| offset + p)
-            .unwrap_or(self.data.len());
+            .ok_or_else(|| {
+                Error::InvalidFormat("local heap string is not null-terminated".into())
+            })?;
 
-        Some(String::from_utf8_lossy(&self.data[offset..end]).to_string())
+        Ok(String::from_utf8_lossy(&self.data[offset..end]).to_string())
     }
+}
+
+fn heap_len(value: u64, context: &str) -> Result<usize> {
+    let len = usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))?;
+    if len > MAX_LOCAL_HEAP_BYTES {
+        return Err(Error::InvalidFormat(format!(
+            "{context} {len} exceeds supported maximum {MAX_LOCAL_HEAP_BYTES}"
+        )));
+    }
+    Ok(len)
 }

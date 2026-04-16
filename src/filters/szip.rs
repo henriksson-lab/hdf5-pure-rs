@@ -15,3 +15,17 @@ pub fn decompress(_data: &[u8]) -> Result<Vec<u8>> {
             .into(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn szip_error_surface_is_stable() {
+        let err = decompress(b"not-szip").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unsupported: SZip decompression not available in pure-Rust mode. Re-save the dataset with deflate compression, or use the C HDF5 library."
+        );
+    }
+}

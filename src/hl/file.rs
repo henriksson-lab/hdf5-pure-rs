@@ -8,10 +8,11 @@ use parking_lot::Mutex;
 use crate::error::{Error, Result};
 use crate::format::btree_v1::BTreeV1Node;
 use crate::format::local_heap::LocalHeap;
-use crate::format::messages::link::LinkMessage;
+use crate::format::messages::link::{LinkMessage, LinkType};
 use crate::format::object_header::{self, RawMessage};
 use crate::format::superblock::Superblock;
 use crate::format::symbol_table::SymbolTableNode;
+use crate::hl::dataset::Dataset;
 use crate::hl::group::Group;
 use crate::io::reader::HdfReader;
 
@@ -38,6 +39,8 @@ pub struct File {
 }
 
 impl File {
+    const MAX_SOFT_LINK_TRAVERSALS: usize = 40;
+
     /// Open an HDF5 file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let f = fs::File::open(path.as_ref()).map_err(|e| {
@@ -83,20 +86,14 @@ impl File {
 
     /// Open a group by path (starting from root).
     pub fn group(&self, path: &str) -> Result<Group> {
-        let root = self.root_group()?;
-        if path == "/" || path.is_empty() {
-            return Ok(root);
+        let resolved = self.resolve_path(path)?;
+        if resolved.object_type != ObjectType::Group {
+            return Err(Error::InvalidFormat(format!(
+                "'{path}' is not a group (type: {:?})",
+                resolved.object_type
+            )));
         }
-
-        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        let mut current = root;
-        for part in parts {
-            if part.is_empty() {
-                continue;
-            }
-            current = current.open_group(part)?;
-        }
-        Ok(current)
+        Group::open(resolved.inner, &resolved.path, resolved.addr)
     }
 
     /// List attribute names on the root group.
@@ -110,16 +107,213 @@ impl File {
     }
 
     /// Open a dataset by path from the root group.
-    pub fn dataset(&self, path: &str) -> Result<crate::hl::dataset::Dataset> {
-        let path = path.trim_start_matches('/');
-        if let Some(last_slash) = path.rfind('/') {
-            let group_path = &path[..last_slash];
-            let ds_name = &path[last_slash + 1..];
-            let group = self.group(group_path)?;
-            group.open_dataset(ds_name)
-        } else {
-            self.root_group()?.open_dataset(path)
+    pub fn dataset(&self, path: &str) -> Result<Dataset> {
+        let resolved = self.resolve_path(path)?;
+        if resolved.object_type != ObjectType::Dataset {
+            return Err(Error::InvalidFormat(format!(
+                "'{path}' is not a dataset (type: {:?})",
+                resolved.object_type
+            )));
         }
+        Ok(Dataset::new(resolved.inner, &resolved.path, resolved.addr))
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<ResolvedObject> {
+        let mut path = canonical_path(path);
+        let mut traversals = 0usize;
+
+        'resolve: loop {
+            if path == "/" {
+                return Ok(ResolvedObject {
+                    inner: self.inner.clone(),
+                    path,
+                    addr: self.superblock.root_addr,
+                    object_type: ObjectType::Group,
+                });
+            }
+
+            let parts: Vec<String> = path
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            let mut current = self.root_group()?;
+            let mut current_path = String::from("/");
+
+            for (idx, part) in parts.iter().enumerate() {
+                let is_last = idx + 1 == parts.len();
+                let link = match current.find_link_by_name(part) {
+                    Ok(link) => link,
+                    Err(link_err) => {
+                        if let Some((_, addr)) = current
+                            .members()?
+                            .into_iter()
+                            .find(|(member_name, _)| member_name == part)
+                        {
+                            let object_type = self.object_type_at(addr)?;
+                            let next_path = join_absolute_path(&current_path, part);
+
+                            if is_last {
+                                return Ok(ResolvedObject {
+                                    inner: self.inner.clone(),
+                                    path: next_path,
+                                    addr,
+                                    object_type,
+                                });
+                            }
+
+                            if object_type != ObjectType::Group {
+                                return Err(Error::InvalidFormat(format!(
+                                    "'{next_path}' is not a group (type: {object_type:?})"
+                                )));
+                            }
+                            current = Group::open(self.inner.clone(), &next_path, addr)?;
+                            current_path = next_path;
+                            continue;
+                        }
+                        return Err(link_err);
+                    }
+                };
+                match link.link_type {
+                    LinkType::Hard => {
+                        let addr = link.hard_link_addr.ok_or_else(|| {
+                            Error::InvalidFormat(format!(
+                                "hard link '{}' is missing object address",
+                                link.name
+                            ))
+                        })?;
+                        let object_type = self.object_type_at(addr)?;
+                        let next_path = join_absolute_path(&current_path, part);
+
+                        if is_last {
+                            return Ok(ResolvedObject {
+                                inner: self.inner.clone(),
+                                path: next_path,
+                                addr,
+                                object_type,
+                            });
+                        }
+
+                        if object_type != ObjectType::Group {
+                            return Err(Error::InvalidFormat(format!(
+                                "'{next_path}' is not a group (type: {object_type:?})"
+                            )));
+                        }
+                        current = Group::open(self.inner.clone(), &next_path, addr)?;
+                        current_path = next_path;
+                    }
+                    LinkType::Soft => {
+                        traversals += 1;
+                        if traversals > Self::MAX_SOFT_LINK_TRAVERSALS {
+                            return Err(Error::InvalidFormat(
+                                "soft link traversal limit exceeded".into(),
+                            ));
+                        }
+                        let target = link.soft_link_target.ok_or_else(|| {
+                            Error::InvalidFormat(format!(
+                                "soft link '{}' is missing target path",
+                                link.name
+                            ))
+                        })?;
+                        let remaining = parts[idx + 1..].join("/");
+                        path = resolve_soft_target(&current_path, &target, &remaining);
+                        continue 'resolve;
+                    }
+                    LinkType::External => {
+                        let (filename, object_path) = link.external_link.ok_or_else(|| {
+                            Error::InvalidFormat(format!(
+                                "external link '{}' is missing target path",
+                                link.name
+                            ))
+                        })?;
+                        let remaining = parts[idx + 1..].join("/");
+                        let target_path = if remaining.is_empty() {
+                            canonical_path(&object_path)
+                        } else {
+                            canonical_path(&join_absolute_path(&object_path, &remaining))
+                        };
+                        let file_path = self.resolve_external_file_path(&filename)?;
+                        let external_file = File::open(file_path)?;
+                        return external_file.resolve_path(&target_path);
+                    }
+                    LinkType::UserDefined(kind) => {
+                        return Err(Error::Unsupported(format!(
+                            "user-defined link traversal is not supported for link type {kind}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    fn object_type_at(&self, addr: u64) -> Result<ObjectType> {
+        let mut guard = self.inner.lock();
+        let oh = object_header::ObjectHeader::read_at(&mut guard.reader, addr)?;
+        Ok(object_type_from_messages(&oh.messages))
+    }
+
+    fn resolve_external_file_path(&self, filename: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(filename);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        let base = self
+            .inner
+            .lock()
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .ok_or_else(|| {
+                Error::InvalidFormat("relative external link has no base file path".into())
+            })?;
+        Ok(base.join(path))
+    }
+}
+
+struct ResolvedObject {
+    inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    path: String,
+    addr: u64,
+    object_type: ObjectType,
+}
+
+fn canonical_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}
+
+fn join_absolute_path(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn resolve_soft_target(parent: &str, target: &str, remaining: &str) -> String {
+    let base = if target.starts_with('/') {
+        canonical_path(target)
+    } else {
+        canonical_path(&join_absolute_path(parent, target))
+    };
+    if remaining.is_empty() {
+        base
+    } else {
+        canonical_path(&join_absolute_path(&base, remaining))
     }
 }
 
@@ -172,10 +366,9 @@ pub(crate) fn collect_v1_group_members<R: Read + Seek>(
     for snod_addr in snod_addrs {
         let snod = SymbolTableNode::read_at(reader, snod_addr)?;
         for entry in &snod.entries {
-            if let Some(name) = heap.get_string(entry.name_offset as usize) {
-                if !name.is_empty() {
-                    members.push((name, entry.obj_header_addr));
-                }
+            let name = heap.get_string(entry.name_offset as usize)?;
+            if !name.is_empty() {
+                members.push((name, entry.obj_header_addr));
             }
         }
     }

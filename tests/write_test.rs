@@ -1,6 +1,7 @@
 use std::fs;
 
-use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, HdfFileWriter};
+use hdf5_pure_rust::engine::writer::{CompoundFieldSpec, DatasetSpec, DtypeSpec, HdfFileWriter};
+use hdf5_pure_rust::hl::value::H5Value;
 use hdf5_pure_rust::File;
 
 #[test]
@@ -163,6 +164,183 @@ fn test_write_with_group() {
         let ds = f.dataset("subgroup/tiny").unwrap();
         let raw = ds.read_raw().unwrap();
         assert_eq!(raw, vec![42]);
+    }
+}
+
+#[test]
+fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_complex_dtypes.h5");
+    let array_data: Vec<u8> = (0i16..12).flat_map(|v| v.to_le_bytes()).collect();
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let enum_data: Vec<u8> = [0u16, 1, 2]
+            .into_iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        w.create_dataset(
+            "/",
+            &DatasetSpec {
+                name: "status",
+                shape: &[3],
+                dtype: DtypeSpec::Enum {
+                    base: Box::new(DtypeSpec::U16),
+                    members: vec![
+                        ("zero".to_string(), 0),
+                        ("one".to_string(), 1),
+                        ("two".to_string(), 2),
+                    ],
+                },
+                data: &enum_data,
+            },
+        )
+        .unwrap();
+
+        let opaque_data = b"abcdwxyz".to_vec();
+        w.create_dataset(
+            "/",
+            &DatasetSpec {
+                name: "opaque",
+                shape: &[2],
+                dtype: DtypeSpec::Opaque {
+                    size: 4,
+                    tag: "hdf5-pure-rust blob".to_string(),
+                },
+                data: &opaque_data,
+            },
+        )
+        .unwrap();
+
+        w.create_dataset(
+            "/",
+            &DatasetSpec {
+                name: "matrix_cells",
+                shape: &[2],
+                dtype: DtypeSpec::Array {
+                    dims: vec![2, 3],
+                    base: Box::new(DtypeSpec::I16),
+                },
+                data: &array_data,
+            },
+        )
+        .unwrap();
+
+        let nested_dtype = DtypeSpec::Compound {
+            size: 8,
+            fields: vec![
+                CompoundFieldSpec {
+                    name: "a".to_string(),
+                    offset: 0,
+                    dtype: DtypeSpec::I32,
+                },
+                CompoundFieldSpec {
+                    name: "b".to_string(),
+                    offset: 4,
+                    dtype: DtypeSpec::F32,
+                },
+            ],
+        };
+        let nested_compound_dtype = DtypeSpec::Compound {
+            size: 16,
+            fields: vec![
+                CompoundFieldSpec {
+                    name: "id".to_string(),
+                    offset: 0,
+                    dtype: DtypeSpec::I32,
+                },
+                CompoundFieldSpec {
+                    name: "nested".to_string(),
+                    offset: 8,
+                    dtype: nested_dtype,
+                },
+            ],
+        };
+        let mut compound_data = Vec::new();
+        for (id, a, b) in [(7i32, 10i32, 1.25f32), (8, 20, 2.5)] {
+            compound_data.extend_from_slice(&id.to_le_bytes());
+            compound_data.extend_from_slice(&[0; 4]);
+            compound_data.extend_from_slice(&a.to_le_bytes());
+            compound_data.extend_from_slice(&b.to_le_bytes());
+        }
+        w.create_dataset(
+            "/",
+            &DatasetSpec {
+                name: "nested_compound",
+                shape: &[2],
+                dtype: nested_compound_dtype,
+                data: &compound_data,
+            },
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+
+    let enum_ds = f.dataset("status").unwrap();
+    let enum_dtype = enum_ds.dtype().unwrap();
+    assert!(enum_dtype.is_enum());
+    assert_eq!(
+        enum_dtype.enum_members().unwrap(),
+        vec![
+            ("zero".to_string(), 0),
+            ("one".to_string(), 1),
+            ("two".to_string(), 2)
+        ]
+    );
+    assert_eq!(enum_ds.read::<u16>().unwrap(), vec![0, 1, 2]);
+
+    let opaque_ds = f.dataset("opaque").unwrap();
+    let opaque_dtype = opaque_ds.dtype().unwrap();
+    assert_eq!(
+        opaque_dtype.opaque_tag().as_deref(),
+        Some("hdf5-pure-rust blob")
+    );
+    assert_eq!(opaque_ds.read_raw().unwrap(), b"abcdwxyz");
+
+    let array_ds = f.dataset("matrix_cells").unwrap();
+    let array_dtype = array_ds.dtype().unwrap();
+    let (dims, base) = array_dtype.array_dims_base().unwrap();
+    assert_eq!(dims, vec![2, 3]);
+    assert_eq!(base.size(), 2);
+    assert_eq!(array_ds.read_raw().unwrap(), array_data);
+
+    let compound_ds = f.dataset("nested_compound").unwrap();
+    let nested_values = compound_ds.read_field_values("nested").unwrap();
+    assert_eq!(
+        nested_values,
+        vec![
+            H5Value::Compound(vec![
+                ("a".to_string(), H5Value::Int(10)),
+                ("b".to_string(), H5Value::Float(1.25)),
+            ]),
+            H5Value::Compound(vec![
+                ("a".to_string(), H5Value::Int(20)),
+                ("b".to_string(), H5Value::Float(2.5)),
+            ]),
+        ]
+    );
+
+    for dataset in ["/status", "/opaque", "/matrix_cells", "/nested_compound"] {
+        let output = std::process::Command::new("h5dump")
+            .arg("-H")
+            .arg("-d")
+            .arg(dataset)
+            .arg(&path)
+            .output();
+        if let Ok(out) = output {
+            assert!(
+                out.status.success(),
+                "h5dump -H failed on dataset {dataset}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
 

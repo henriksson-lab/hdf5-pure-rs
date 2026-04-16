@@ -45,6 +45,45 @@ fn test_read_2d_ndarray() {
 }
 
 #[test]
+fn test_read_dyn_ndarray_3d() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("read_dyn_3d.h5");
+
+    {
+        let mut wf = hdf5_pure_rust::WritableFile::create(&path).unwrap();
+        let data: Vec<i32> = (0..24).collect();
+        wf.new_dataset_builder("cube")
+            .shape(&[2, 3, 4])
+            .write::<i32>(&data)
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let arr = f.dataset("cube").unwrap().read_dyn::<i32>().unwrap();
+    assert_eq!(arr.shape(), &[2, 3, 4]);
+    assert_eq!(arr[[0, 0, 0]], 0);
+    assert_eq!(arr[[1, 2, 3]], 23);
+}
+
+#[test]
+fn test_raw_message_inspection_apis() {
+    let f = File::open("tests/data/datasets_v0.h5").unwrap();
+    let ds = f.dataset("float64_1d").unwrap();
+
+    let dtype = ds.raw_datatype_message().unwrap();
+    assert_eq!(dtype.size, 8);
+    assert_eq!(ds.dtype().unwrap().raw_message().size, 8);
+
+    let space = ds.raw_dataspace_message().unwrap();
+    assert_eq!(space.dims, vec![5]);
+    assert_eq!(ds.space().unwrap().raw_message().dims, vec![5]);
+
+    let plist = ds.create_plist().unwrap();
+    assert!(plist.filters.is_empty());
+}
+
+#[test]
 fn test_read_chunked_typed() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("chunked").unwrap();
@@ -73,9 +112,9 @@ fn test_attr_read_array_typed() {
 
 #[test]
 fn test_read_wrong_type_size() {
-    let f = File::open("tests/data/datasets_v0.h5").unwrap();
-    let ds = f.dataset("int32_1d").unwrap();
-    // 12 bytes (3 * i32) is not a multiple of 8 (f64), should error
-    let result = ds.read::<f64>();
+    let f = File::open("tests/data/strings.h5").unwrap();
+    let ds = f.dataset("fixed_str").unwrap();
+    // Fixed strings are not part of the numeric conversion table.
+    let result = ds.read::<u64>();
     assert!(result.is_err());
 }

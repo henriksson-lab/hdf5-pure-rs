@@ -17,6 +17,16 @@ pub const HDR_ATTR_CRT_ORDER_INDEXED: u8 = 0x08;
 pub const HDR_ATTR_STORE_PHASE_CHANGE: u8 = 0x10;
 pub const HDR_STORE_TIMES: u8 = 0x20;
 
+const MSG_FLAG_SHARED: u8 = 0x02;
+const SHARED_MESSAGE_TABLE_VERSION: u8 = 0;
+const SHARED_MESSAGE_MAX_INDEXES: u8 = 8;
+const SHARED_REFERENCE_VERSION_1: u8 = 1;
+const SHARED_REFERENCE_VERSION_2: u8 = 2;
+const SHARED_REFERENCE_VERSION_3: u8 = 3;
+const SHARED_TYPE_SOHM: u8 = 1;
+const SHARED_TYPE_COMMITTED: u8 = 2;
+const SHARED_HEAP_ID_LEN: usize = 8;
+
 // Message type IDs
 pub const MSG_NIL: u16 = 0x0000;
 pub const MSG_DATASPACE: u16 = 0x0001;
@@ -125,6 +135,7 @@ impl ObjectHeader {
 
     /// Read a v1 object header.
     fn read_v1<R: Read + Seek>(reader: &mut HdfReader<R>) -> Result<Self> {
+        let header_start = reader.position()?;
         let version = reader.read_u8()?;
         if version != 1 {
             return Err(Error::InvalidFormat(format!(
@@ -146,10 +157,13 @@ impl ObjectHeader {
 
         // Now read messages from chunk data
         let chunk_start = reader.position()?;
-        let chunk_end = chunk_start + chunk_data_size;
+        let chunk_end = chunk_start
+            .checked_add(chunk_data_size)
+            .ok_or_else(|| Error::InvalidFormat("object header v1 chunk size overflow".into()))?;
 
         let mut messages = Vec::new();
         let mut continuations = Vec::new();
+        let mut chunk_ranges = vec![(header_start, chunk_end)];
 
         Self::read_v1_messages(
             reader,
@@ -157,12 +171,20 @@ impl ObjectHeader {
             num_messages,
             &mut messages,
             &mut continuations,
+            &mut chunk_ranges,
             0,
         )?;
 
         // Process continuation chunks
         for (cont_addr, cont_len) in continuations {
-            Self::read_v1_continuation(reader, cont_addr, cont_len, &mut messages, 1)?;
+            Self::read_v1_continuation(
+                reader,
+                cont_addr,
+                cont_len,
+                &mut messages,
+                &mut chunk_ranges,
+                1,
+            )?;
         }
 
         Ok(ObjectHeader {
@@ -185,12 +207,20 @@ impl ObjectHeader {
         _num_messages: u16,
         messages: &mut Vec<RawMessage>,
         continuations: &mut Vec<(u64, u64)>,
+        chunk_ranges: &mut Vec<(u64, u64)>,
         chunk_index: u16,
     ) -> Result<()> {
         while reader.position()? < chunk_end {
             let pos = reader.position()?;
             if pos + 8 > chunk_end {
-                break;
+                let remaining = (chunk_end - pos) as usize;
+                let padding = reader.read_bytes(remaining)?;
+                if padding.iter().all(|&b| b == 0) {
+                    break;
+                }
+                return Err(Error::InvalidFormat(
+                    "object header v1 message header is truncated".into(),
+                ));
             }
 
             let msg_type = reader.read_u16()?;
@@ -200,7 +230,18 @@ impl ObjectHeader {
             reader.skip(3)?;
 
             // Aligned message size (v1 messages are 8-byte aligned)
-            let aligned_size = (msg_size + 7) & !7;
+            let aligned_size = msg_size.checked_add(7).map(|n| n & !7).ok_or_else(|| {
+                Error::InvalidFormat("object header message size overflow".into())
+            })?;
+            let data_start = pos + 8;
+            let data_end = data_start.checked_add(aligned_size).ok_or_else(|| {
+                Error::InvalidFormat("object header message range overflow".into())
+            })?;
+            if data_end > chunk_end {
+                return Err(Error::InvalidFormat(
+                    "object header v1 message payload exceeds chunk".into(),
+                ));
+            }
 
             if msg_type == MSG_NIL {
                 reader.skip(aligned_size)?;
@@ -209,10 +250,22 @@ impl ObjectHeader {
 
             if msg_type == MSG_HEADER_CONTINUATION {
                 // Continuation message: contains offset + length
+                let used = reader.sizeof_addr() as u64 + reader.sizeof_size() as u64;
+                if msg_size < used {
+                    return Err(Error::InvalidFormat(
+                        "object header continuation message is truncated".into(),
+                    ));
+                }
                 let cont_offset = reader.read_addr()?;
                 let cont_length = reader.read_length()?;
-                let remaining =
-                    aligned_size - reader.sizeof_addr() as u64 - reader.sizeof_size() as u64;
+                Self::reserve_continuation_range(
+                    reader,
+                    cont_offset,
+                    cont_length,
+                    8,
+                    chunk_ranges,
+                )?;
+                let remaining = aligned_size - used;
                 if remaining > 0 {
                     reader.skip(remaining)?;
                 }
@@ -226,6 +279,13 @@ impl ObjectHeader {
             if padding > 0 {
                 reader.skip(padding)?;
             }
+            Self::validate_message_payload(
+                msg_type,
+                msg_flags,
+                &data,
+                reader.sizeof_addr(),
+                reader.sizeof_size(),
+            )?;
 
             messages.push(RawMessage {
                 msg_type,
@@ -244,12 +304,15 @@ impl ObjectHeader {
         addr: u64,
         length: u64,
         messages: &mut Vec<RawMessage>,
+        chunk_ranges: &mut Vec<(u64, u64)>,
         chunk_index: u16,
     ) -> Result<()> {
         reader.seek(addr)?;
 
         // V1 continuation chunks are just raw messages, no header.
-        let chunk_end = addr + length;
+        let chunk_end = addr.checked_add(length).ok_or_else(|| {
+            Error::InvalidFormat("object header continuation range overflow".into())
+        })?;
         let mut continuations = Vec::new();
         Self::read_v1_messages(
             reader,
@@ -257,11 +320,19 @@ impl ObjectHeader {
             0,
             messages,
             &mut continuations,
+            chunk_ranges,
             chunk_index,
         )?;
 
         for (cont_addr, cont_len) in continuations {
-            Self::read_v1_continuation(reader, cont_addr, cont_len, messages, chunk_index + 1)?;
+            Self::read_v1_continuation(
+                reader,
+                cont_addr,
+                cont_len,
+                messages,
+                chunk_ranges,
+                chunk_index + 1,
+            )?;
         }
 
         Ok(())
@@ -303,7 +374,9 @@ impl ObjectHeader {
 
         // Now we know where chunk 0 data starts and where its checksum is
         let chunk0_data_start = reader.position()?;
-        let chunk0_data_end = chunk0_data_start + chunk0_data_size;
+        let chunk0_data_end = chunk0_data_start
+            .checked_add(chunk0_data_size)
+            .ok_or_else(|| Error::InvalidFormat("object header v2 chunk size overflow".into()))?;
 
         // Verify checksum: it covers from "OHDR" magic to just before the checksum
         let checksum_pos = chunk0_data_end;
@@ -329,6 +402,10 @@ impl ObjectHeader {
         let has_crt_order = flags & HDR_ATTR_CRT_ORDER_TRACKED != 0;
         let mut messages = Vec::new();
         let mut continuations = Vec::new();
+        let chunk0_range_end = chunk0_data_end
+            .checked_add(4)
+            .ok_or_else(|| Error::InvalidFormat("object header v2 chunk range overflow".into()))?;
+        let mut chunk_ranges = vec![(header_addr, chunk0_range_end)];
 
         Self::read_v2_messages(
             reader,
@@ -336,6 +413,7 @@ impl ObjectHeader {
             has_crt_order,
             &mut messages,
             &mut continuations,
+            &mut chunk_ranges,
             0,
         )?;
 
@@ -347,6 +425,7 @@ impl ObjectHeader {
                 cont_len,
                 has_crt_order,
                 &mut messages,
+                &mut chunk_ranges,
                 1,
             )?;
         }
@@ -371,13 +450,21 @@ impl ObjectHeader {
         has_crt_order: bool,
         messages: &mut Vec<RawMessage>,
         continuations: &mut Vec<(u64, u64)>,
+        chunk_ranges: &mut Vec<(u64, u64)>,
         chunk_index: u16,
     ) -> Result<()> {
         while reader.position()? < chunk_data_end {
             let pos = reader.position()?;
             // Minimum message header size: 4 bytes (type:1, size:2, flags:1)
             if pos + 4 > chunk_data_end {
-                break;
+                let remaining = (chunk_data_end - pos) as usize;
+                let padding = reader.read_bytes(remaining)?;
+                if padding.iter().all(|&b| b == 0) {
+                    break;
+                }
+                return Err(Error::InvalidFormat(
+                    "object header v2 message header is truncated".into(),
+                ));
             }
 
             let msg_type = reader.read_u8()? as u16;
@@ -385,10 +472,24 @@ impl ObjectHeader {
             let msg_flags = reader.read_u8()?;
 
             let creation_index = if has_crt_order {
+                if reader.position()? + 2 > chunk_data_end {
+                    return Err(Error::InvalidFormat(
+                        "object header v2 message creation order is truncated".into(),
+                    ));
+                }
                 Some(reader.read_u16()?)
             } else {
                 None
             };
+            let data_start = reader.position()?;
+            let data_end = data_start.checked_add(msg_size).ok_or_else(|| {
+                Error::InvalidFormat("object header v2 message range overflow".into())
+            })?;
+            if data_end > chunk_data_end {
+                return Err(Error::InvalidFormat(
+                    "object header v2 message payload exceeds chunk".into(),
+                ));
+            }
 
             if msg_type == MSG_NIL as u16 {
                 reader.skip(msg_size)?;
@@ -396,9 +497,21 @@ impl ObjectHeader {
             }
 
             if msg_type == MSG_HEADER_CONTINUATION as u16 {
+                let used = reader.sizeof_addr() as u64 + reader.sizeof_size() as u64;
+                if msg_size < used {
+                    return Err(Error::InvalidFormat(
+                        "object header continuation message is truncated".into(),
+                    ));
+                }
                 let cont_offset = reader.read_addr()?;
                 let cont_length = reader.read_length()?;
-                let used = reader.sizeof_addr() as u64 + reader.sizeof_size() as u64;
+                Self::reserve_continuation_range(
+                    reader,
+                    cont_offset,
+                    cont_length,
+                    8,
+                    chunk_ranges,
+                )?;
                 if msg_size > used {
                     reader.skip(msg_size - used)?;
                 }
@@ -407,6 +520,13 @@ impl ObjectHeader {
             }
 
             let data = reader.read_bytes(msg_size as usize)?;
+            Self::validate_message_payload(
+                msg_type,
+                msg_flags,
+                &data,
+                reader.sizeof_addr(),
+                reader.sizeof_size(),
+            )?;
 
             messages.push(RawMessage {
                 msg_type,
@@ -426,6 +546,7 @@ impl ObjectHeader {
         length: u64,
         has_crt_order: bool,
         messages: &mut Vec<RawMessage>,
+        chunk_ranges: &mut Vec<(u64, u64)>,
         chunk_index: u16,
     ) -> Result<()> {
         reader.seek(addr)?;
@@ -440,7 +561,12 @@ impl ObjectHeader {
 
         // Data runs from after magic to before checksum
         let _data_start = reader.position()?;
-        let data_end = addr + length - 4; // minus checksum
+        let data_end = addr
+            .checked_add(length)
+            .and_then(|end| end.checked_sub(4))
+            .ok_or_else(|| {
+                Error::InvalidFormat("object header continuation range overflow".into())
+            })?; // minus checksum
 
         let mut continuations = Vec::new();
         Self::read_v2_messages(
@@ -449,6 +575,7 @@ impl ObjectHeader {
             has_crt_order,
             messages,
             &mut continuations,
+            chunk_ranges,
             chunk_index,
         )?;
 
@@ -474,12 +601,213 @@ impl ObjectHeader {
                 cont_len,
                 has_crt_order,
                 messages,
+                chunk_ranges,
                 chunk_index + 1,
             )?;
         }
 
         Ok(())
     }
+
+    fn reserve_continuation_range<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        length: u64,
+        min_length: u64,
+        chunk_ranges: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        if length < min_length {
+            return Err(Error::InvalidFormat(
+                "object header continuation chunk is too small".into(),
+            ));
+        }
+        let end = addr.checked_add(length).ok_or_else(|| {
+            Error::InvalidFormat("object header continuation range overflow".into())
+        })?;
+        let file_len = reader.len()?;
+        if end > file_len {
+            return Err(Error::InvalidFormat(
+                "object header continuation range exceeds file size".into(),
+            ));
+        }
+        if chunk_ranges
+            .iter()
+            .any(|&(range_start, range_end)| addr < range_end && range_start < end)
+        {
+            return Err(Error::InvalidFormat(
+                "object header continuation range overlaps another metadata chunk".into(),
+            ));
+        }
+        chunk_ranges.push((addr, end));
+        Ok(())
+    }
+
+    fn validate_message_payload(
+        msg_type: u16,
+        msg_flags: u8,
+        data: &[u8],
+        sizeof_addr: u8,
+        sizeof_size: u8,
+    ) -> Result<()> {
+        if msg_type == MSG_SHARED_MSG_TABLE {
+            Self::validate_shared_message_table(data, sizeof_addr)?;
+        }
+        if msg_flags & MSG_FLAG_SHARED != 0 {
+            Self::validate_shared_message_reference(data, sizeof_addr, sizeof_size)?;
+        }
+        Ok(())
+    }
+
+    fn validate_shared_message_table(data: &[u8], sizeof_addr: u8) -> Result<()> {
+        let expected_len = 1usize
+            .checked_add(sizeof_addr as usize)
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(|| Error::InvalidFormat("shared message table size overflow".into()))?;
+        if data.len() != expected_len {
+            return Err(Error::InvalidFormat(
+                "shared message table payload has invalid length".into(),
+            ));
+        }
+        let version = data[0];
+        if version != SHARED_MESSAGE_TABLE_VERSION {
+            return Err(Error::InvalidFormat(format!(
+                "unsupported shared message table version: {version}"
+            )));
+        }
+        let addr_end = 1 + sizeof_addr as usize;
+        let table_addr = read_le_uint(&data[1..addr_end])?;
+        if is_undefined_addr(table_addr, sizeof_addr)? {
+            return Err(Error::InvalidFormat(
+                "shared message table address is undefined".into(),
+            ));
+        }
+        let nindexes = data[addr_end];
+        if nindexes == 0 || nindexes > SHARED_MESSAGE_MAX_INDEXES {
+            return Err(Error::InvalidFormat(
+                "shared message table index count is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_shared_message_reference(
+        data: &[u8],
+        sizeof_addr: u8,
+        sizeof_size: u8,
+    ) -> Result<()> {
+        if data.len() < 2 {
+            return Err(Error::InvalidFormat(
+                "shared object-header message reference is truncated".into(),
+            ));
+        }
+
+        let version = data[0];
+        match version {
+            SHARED_REFERENCE_VERSION_1 => {
+                let expected_len = 2usize
+                    .checked_add(6)
+                    .and_then(|len| len.checked_add(sizeof_size as usize))
+                    .and_then(|len| len.checked_add(sizeof_addr as usize))
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("shared message reference size overflow".into())
+                    })?;
+                if data.len() != expected_len {
+                    return Err(Error::InvalidFormat(
+                        "shared object-header message v1 reference has invalid length".into(),
+                    ));
+                }
+                let addr_start = 2 + 6 + sizeof_size as usize;
+                let addr = read_le_uint(&data[addr_start..])?;
+                if is_undefined_addr(addr, sizeof_addr)? {
+                    return Err(Error::InvalidFormat(
+                        "shared object-header message address is undefined".into(),
+                    ));
+                }
+            }
+            SHARED_REFERENCE_VERSION_2 => {
+                let expected_len = 2usize.checked_add(sizeof_addr as usize).ok_or_else(|| {
+                    Error::InvalidFormat("shared message reference size overflow".into())
+                })?;
+                if data.len() != expected_len {
+                    return Err(Error::InvalidFormat(
+                        "shared object-header message v2 reference has invalid length".into(),
+                    ));
+                }
+                let addr = read_le_uint(&data[2..])?;
+                if is_undefined_addr(addr, sizeof_addr)? {
+                    return Err(Error::InvalidFormat(
+                        "shared object-header message address is undefined".into(),
+                    ));
+                }
+            }
+            SHARED_REFERENCE_VERSION_3 => match data[1] {
+                SHARED_TYPE_SOHM => {
+                    if data.len() != 2 + SHARED_HEAP_ID_LEN {
+                        return Err(Error::InvalidFormat(
+                            "shared object-header message SOHM reference has invalid length".into(),
+                        ));
+                    }
+                }
+                SHARED_TYPE_COMMITTED => {
+                    let expected_len =
+                        2usize.checked_add(sizeof_addr as usize).ok_or_else(|| {
+                            Error::InvalidFormat("shared message reference size overflow".into())
+                        })?;
+                    if data.len() != expected_len {
+                        return Err(Error::InvalidFormat(
+                            "shared object-header message committed reference has invalid length"
+                                .into(),
+                        ));
+                    }
+                    let addr = read_le_uint(&data[2..])?;
+                    if is_undefined_addr(addr, sizeof_addr)? {
+                        return Err(Error::InvalidFormat(
+                            "shared object-header message address is undefined".into(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(Error::InvalidFormat(
+                        "shared object-header message type is invalid".into(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(Error::InvalidFormat(
+                    "shared object-header message version is invalid".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn read_le_uint(data: &[u8]) -> Result<u64> {
+    if data.len() > 8 {
+        return Err(Error::InvalidFormat(
+            "integer payload is wider than u64".into(),
+        ));
+    }
+    Ok(data.iter().enumerate().fold(0u64, |value, (idx, byte)| {
+        value | ((*byte as u64) << (idx * 8))
+    }))
+}
+
+fn is_undefined_addr(addr: u64, sizeof_addr: u8) -> Result<bool> {
+    let bits = u32::from(sizeof_addr)
+        .checked_mul(8)
+        .ok_or_else(|| Error::InvalidFormat("address size overflow".into()))?;
+    let undef = if bits == 64 {
+        u64::MAX
+    } else if bits < 64 {
+        (1u64 << bits) - 1
+    } else {
+        return Err(Error::InvalidFormat(
+            "address payload is wider than u64".into(),
+        ));
+    };
+    Ok(addr == undef)
 }
 
 #[cfg(test)]

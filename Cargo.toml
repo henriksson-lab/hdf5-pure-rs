@@ -9,7 +9,7 @@ description = "Pure Rust implementation of the HDF5 file format. No C dependenci
 license = "BSD-3-Clause"
 repository = "https://github.com/henriksson-lab/hdf5-pure-rs"
 homepage = "https://github.com/henriksson-lab/hdf5-pure-rs"
-include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/Cargo.toml", "/README.md", "/LICENSE-*"]
+include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/examples/**/*", "/Cargo.toml", "/README.md", "/LICENSE-*"]
 
 [dependencies]
 bitflags = "2.4"
@@ -37,4 +37,5 @@ path = "src/bin/tracehash_corpus.rs"
 required-features = ["tracehash"]
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3.9"

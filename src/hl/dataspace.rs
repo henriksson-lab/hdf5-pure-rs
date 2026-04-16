@@ -11,6 +11,11 @@ impl Dataspace {
         Self { msg }
     }
 
+    /// Return the parsed low-level dataspace message.
+    pub fn raw_message(&self) -> DataspaceMessage {
+        self.msg.clone()
+    }
+
     /// Number of dimensions.
     pub fn ndim(&self) -> usize {
         self.msg.ndims as usize

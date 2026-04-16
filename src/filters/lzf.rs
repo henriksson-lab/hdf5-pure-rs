@@ -68,6 +68,13 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
         }
     }
 
+    if output.len() != expected_size {
+        return Err(Error::InvalidFormat(format!(
+            "lzf: output length mismatch: expected {expected_size}, got {}",
+            output.len()
+        )));
+    }
+
     Ok(output)
 }
 
@@ -92,5 +99,15 @@ mod tests {
         let compressed = vec![0x02, b'a', b'b', b'c', 0x20, 0x02];
         let result = decompress(&compressed, 6).unwrap();
         assert_eq!(result, b"abcabc");
+    }
+
+    #[test]
+    fn test_lzf_rejects_output_size_mismatch() {
+        let compressed = vec![0x04, b'H', b'e', b'l', b'l', b'o'];
+        let err = decompress(&compressed, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("lzf: output length mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }

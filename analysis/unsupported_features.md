@@ -1,62 +1,85 @@
 # Unsupported HDF5 Features
 
-This crate intentionally implements a subset of HDF5. The features below are
-recognized as outside the supported surface until dedicated implementations and
-compatibility tests are added.
+This crate intentionally implements a read-focused subset of HDF5. The table
+below tracks known libhdf5 divergences, the supported subset around each
+divergence, and the regression tests that currently pin the behavior.
 
-## Dataset Storage
+When a row says "coverage gap", the divergence is documented here but still has
+an open TODO entry for a dedicated fixture or exact error assertion.
 
-- Virtual dataset reads support serialized all-selection and regular hyperslab
-  mappings, including relative external source files. Point selections,
-  irregular hyperslabs, printf-gap expansion, and full VDS access-property behavior remain
-  unsupported.
-- v4 chunk indexes return `Unsupported` except for single-chunk datasets,
-  unfiltered implicit chunk indexes, fixed-array chunk indexes, extensible-array
-  chunk indexes including data/super-block spillover, and v2-B-tree chunk
-  indexes.
-- Filtered v4 implicit chunk indexes remain explicitly unsupported; HDF5 does
-  not normally select implicit chunk indexes for filtered datasets.
-- `MutableFile::write_chunk` appends and replaces full chunks in v1 chunk
-  B-trees, including append-only root-leaf rebuilds for full leaves. It can
-  replace existing chunks in v4 fixed-array indexes. Growing v4 fixed arrays
-  and updating extensible-array or v2-B-tree chunk indexes remain unsupported.
+## Dataset Storage And Virtual Datasets
+
+| Area | Current behavior | Regression coverage |
+| --- | --- | --- |
+| VDS regular hyperslab mappings | Supported for serialized all-selections and regular hyperslabs, including relative source files and same-file source metadata. | `test_reference_virtual_dataset_regular_hyperslabs_read`, `test_virtual_dataset_all_selection_read`, `test_virtual_dataset_same_file_source_read`, `test_virtual_dataset_mixed_all_and_regular_selection_read`, `test_virtual_dataset_fill_value_for_unmapped_regions`, `test_virtual_layout_parses_as_metadata_only` |
+| VDS point selections | Not implemented. Non-hyperslab serialized selection types return `Unsupported`. | Coverage gap: TODO tracks adding a point-selection fixture or a direct decode-time rejection test. |
+| VDS irregular hyperslabs | Not implemented. Hyperslab selections whose serialized flags are not the regular form return `Unsupported`. | Coverage gap: TODO tracks adding an irregular-hyperslab fixture or a direct decode-time rejection test. |
+| VDS access properties | Missing source-file policy, VDS prefix substitution, and view policy are not implemented. Reads use the file names serialized in the virtual mapping heap; missing source files surface as ordinary file I/O errors. | `test_virtual_dataset_missing_source_file_fails_without_access_property_policy`, `virtual_source_resolution_requires_base_path_for_relative_and_same_file_sources`; no public API exists yet for prefix substitution or view-policy configuration. |
+| VDS datatype conversion | VDS reads require source and destination element sizes to match; full libhdf5 datatype conversion is not implemented. | `test_reference_virtual_dataset_regular_hyperslabs_read`, `test_virtual_dataset_mixed_all_and_regular_selection_read`, `test_virtual_dataset_f64_read`, `test_virtual_dataset_rejects_mismatched_read_element_size`; coverage gap for true libhdf5 datatype conversion parity. |
+| v4 chunk indexes | Single-chunk, unfiltered implicit, fixed-array, paged fixed-array, extensible-array, extensible-array spillover, v2-B-tree, and sparse fill-value fallback are supported. | `test_v4_fixed_array_chunks_read`, `test_v4_paged_fixed_array_chunks_read`, `test_v4_filtered_fixed_array_chunks_read`, `test_v4_extensible_array_chunks_read`, `test_v4_extensible_array_spillover_chunks_read`, `test_v4_btree2_chunks_read`, `test_v4_btree2_internal_chunks_read`, `test_sparse_chunked_fill_value_read` |
+| Filtered implicit chunk indexes | Explicitly unsupported. HDF5 does not normally choose implicit chunk indexes for filtered datasets, but malformed or hand-authored files can encode them. | Coverage gap: TODO tracks a targeted fixture and error assertion. |
+| Mutable chunk writes | `MutableFile::write_chunk` appends and replaces full v1 B-tree chunks and can replace existing chunks in v4 fixed-array indexes. Growing v4 fixed arrays and updating extensible-array or v2-B-tree chunk indexes remain unsupported. | `test_write_chunk_replaces_existing_chunk`, `test_write_chunk_splits_full_v1_btree_leaf`, `test_resize_then_write_appended_chunk`, `test_resize_chunked_dataset`, `test_write_chunk_replaces_existing_v4_fixed_array_chunk`, `test_resize_non_chunked_fails`, `test_resize_wrong_ndims_fails` |
+| Undefined storage addresses, late allocation, and external raw data storage | Undefined contiguous storage addresses read as fill values. External raw data storage is explicitly unsupported when the dataset object header contains an external file list message. External links are decoded, but external raw data storage is a different dataset-layout feature and remains outside the supported surface. | `test_external_raw_data_storage_is_explicitly_unsupported`; coverage gap for allocation-time-late/fill-time-never semantics and undefined-address fixtures. |
 
 ## Filters
 
-- NBit decodes datatype-aware HDF5 set-local filter parameters.
-- ScaleOffset decodes datatype-aware integer and decimal floating-point
-  set-local filter parameters.
-- SZip returns `Unsupported` permanently unless a pure-Rust implementation is
-  added later.
-- Unknown filters return `Unsupported`.
+| Area | Current behavior | Regression coverage |
+| --- | --- | --- |
+| Deflate | Supported through `flate2` for chunk and heap filter pipelines. | Covered indirectly by filtered chunk, NBit, ScaleOffset, and filtered fractal-heap fixtures. |
+| NBit | Supported for datatype-aware HDF5 set-local parameters used by current fixtures. | `test_nbit_filter_i32_read`; coverage gap for signed/unsigned/floating/compound exact libhdf5 parity vectors and malformed parameter fixtures. |
+| ScaleOffset | Supported for datatype-aware integer and decimal floating-point set-local parameters used by current fixtures. | `test_scaleoffset_filter_i32_read`, `test_scaleoffset_filter_f32_read`; coverage gap for minbits, signed values, zero minbits, all scale types, and malformed parameter fixtures. |
+| Per-chunk filter masks | Supported for skipped filters in tested filtered chunk layouts. | `test_filtered_chunk_mask_skips_unapplied_filters`, `test_filtered_single_chunk_mask_skips_unapplied_filters`; coverage gap for middle-filter skips in multi-filter pipelines. |
+| SZip | Intentionally unsupported unless a pure-Rust decoder is added. | `test_unsupported_filters_fail_explicitly`; coverage gap for a real SZip fixture and exact high-level error surface. |
+| Unknown filters | Required unknown filters return `Unsupported`. Optional-filter skip semantics are not yet fully audited. | `test_unsupported_filters_fail_explicitly`; coverage gap for optional unknown filters that libhdf5 may legally skip. |
+| Malformed filter pipelines | Truncated payloads, too many filters, invalid masks, and datatype-aware filters with missing parameters fail explicitly. | `test_datatype_aware_filters_reject_missing_parameters`, `test_filter_pipeline_rejects_out_of_range_filter_mask`, `test_filter_pipeline_rejects_more_than_32_filters`, `test_filter_pipeline_rejects_truncated_decode_payloads` |
 
-## Compound Members
+## Datatypes And Conversion
 
-Compound field metadata preserves each embedded member datatype, including byte
-order and nested datatype information. Direct `read_field::<T>()` supports
-fixed-size fields where the requested Rust type has the same byte size.
-`read_field_raw()` returns raw per-record member bytes for non-primitive
-members so callers can handle nested, array, variable-length, or reference
-payloads explicitly.
+| Area | Current behavior | Regression coverage |
+| --- | --- | --- |
+| Primitive conversion | High-level reads mostly require exact element-size/type compatibility. Full libhdf5 conversion classes for widening, narrowing, overflow, integer-float conversion, and NaN/Inf behavior are not implemented. | Existing primitive reference tests in `tests/t3_datatypes.rs`; coverage gap for the conversion matrix called out in TODO. |
+| Compound fields | Metadata preserves member datatypes, byte order, offsets, nested datatypes, and member names. `read_field::<T>()` supports fixed-size fields with matching Rust size. `read_field_raw()` returns raw member bytes for non-primitive members. | `test_compound_dtype_info`, `test_compound_read_field_f64`, `test_compound_read_field_i32`, `test_compound_read_field_raw`, `test_compound_read_field_wrong_size`, `test_compound_fields_api`, `test_compound_field_preserves_member_byte_order`, `test_compound_fields_reject_truncated_member_metadata` |
+| Recursive compound values | Nested compound, array, variable-length, and reference members can be decoded through `read_field_values()`. This is not a full libhdf5 conversion engine. | `test_recursive_compound_nested_member_values`, `test_recursive_compound_array_member_values`, `test_recursive_compound_vlen_member_values`, `test_recursive_compound_reference_member_values` |
+| Variable-length strings | Vlen string datasets and attributes backed by global heap references are readable. Empty/null-string edge cases and broad global-heap edge cases remain incomplete. | `test_read_vlen_string_attr`, `test_read_vlen_string_dataset`, `t9a_global_heap_vlen_strings`, `t9a_global_heap_vlen_attr`, `test_vlen_base_distinguishes_sequence_and_string_metadata`, `test_vlen_base_rejects_truncated_or_ambiguous_metadata` |
+| Fixed-length strings, opaque, time, enum conversion, array datatype variants | Partially decoded at the metadata layer where fixtures require it, but not covered for full libhdf5 read/conversion parity. | Existing datatype reference tests in `tests/t3_datatypes.rs`; coverage gap for the detailed parity vectors listed in TODO. |
 
-Compound field byte-swapping is applied for big-endian primitive numeric
-members. Recursive value conversion is available for nested compound, array,
-variable-length, and reference members through `read_field_values()`.
+## Groups, Links, Attributes, And Heaps
 
-## Fractal Heaps
+| Area | Current behavior | Regression coverage |
+| --- | --- | --- |
+| External links | Link messages decode external filename/object path and writer APIs can create external links. Opening/traversing the target file through an external link is not implemented as libhdf5 does it. | `test_write_external_link`, `t6b_external_link`, `t11a_be_extlinks`; coverage gap for missing-file, relative, absolute, and same-directory traversal behavior. |
+| Soft-link traversal | Basic link metadata is decoded, but cycle detection and bounded traversal behavior are not yet pinned. | Coverage gap: TODO tracks soft-link cycle tests. |
+| Dense links and dense attributes | Fractal-heap plus v2-B-tree backed dense link and attribute storage is supported for current fixtures. Multiple tree levels and creation-order variants need broader coverage. | `t9c_fractal_heap_dense_links`, `t9c_fractal_heap_modern_dense_links`, `t9c_fractal_heap_dense_attrs` |
+| Fractal heap managed objects | Direct managed objects, filtered direct blocks, and indirect-block lookup paths used by fixtures are supported. Deep indirect growth and checksum corruption are not fully covered. | `test_filtered_fractal_heap_direct_object_read`, `t9c_fractal_heap_dense_links`, `t9c_fractal_heap_modern_dense_links`, `t9c_fractal_heap_dense_attrs`; coverage gap for deeper indirect growth and checksum corruption. |
+| Fractal heap huge objects | Directly addressed huge objects and v2-B-tree tracked huge objects are readable for supported record layouts. Unsupported record variants fail explicitly. | `test_huge_fractal_heap_direct_object_read`, `test_filtered_huge_fractal_heap_direct_object_read`, `test_huge_fractal_heap_indirect_object_is_unsupported` |
+| Global heap | Global heap collections and object dereferences used by vlen string data are supported. Deleted objects, duplicate object IDs, and collection padding edge cases need dedicated fixtures. | `t9a_global_heap_vlen_strings`, `t9a_global_heap_vlen_attr`, `test_read_vlen_string_attr`, `test_read_vlen_string_dataset`; coverage gap for deleted-object and duplicate-ID edge cases. |
 
-- Directly addressed huge fractal heap objects and v2-B-tree tracked huge
-  objects are readable, including filtered records when the heap filter pipeline
-  is supported. Unsupported record variants fail explicitly.
-- Filtered direct managed fractal heap blocks are readable with supported
-  filter pipelines. Unsupported filtered variants fail explicitly.
+## Writer Surface
 
-## Tracehash
+| Area | Current behavior | Regression coverage |
+| --- | --- | --- |
+| Dataset creation | Writer support is intentionally narrow: primitive dataset creation, compact fixed-string and flat compound datasets, explicit fill-value messages, and selected mutable chunk operations are supported. Dense groups/attributes, vlen strings, enum/opaque/array/nested compound metadata, and modern chunk-index creation remain unsupported. | Existing writer tests in `tests/write_test.rs`, `tests/write_api_test.rs`, `tests/resize_test.rs`, and `tests/link_test.rs`; coverage gap for the remaining writer parity and h5dump/h5py round-trip items in TODO. |
+| Writer chunk indexes | New chunked datasets are written with v1 B-tree chunk indexes. `MutableFile::write_chunk` can append/replace/rebuild v1 B-tree chunks and replace existing v4 fixed-array chunks, but it does not create new fixed-array/extensible-array indexes. | `test_write_chunk_replaces_existing_chunk`, `test_write_chunk_splits_full_v1_btree_leaf`, `test_resize_then_write_appended_chunk`, `test_write_chunk_replaces_existing_v4_fixed_array_chunk`. |
+| Free-space managers | Write paths append new metadata/raw data and do not implement libhdf5 free-space manager reuse. File growth and address reuse are therefore not a compatibility guarantee. | Documented behavior; no free-space reuse tests are expected until a free-space manager writer is added. |
 
-Rust-side probes exist for decode checkpoints, chunk-index lookup, filter
-application, and fractal-heap reads. The vendored HDF5 tree has matching probe
-calls plus a small public-API corpus driver. The current local comparison has
-Rust emitting `/tmp/rust.tsv` and patched HDF5 C emitting `/tmp/c.tsv`; the
-current report shows an exact 15261-row match with no count differences, missing
-inputs, or matched-output divergences. See
+## Tracehash Parity Boundary
+
+The supported tracehash corpus is intentionally read-side focused. Rust-side
+probes cover datatype property parsing, dataspace and selection decode, fill
+values, chunk lookup, filter application, fractal-heap reads, global-heap
+dereference, variable-length string reads, external-link target decode, and
+same-file VDS source resolution. The vendored HDF5 tree has matching probes and
+a public-API corpus driver.
+
+The current default local comparison matches exactly:
+
+- Rust output: `/tmp/rust.tsv`
+- Patched HDF5 C output: `/tmp/c.tsv`
+- Result: 22839 matched rows, with no count differences, missing inputs, or
+  matched-output divergences.
+
+Focused probes for external-link target decode and same-file VDS source
+resolution also match, but those fixtures remain outside the default tracehash
+corpus to avoid conflating supported metadata decode with unsupported
+link-traversal and full VDS source-file read behavior. See
 `analysis/tracehash_divergence_report.md`.

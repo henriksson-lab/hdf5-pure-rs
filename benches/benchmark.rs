@@ -1,47 +1,86 @@
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use hdf5_pure_rust::{File, WritableFile};
-use std::time::Instant;
 
-fn main() {
-    let n = 1_000_000usize;
-    let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
-    let iterations = 10;
-
-    // Write benchmark
-    let mut total_write = std::time::Duration::ZERO;
-    for _ in 0..iterations {
-        let t = Instant::now();
-        let mut wf = WritableFile::create("/tmp/bench_rust.h5").unwrap();
-        wf.new_dataset_builder("data")
-            .shape(&[n as u64])
-            .chunk(&[50000])
-            .deflate(1)
-            .write::<f64>(&data)
-            .unwrap();
-        wf.flush().unwrap();
-        total_write += t.elapsed();
-    }
-    let avg_write = total_write / iterations as u32;
-
-    // Read benchmark
-    let mut total_read = std::time::Duration::ZERO;
-    for _ in 0..iterations {
-        let t = Instant::now();
-        let f = File::open("/tmp/bench_rust.h5").unwrap();
-        let ds = f.dataset("data").unwrap();
-        let _vals: Vec<f64> = ds.read::<f64>().unwrap();
-        total_read += t.elapsed();
-    }
-    let avg_read = total_read / iterations as u32;
-
-    println!(
-        "hdf5-pure-rust write: {:.1} ms",
-        avg_write.as_secs_f64() * 1000.0
-    );
-    println!(
-        "hdf5-pure-rust read:  {:.1} ms",
-        avg_read.as_secs_f64() * 1000.0
-    );
-    println!("Data: {} f64 elements, chunked 50000, deflate level 1", n);
-
-    std::fs::remove_file("/tmp/bench_rust.h5").ok();
+fn unique_h5_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "hdf5-pure-rust-{name}-{}-{}.h5",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }
+
+fn create_chunked_fixture(path: &std::path::Path, filtered: bool) {
+    let data: Vec<f64> = (0..100_000).map(|i| i as f64).collect();
+    let mut file = WritableFile::create(path).unwrap();
+    let builder = file
+        .new_dataset_builder("data")
+        .shape(&[data.len() as u64])
+        .chunk(&[10_000]);
+    if filtered {
+        builder.deflate(1).write::<f64>(&data).unwrap();
+    } else {
+        builder.write::<f64>(&data).unwrap();
+    }
+    file.flush().unwrap();
+}
+
+fn bench_chunked_reads(c: &mut Criterion) {
+    let path = unique_h5_path("chunked");
+    create_chunked_fixture(&path, false);
+    c.bench_function("chunked_read_f64", |b| {
+        b.iter(|| {
+            let file = File::open(&path).unwrap();
+            let dataset = file.dataset("data").unwrap();
+            let values: Vec<f64> = dataset.read().unwrap();
+            black_box(values);
+        })
+    });
+    std::fs::remove_file(path).ok();
+}
+
+fn bench_filtered_reads(c: &mut Criterion) {
+    let path = unique_h5_path("filtered");
+    create_chunked_fixture(&path, true);
+    c.bench_function("filtered_chunked_read_f64", |b| {
+        b.iter(|| {
+            let file = File::open(&path).unwrap();
+            let dataset = file.dataset("data").unwrap();
+            let values: Vec<f64> = dataset.read().unwrap();
+            black_box(values);
+        })
+    });
+    std::fs::remove_file(path).ok();
+}
+
+fn bench_dense_group_traversal(c: &mut Criterion) {
+    c.bench_function("dense_group_member_names", |b| {
+        b.iter(|| {
+            let file = File::open("tests/data/hdf5_ref/dense_group_cases.h5").unwrap();
+            let group = file.group("name_index_deep").unwrap();
+            black_box(group.member_names().unwrap());
+        })
+    });
+}
+
+fn bench_vds_read(c: &mut Criterion) {
+    c.bench_function("vds_all_read_i32", |b| {
+        b.iter(|| {
+            let file = File::open("tests/data/hdf5_ref/vds_all.h5").unwrap();
+            let dataset = file.dataset("vds_all").unwrap();
+            let values: Vec<i32> = dataset.read().unwrap();
+            black_box(values);
+        })
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_chunked_reads,
+    bench_filtered_reads,
+    bench_dense_group_traversal,
+    bench_vds_read
+);
+criterion_main!(benches);

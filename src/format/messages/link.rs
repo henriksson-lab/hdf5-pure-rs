@@ -36,7 +36,7 @@ impl LinkMessage {
         // Version
         let version = read_u8(data, &mut pos, "link message version")?;
         if version != 1 {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidFormat(format!(
                 "link message version {version}"
             )));
         }
@@ -76,6 +76,11 @@ impl LinkMessage {
         } else {
             0 // ASCII
         };
+        if char_encoding > 1 {
+            return Err(Error::InvalidFormat(format!(
+                "invalid link character encoding {char_encoding}"
+            )));
+        }
 
         // Length of link name
         let name_len_size = 1 << size_of_len_of_link_name; // 1, 2, 4, or 8
@@ -140,6 +145,7 @@ impl LinkMessage {
                     .position(|&b| b == 0)
                     .unwrap_or(end - pos);
                 let obj_path = String::from_utf8_lossy(&data[pos..pos + null_pos2]).to_string();
+                trace_external_link_resolve(&filename, &obj_path);
 
                 external_link = Some((filename, obj_path));
             }
@@ -159,6 +165,20 @@ impl LinkMessage {
         })
     }
 }
+
+#[cfg(feature = "tracehash")]
+fn trace_external_link_resolve(filename: &str, obj_path: &str) {
+    let mut th = tracehash::th_call!("hdf5.external_link.resolve");
+    th.input_bytes(filename.as_bytes());
+    th.input_bytes(obj_path.as_bytes());
+    th.output_bool(true);
+    th.output_bytes(filename.as_bytes());
+    th.output_bytes(obj_path.as_bytes());
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_external_link_resolve(_filename: &str, _obj_path: &str) {}
 
 fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Result<()> {
     let end = pos

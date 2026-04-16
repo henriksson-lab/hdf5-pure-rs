@@ -1,7 +1,10 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::{is_undef_addr, HdfReader, UNDEF_ADDR};
+
+const MAX_FIXED_ARRAY_ELEMENTS: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct FixedArrayElement {
@@ -60,7 +63,8 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
             header.class_id
         )));
     }
-    if element_index >= header.elements as usize {
+    let element_count = usize_from_u64(header.elements, "fixed array element count")?;
+    if element_index >= element_count {
         return Err(Error::InvalidFormat(format!(
             "fixed array element index {element_index} out of bounds for {} elements",
             header.elements
@@ -89,9 +93,9 @@ pub fn locate_fixed_array_element<R: Read + Seek>(
         .ok_or_else(|| Error::InvalidFormat("fixed array page size overflow".into()))?;
     let data_prefix_size = 4 + 1 + 1 + reader.sizeof_addr() as usize;
 
-    if (header.elements as usize) > page_elements {
+    if element_count > page_elements {
         reader.seek(header.data_block_addr + data_prefix_size as u64)?;
-        let pages = (header.elements as usize).div_ceil(page_elements);
+        let pages = element_count.div_ceil(page_elements);
         let page_init_size = pages.div_ceil(8);
         let page_init = reader.read_bytes(page_init_size)?;
         let page_index = element_index / page_elements;
@@ -134,8 +138,14 @@ fn read_header<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<F
     let raw_element_size = reader.read_u8()? as usize;
     let max_page_elements_bits = reader.read_u8()?;
     let elements = reader.read_length()?;
+    let element_count = usize_from_u64(elements, "fixed array element count")?;
+    if element_count > MAX_FIXED_ARRAY_ELEMENTS {
+        return Err(Error::InvalidFormat(format!(
+            "fixed array element count {element_count} exceeds supported maximum {MAX_FIXED_ARRAY_ELEMENTS}"
+        )));
+    }
     let data_block_addr = reader.read_addr()?;
-    let _checksum = reader.read_u32()?;
+    verify_checksum(reader, addr, "fixed array header")?;
 
     Ok(FixedArrayHeader {
         class_id,
@@ -144,6 +154,27 @@ fn read_header<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<F
         elements,
         data_block_addr,
     })
+}
+
+fn verify_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+) -> Result<()> {
+    let checksum_pos = reader.position()?;
+    let stored_checksum = reader.read_u32()?;
+    let check_len = usize::try_from(checksum_pos - start)
+        .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    reader.seek(start)?;
+    let check_data = reader.read_bytes(check_len)?;
+    let computed = checksum_metadata(&check_data);
+    if stored_checksum != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
+        )));
+    }
+    reader.seek(checksum_pos + 4)?;
+    Ok(())
 }
 
 fn read_data_block<R: Read + Seek>(
@@ -197,9 +228,10 @@ fn read_data_block<R: Read + Seek>(
         )));
     }
 
-    let mut elements = Vec::with_capacity(header.elements as usize);
-    if (header.elements as usize) > page_elements {
-        let pages = (header.elements as usize).div_ceil(page_elements);
+    let element_count = usize_from_u64(header.elements, "fixed array element count")?;
+    let mut elements = Vec::with_capacity(element_count);
+    if element_count > page_elements {
+        let pages = element_count.div_ceil(page_elements);
         let page_init_size = pages.div_ceil(8);
         let page_init = reader.read_bytes(page_init_size)?;
         let _checksum = reader.read_u32()?;
@@ -207,7 +239,7 @@ fn read_data_block<R: Read + Seek>(
         let page_size = page_elements * header.raw_element_size + 4;
         for page_index in 0..pages {
             let page_start = page_index * page_elements;
-            let page_count = page_elements.min(header.elements as usize - page_start);
+            let page_count = page_elements.min(element_count - page_start);
             if bit_is_set(&page_init, page_index) {
                 let page_addr =
                     header.data_block_addr + prefix_size as u64 + (page_index * page_size) as u64;
@@ -261,6 +293,11 @@ fn append_fill_elements(count: usize, elements: &mut Vec<FixedArrayElement>) {
             filter_mask: 0,
         });
     }
+}
+
+fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }
 
 fn bit_is_set(bytes: &[u8], bit: usize) -> bool {

@@ -1,4 +1,14 @@
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::{Error, File};
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+struct ThreeBytes([u8; 3]);
+
+unsafe impl hdf5_pure_rust::H5Type for ThreeBytes {
+    fn type_size() -> usize {
+        3
+    }
+}
 
 #[test]
 fn test_reference_virtual_dataset_regular_hyperslabs_read() {
@@ -75,4 +85,106 @@ fn test_virtual_dataset_fill_value_for_unmapped_regions() {
         }
     }
     assert_eq!(vals, expected);
+}
+
+#[test]
+fn test_virtual_dataset_f64_read() {
+    let f = File::open("tests/data/hdf5_ref/vds_f64.h5").unwrap();
+    let ds = f.dataset("vds_f64").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    assert_eq!(ds.shape().unwrap(), vec![3, 4]);
+
+    let vals: Vec<f64> = ds.read::<f64>().unwrap();
+    let expected = (0..12)
+        .map(|value| (value as f64 / 2.0) + 0.25)
+        .collect::<Vec<_>>();
+    assert_eq!(vals, expected);
+}
+
+#[test]
+fn test_virtual_dataset_rejects_mismatched_read_element_size() {
+    let f = File::open("tests/data/hdf5_ref/vds_f64.h5").unwrap();
+    let ds = f.dataset("vds_f64").unwrap();
+    let err = ds
+        .read::<ThreeBytes>()
+        .expect_err("VDS read should reject mismatched destination element sizes");
+
+    assert!(matches!(err, Error::InvalidFormat(_)));
+}
+
+#[test]
+fn test_virtual_dataset_scalar_mapping_read() {
+    let f = File::open("tests/data/hdf5_ref/vds_scalar.h5").unwrap();
+    let ds = f.dataset("vds_scalar").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    assert_eq!(ds.size().unwrap(), 1);
+
+    let val = ds.read_scalar::<i32>().unwrap();
+    assert_eq!(val, 42);
+}
+
+#[test]
+fn test_virtual_dataset_zero_sized_mapping_read() {
+    let f = File::open("tests/data/hdf5_ref/vds_zero_sized.h5").unwrap();
+    let ds = f.dataset("vds_zero_sized").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    assert_eq!(ds.shape().unwrap(), vec![0, 4]);
+    assert_eq!(ds.size().unwrap(), 0);
+
+    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    assert!(vals.is_empty());
+}
+
+#[test]
+fn test_virtual_dataset_null_mapping_read() {
+    let f = File::open("tests/data/hdf5_ref/vds_null.h5").unwrap();
+    let ds = f.dataset("vds_null").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    assert!(ds.space().unwrap().is_null());
+    assert_eq!(ds.shape().unwrap(), Vec::<u64>::new());
+    assert_eq!(ds.size().unwrap(), 0);
+
+    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    assert!(vals.is_empty());
+}
+
+#[test]
+fn test_virtual_dataset_rank_mismatch_mapping_read() {
+    let f = File::open("tests/data/hdf5_ref/vds_rank_mismatch.h5").unwrap();
+    let ds = f.dataset("vds_rank_mismatch").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    assert_eq!(ds.shape().unwrap(), vec![2, 3]);
+
+    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    assert_eq!(vals, (0..6).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_virtual_dataset_overlapping_mappings_later_mapping_wins() {
+    let f = File::open("tests/data/hdf5_ref/vds_overlap.h5").unwrap();
+    let ds = f.dataset("vds_overlap").unwrap();
+    assert!(ds.is_virtual().unwrap());
+    assert_eq!(ds.shape().unwrap(), vec![4]);
+
+    let vals: Vec<i32> = ds.read::<i32>().unwrap();
+    assert_eq!(vals, vec![1, 9, 8, 4]);
+}
+
+#[test]
+fn test_virtual_dataset_missing_source_file_fails_without_access_property_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let vds_path = dir.path().join("vds_all.h5");
+    std::fs::copy("tests/data/hdf5_ref/vds_all.h5", &vds_path).unwrap();
+
+    let f = File::open(&vds_path).unwrap();
+    let ds = f.dataset("vds_all").unwrap();
+    let err = ds
+        .read::<i32>()
+        .expect_err("missing VDS source should fail without a VDS access policy");
+
+    assert!(
+        matches!(err, Error::Io(_)),
+        "missing source should surface as file I/O without VDS access-property behavior: {err}"
+    );
 }

@@ -134,7 +134,7 @@ impl Group {
     }
 
     /// Find a specific link by name, checking both inline messages and dense storage.
-    fn find_link_by_name(&self, name: &str) -> Result<LinkMessage> {
+    pub(crate) fn find_link_by_name(&self, name: &str) -> Result<LinkMessage> {
         let mut guard = self.inner.lock();
         let sizeof_addr = guard.superblock.sizeof_addr;
         let oh = ObjectHeader::read_at(&mut guard.reader, self.addr)?;

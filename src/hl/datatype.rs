@@ -11,6 +11,11 @@ impl Datatype {
         Self { msg }
     }
 
+    /// Return the parsed low-level datatype message.
+    pub fn raw_message(&self) -> DatatypeMessage {
+        self.msg.clone()
+    }
+
     /// Total size of one element in bytes.
     pub fn size(&self) -> usize {
         self.msg.size as usize
@@ -46,6 +51,16 @@ impl Datatype {
         self.msg.class == DatatypeClass::String
     }
 
+    /// String character set for HDF5 string datatypes: 0=ASCII, 1=UTF-8.
+    pub fn char_set(&self) -> Option<u8> {
+        self.msg.char_set()
+    }
+
+    /// Fixed-length string padding type: 0=null-terminated, 1=null-padded, 2=space-padded.
+    pub fn string_padding(&self) -> Option<u8> {
+        self.msg.string_padding()
+    }
+
     /// Whether this is a compound type.
     pub fn is_compound(&self) -> bool {
         self.msg.class == DatatypeClass::Compound
@@ -59,6 +74,16 @@ impl Datatype {
     /// Whether this is a variable-length type.
     pub fn is_vlen(&self) -> bool {
         self.msg.class == DatatypeClass::VarLen
+    }
+
+    /// Opaque datatype tag, if this is an opaque datatype.
+    pub fn opaque_tag(&self) -> Option<String> {
+        self.msg.opaque_tag()
+    }
+
+    /// Reference datatype kind: 0=object reference, 1=dataset region reference.
+    pub fn reference_type(&self) -> Option<u8> {
+        self.msg.reference_type()
     }
 
     /// Get compound type fields (returns None if not compound).

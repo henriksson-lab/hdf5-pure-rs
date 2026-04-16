@@ -25,7 +25,7 @@ impl AttributeInfoMessage {
 
         let version = read_u8(data, &mut pos, "attribute info message version")?;
         if version != 0 {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::InvalidFormat(format!(
                 "attribute info version {version}"
             )));
         }

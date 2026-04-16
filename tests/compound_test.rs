@@ -144,3 +144,86 @@ fn test_recursive_compound_reference_member_values() {
         other => panic!("unexpected reference values: {other:?}"),
     }
 }
+
+#[test]
+fn test_compound_padded_reordered_members() {
+    let f = File::open("tests/data/hdf5_ref/compound_layout_cases.h5").unwrap();
+    let ds = f.dataset("padded_reordered").unwrap();
+    let fields = ds.compound_fields().unwrap();
+
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name, "second");
+    assert_eq!(fields[0].byte_offset, 4);
+    assert_eq!(fields[1].name, "first");
+    assert_eq!(fields[1].byte_offset, 0);
+    assert_eq!(fields[2].name, "last");
+    assert_eq!(fields[2].byte_offset, 8);
+    assert_eq!(ds.dtype().unwrap().size(), 12);
+
+    assert_eq!(ds.read_field::<i32>("first").unwrap(), vec![1000, 2000]);
+    assert_eq!(ds.read_field::<i16>("second").unwrap(), vec![10, 20]);
+    assert_eq!(ds.read_field::<u8>("last").unwrap(), vec![7, 8]);
+}
+
+#[test]
+fn test_recursive_compound_nested_vlen_member_values() {
+    let f = File::open("tests/data/hdf5_ref/compound_layout_cases.h5").unwrap();
+    let ds = f.dataset("nested_vlen").unwrap();
+
+    let values = ds.read_field_values("nested_vlen").unwrap();
+    assert_eq!(
+        values[0],
+        H5Value::Compound(vec![
+            ("tag".to_string(), H5Value::Int(3)),
+            (
+                "seq".to_string(),
+                H5Value::VarLen(vec![H5Value::Int(1), H5Value::Int(2)])
+            ),
+        ])
+    );
+    assert_eq!(
+        values[1],
+        H5Value::Compound(vec![
+            ("tag".to_string(), H5Value::Int(4)),
+            (
+                "seq".to_string(),
+                H5Value::VarLen(vec![H5Value::Int(5), H5Value::Int(6), H5Value::Int(7)])
+            ),
+        ])
+    );
+}
+
+#[test]
+fn test_compound_multidimensional_array_member_values() {
+    let f = File::open("tests/data/hdf5_ref/array_datatype_cases.h5").unwrap();
+    let ds = f.dataset("compound_array2d").unwrap();
+    let fields = ds.compound_fields().unwrap();
+    let grid = fields.iter().find(|field| field.name == "grid").unwrap();
+    let (dims, base) = grid.datatype.array_dims_base().unwrap();
+
+    assert_eq!(dims, vec![2, 3]);
+    assert_eq!(base.size, 2);
+    let values = ds.read_field_values("grid").unwrap();
+    assert_eq!(
+        values[0],
+        H5Value::Array(vec![
+            H5Value::Int(1),
+            H5Value::Int(2),
+            H5Value::Int(3),
+            H5Value::Int(4),
+            H5Value::Int(5),
+            H5Value::Int(6),
+        ])
+    );
+    assert_eq!(
+        values[1],
+        H5Value::Array(vec![
+            H5Value::Int(7),
+            H5Value::Int(8),
+            H5Value::Int(9),
+            H5Value::Int(10),
+            H5Value::Int(11),
+            H5Value::Int(12),
+        ])
+    );
+}

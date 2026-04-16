@@ -6,10 +6,23 @@ Date: 2026-04-15
 
 - Rust corpus runner: `scripts/tracehash-rust-corpus.sh`
 - Rust trace output: `/tmp/rust.tsv`
-- Rust trace rows observed locally: 15261
+- Rust trace rows observed locally: 22839
 - C corpus runner: `scripts/tracehash-c-corpus.sh`
 - C trace output: `/tmp/c.tsv`
-- C trace rows observed locally: 15261
+- C trace rows observed locally: 22839
+- Latest revalidation: after adding global-heap dereference and
+  variable-length string read tracehash coverage,
+  `scripts/tracehash-compare.sh /tmp/rust.tsv /tmp/c.tsv` matches 22839 Rust
+  rows to 22839 C rows.
+- Focused VDS selection revalidation:
+  `scripts/tracehash-compare.sh /tmp/rust-vds-selection.tsv /tmp/c-vds-selection.tsv`
+  matches 6 Rust rows to 6 C rows for `hdf5.selection.deserialize`.
+- Focused external-link revalidation:
+  `scripts/tracehash-compare.sh /tmp/rust-ext-only.tsv /tmp/c-ext-only.tsv`
+  matches 1 Rust row to 1 C row for `hdf5.external_link.resolve`.
+- Focused same-file VDS source revalidation:
+  `scripts/tracehash-compare.sh /tmp/rust-vds-source-only.tsv /tmp/c-vds-source-only.tsv`
+  matches 1 Rust row to 1 C row for `hdf5.vds.source.resolve`.
 
 ## Result
 
@@ -43,6 +56,34 @@ The build and comparison required these tracehash fixes:
 - Add Rust probes for chunk-index lookups and filter application.
 - Align Rust/C decode probe outputs for datatype, data layout, and filter
   pipeline and object-header messages.
+- Add datatype property tracehash coverage for version, class bits, declared
+  size, and raw class-specific property bytes.
+- Add dataspace extent tracehash coverage for version, rank, flags, extent
+  class, dimensions, and maximum dimensions.
+- Add serialized selection tracehash coverage for VDS selection buffers.
+- Add fill-value tracehash coverage for message version, allocation time,
+  write time, defined state, and raw fill bytes.
+- Add v1 B-tree chunk lookup tracehash coverage keyed by chunk index address
+  and scaled chunk coordinates.
+- Add v2 B-tree chunk record decode tracehash coverage keyed by raw chunk
+  record bytes, with decoded address, byte length, filter mask, and scaled
+  coordinates.
+- Add v2 B-tree chunk internal-node child traversal coverage for decoded child
+  pointer address, child record count, and cumulative descendant record count.
+- Add fractal-heap managed-object tracehash coverage for direct/indirect block
+  resolution, selected block address/size, object offset/length, and filtered
+  block state.
+- Add fractal-heap huge-object and tiny-object tracehash probes. A generated
+  dense-attribute huge-object fixture was spot-checked by filtering traces to
+  `hdf5.fractal_heap.huge_object`, matching 20 Rust rows to 20 C rows.
+- Add global-heap dereference and variable-length string read probes, and add
+  `tests/data/strings.h5` to the default Rust/C tracehash corpus. The corpus
+  walker now exercises variable-length string datasets and attributes without
+  using public API metadata reopens.
+- Add focused external-link target and same-file VDS source mapping probes.
+  These remain outside the default corpus to avoid unrelated full-link/VDS
+  traversal differences, but filtered trace comparisons match the intended
+  probe rows.
 - Avoid hashing the C layout message chunk-index union field for non-chunk
   layouts.
 
@@ -55,6 +96,7 @@ tests/data/datasets_v3.h5
 tests/data/compound.h5
 tests/data/dense_links.h5
 tests/data/dense_attrs.h5
+tests/data/strings.h5
 tests/data/hdf5_ref/all_dtypes.h5
 tests/data/hdf5_ref/fractal_heap_modern.h5
 tests/data/hdf5_ref/v4_fixed_array_chunks.h5
@@ -70,12 +112,31 @@ tests/data/hdf5_ref/scaleoffset_filter_i32.h5
 `scripts/tracehash-compare.sh /tmp/rust.tsv /tmp/c.tsv` currently matches:
 
 ```text
-tracehash: traces match for 15261 left rows and 15261 right rows
+tracehash: traces match for 22839 left rows and 22839 right rows
+```
+
+Focused VDS selection rows currently match:
+
+```text
+tracehash: traces match for 6 left rows and 6 right rows
+```
+
+Focused external-link target rows currently match:
+
+```text
+tracehash: traces match for 1 left rows and 1 right rows
+```
+
+Focused same-file VDS source rows currently match:
+
+```text
+tracehash: traces match for 1 left rows and 1 right rows
 ```
 
 The current tracehash corpus has no count differences, missing inputs, or
 matched-output divergences across the instrumented object-header, message
-decode, chunk lookup, fractal-heap, and filter probes.
+decode, chunk lookup, fractal-heap, global-heap, vlen-read, and filter probes;
+focused external-link and VDS source-resolution probes also match.
 
 ## Next Command When C Trace Exists
 

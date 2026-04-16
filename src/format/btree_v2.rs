@@ -1,6 +1,7 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::HdfReader;
 
 /// v2 B-tree header magic: "BTHD"
@@ -55,8 +56,7 @@ impl BTreeV2Header {
         let root_nrecords = reader.read_u16()?;
         let total_records = reader.read_length()?;
 
-        // Checksum
-        let _checksum = reader.read_u32()?;
+        verify_checksum(reader, addr, "v2 B-tree header")?;
 
         Ok(Self {
             tree_type,
@@ -70,6 +70,27 @@ impl BTreeV2Header {
             total_records,
         })
     }
+}
+
+fn verify_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+) -> Result<()> {
+    let checksum_pos = reader.position()?;
+    let stored_checksum = reader.read_u32()?;
+    let check_len = usize::try_from(checksum_pos - start)
+        .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    reader.seek(start)?;
+    let check_data = reader.read_bytes(check_len)?;
+    let computed = checksum_metadata(&check_data);
+    if stored_checksum != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
+        )));
+    }
+    reader.seek(checksum_pos + 4)?;
+    Ok(())
 }
 
 /// Collect all records from a v2 B-tree as raw byte arrays.
@@ -206,8 +227,19 @@ fn read_internal_records<R: Read + Seek>(
     for _ in 0..=nrecords {
         let child_addr = reader.read_addr()?;
         let child_nrecords = read_var_uint(reader, max_nrec_size)? as u16;
-        if child_all_nrec_size > 0 {
-            let _child_all_records = read_var_uint(reader, child_all_nrec_size)?;
+        let child_all_records = if child_all_nrec_size > 0 {
+            read_var_uint(reader, child_all_nrec_size)?
+        } else {
+            child_nrecords as u64
+        };
+        if matches!(header.tree_type, 10 | 11) {
+            trace_internal_child(
+                depth,
+                children.len(),
+                child_addr,
+                child_nrecords,
+                child_all_records,
+            );
         }
         children.push((child_addr, child_nrecords));
     }
@@ -226,6 +258,34 @@ fn read_internal_records<R: Read + Seek>(
     )?;
 
     Ok(())
+}
+
+#[cfg(feature = "tracehash")]
+fn trace_internal_child(
+    depth: u16,
+    child_index: usize,
+    child_addr: u64,
+    child_nrecords: u16,
+    child_all_records: u64,
+) {
+    let mut th = tracehash::th_call!("hdf5.chunk_index.btree2.internal_traverse");
+    th.input_u64(depth as u64);
+    th.input_u64(child_index as u64);
+    th.input_u64(child_addr);
+    th.output_bool(true);
+    th.output_u64(child_nrecords as u64);
+    th.output_u64(child_all_records);
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_internal_child(
+    _depth: u16,
+    _child_index: usize,
+    _child_addr: u64,
+    _child_nrecords: u16,
+    _child_all_records: u64,
+) {
 }
 
 fn read_child_records<R: Read + Seek>(

@@ -54,7 +54,7 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         return Err(Error::InvalidFormat("scaleoffset data too short".into()));
     }
 
-    let minbits = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let minbits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let minval_size = data[4] as usize;
     if minval_size > 16 || data.len() < 5 + minval_size {
         return Err(Error::InvalidFormat(
@@ -379,5 +379,50 @@ impl<'a> BitStream<'a> {
             }
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(minbits: u32, minval_size: u8) -> Vec<u8> {
+        let mut data = vec![0u8; HEADER_LEN];
+        data[..4].copy_from_slice(&minbits.to_le_bytes());
+        data[4] = minval_size;
+        data
+    }
+
+    #[test]
+    fn rejects_missing_client_data() {
+        let err = decompress(&[], &[0, 0, 1]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scaleoffset filter missing datatype parameters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_float_scale_type() {
+        let params = vec![1, 2, 1, CLS_FLOAT, 4, SIGN_UNSIGNED, ORDER_LE];
+        let err = decompress(&header(0, 0), &params).unwrap_err();
+        assert!(
+            err.to_string().contains("scaleoffset float scale type 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_full_precision_output_size_mismatch() {
+        let params = vec![2, 0, 2, CLS_INTEGER, 4, SIGN_UNSIGNED, ORDER_LE];
+        let mut data = header(32, 0);
+        data.extend_from_slice(&1u32.to_le_bytes());
+        let err = decompress(&data, &params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("scaleoffset full-precision data too short"),
+            "unexpected error: {err}"
+        );
     }
 }

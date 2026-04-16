@@ -5,7 +5,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
+use crate::format::btree_v2;
+use crate::format::fractal_heap::FractalHeapHeader;
 use crate::format::messages::attribute::AttributeMessage;
+use crate::format::messages::attribute_info::AttributeInfoMessage;
 use crate::format::object_header::{self, ObjectHeader};
 use crate::hl::file::FileInner;
 
@@ -97,6 +100,34 @@ pub(crate) fn collect_attributes(
                 Err(e) => {
                     // Skip malformed attributes
                     eprintln!("Warning: failed to decode attribute: {e}");
+                }
+            }
+        }
+    }
+
+    for msg in &oh.messages {
+        if msg.msg_type == object_header::MSG_ATTR_INFO {
+            let attr_info = AttributeInfoMessage::decode(&msg.data, guard.superblock.sizeof_addr)?;
+            if attr_info.has_dense_storage() {
+                let heap =
+                    FractalHeapHeader::read_at(&mut guard.reader, attr_info.fractal_heap_addr)?;
+                let records =
+                    btree_v2::collect_all_records(&mut guard.reader, attr_info.name_btree_addr)?;
+                let heap_id_len = heap.heap_id_len as usize;
+
+                for record in &records {
+                    if record.len() < heap_id_len {
+                        continue;
+                    }
+                    let heap_id = &record[..heap_id_len];
+                    if let Ok(attr_data) = heap.read_managed_object(&mut guard.reader, heap_id) {
+                        match AttributeMessage::decode(&attr_data) {
+                            Ok(attr_msg) => attrs.push(Attribute { msg: attr_msg }),
+                            Err(e) => {
+                                eprintln!("Warning: failed to decode dense attribute: {e}");
+                            }
+                        }
+                    }
                 }
             }
         }

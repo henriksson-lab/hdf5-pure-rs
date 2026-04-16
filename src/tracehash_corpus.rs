@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use crate::error::Result;
 use crate::format::btree_v2;
 use crate::format::fractal_heap::FractalHeapHeader;
+use crate::format::global_heap::{read_global_heap_object, GlobalHeapRef};
 use crate::format::messages::attribute::AttributeMessage;
 use crate::format::messages::attribute_info::AttributeInfoMessage;
 use crate::format::messages::link::LinkMessage;
@@ -56,7 +57,7 @@ fn walk_object(inner: Inner, name: &str, addr: u64) -> Result<()> {
 
     {
         let mut guard = inner.lock();
-        touch_attrs(&mut guard.reader, &messages, sizeof_addr)?;
+        touch_attrs(&mut guard.reader, &messages, sizeof_addr, name == "/")?;
     }
 
     match object_type {
@@ -73,8 +74,16 @@ fn walk_object(inner: Inner, name: &str, addr: u64) -> Result<()> {
         }
         ObjectType::Dataset => {
             if let Ok(info) = Dataset::parse_info(&messages, sizeof_addr, sizeof_size) {
+                let reader_inner = inner.clone();
                 let dataset = Dataset::new(inner, name, addr);
-                let _ = dataset.read_raw_with_info(info);
+                if info.datatype.is_variable_string() {
+                    if let Ok(raw) = dataset.read_raw_with_info(info) {
+                        let mut guard = reader_inner.lock();
+                        let _ = touch_vlen_strings(&mut guard.reader, &raw, sizeof_addr);
+                    }
+                } else {
+                    let _ = dataset.read_raw_with_info(info);
+                }
             }
         }
         ObjectType::NamedDatatype | ObjectType::Unknown => {}
@@ -87,11 +96,19 @@ fn touch_attrs<R: std::io::Read + std::io::Seek>(
     reader: &mut HdfReader<R>,
     messages: &[RawMessage],
     sizeof_addr: u8,
+    duplicate_root_vlen_reads: bool,
 ) -> Result<()> {
     for msg in messages {
         if msg.msg_type == object_header::MSG_ATTRIBUTE {
             if let Ok(attr) = AttributeMessage::decode(&msg.data) {
-                let _ = attr.data.len();
+                if attr.datatype.is_variable_string() {
+                    touch_vlen_strings(reader, &attr.data, sizeof_addr)?;
+                    if duplicate_root_vlen_reads {
+                        touch_vlen_strings(reader, &attr.data, sizeof_addr)?;
+                    }
+                } else {
+                    let _ = attr.data.len();
+                }
             }
         }
         if msg.msg_type == object_header::MSG_ATTR_INFO {
@@ -103,6 +120,56 @@ fn touch_attrs<R: std::io::Read + std::io::Seek>(
     }
     Ok(())
 }
+
+fn touch_vlen_strings<R: std::io::Read + std::io::Seek>(
+    reader: &mut HdfReader<R>,
+    raw: &[u8],
+    sizeof_addr: u8,
+) -> Result<()> {
+    let sizeof_addr = sizeof_addr as usize;
+    let ref_size = 4 + sizeof_addr + 4;
+    for chunk in raw.chunks_exact(ref_size) {
+        let seq_len = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u64;
+        let mut addr = 0u64;
+        for i in 0..sizeof_addr.min(8) {
+            addr |= (chunk[4 + i] as u64) << (i * 8);
+        }
+        let index_pos = 4 + sizeof_addr;
+        let index = u32::from_le_bytes([
+            chunk[index_pos],
+            chunk[index_pos + 1],
+            chunk[index_pos + 2],
+            chunk[index_pos + 3],
+        ]);
+
+        if seq_len == 0 || addr == 0 || crate::io::reader::is_undef_addr(addr) {
+            continue;
+        }
+
+        let data = read_global_heap_object(
+            reader,
+            &GlobalHeapRef {
+                collection_addr: addr,
+                object_index: index,
+            },
+        )?;
+        trace_vlen_read(data.len() as u64, &data);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "tracehash")]
+fn trace_vlen_read(len: u64, data: &[u8]) {
+    let mut th = tracehash::th_call!("hdf5.vlen.read");
+    th.input_u64(len);
+    th.output_bool(true);
+    th.output_bytes(data);
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_vlen_read(_len: u64, _data: &[u8]) {}
 
 fn group_members_from_messages<R: std::io::Read + std::io::Seek>(
     reader: &mut HdfReader<R>,

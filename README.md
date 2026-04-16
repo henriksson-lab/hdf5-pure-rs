@@ -5,20 +5,15 @@
 
 Pure Rust implementation of the HDF5 file format. 
 
-Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch).
+Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/commit/62701c4c79775d267deedd15ed14d4c09571e792) (2026-04-10, v1.14.x branch). The machine-readable source pin is `hdf5-source.json`.
 
-**This crate is still under construction, with more testing and benchmarking needed. Be careful in using it for production**
-
-
-
-## This is an LLM-mediated faithful (hopefully) translation, not the original code!
+## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
 
 Most users should probably first see if the existing original code works for them, unless they have reason otherwise. The original source
 may have newer features and it has had more love in terms of fixing bugs. In fact, we aim to replicate bugs if they are present, for the
 sake of reproducibility! (but then we might have added a few more in the process)
 
-There are however cases when you might prefer this Rust version. We generally agree with [this page](https://rewrites.bio/)
-but more specifically:
+There are however cases when you might prefer this Rust version. We generally agree with [this manifesto](https://rewrites.bio/) but more specifically:
 * We have had many issues with ensuring that our software works using existing containers (Docker, PodMan, Singularity). One size does not fit all and it eats our resources trying to keep up with every way of delivering software
 * Common package managers do not work well. It was great when we had a few Linux distributions with stable procedures, but now there are just too many ecosystems (Homebrew, Conda). Conda has an NP-complete resolver which does not scale. Homebrew is only so-stable. And our dependencies in Python still break. These can no longer be considered professional serious options. Meanwhile, Cargo enables multiple versions of packages to be available, even within the same program(!)
 * The future is the web. We deploy software in the web browser, and until now that has meant Javascript. This is a language where even the == operator is broken. Typescript is one step up, but a game changer is the ability to compile Rust code into webassembly, enabling performance and sharing of code with the backend. Translating code to Rust enables new ways of deployment and running code in the browser has especial benefits for science - researchers do not have deep pockets to run servers, so pushing compute to the user enables deployment that otherwise would be impossible
@@ -27,10 +22,13 @@ but more specifically:
 
 But:
 
-* **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back to the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
+* **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back into the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
 * Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
 * **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
 * **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
+* **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
+
+This blurb might be out of date. Go to [this page](https://github.com/henriksson-lab/rustification) for the latest information and further information about how we approach translation
 
 
 
@@ -83,7 +81,7 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 | Filters | Deflate, shuffle, fletcher32, LZF, NBit, ScaleOffset, optional Blosc | SZip, unknown filters |
 | Datatypes | Primitive numeric types, enum metadata, fixed/vlen strings, compound metadata, primitive compound field reads, raw compound member extraction, recursive compound field values for nested compound/array/vlen/reference members | Full HDF5 datatype conversion parity |
 | Groups and links | v1 symbol tables, v2 link messages, dense link/attribute storage, filtered direct fractal heap reads, filtered and unfiltered huge direct/indirect fractal heap reads, soft/external links | Full coverage of every HDF5 index/storage variant |
-| Writing | v2 superblock, groups, datasets, attributes, compact/contiguous/chunked storage, deflate/shuffle, soft/external links, limited `MutableFile::write_chunk` append/replace/rebuild for v1 chunk B-trees, and replacement of existing v4 fixed-array chunks | General-purpose HDF5 writer parity with the C library |
+| Writing | v2 superblock, compact/contiguous/chunked primitive numeric datasets, compact fixed-string and flat compound datasets, explicit fill-value messages, compact attributes, deflate/shuffle chunk filters, soft/external links, limited `MutableFile::resize_dataset`, v1 chunk B-tree append/replace/rebuild, filtered chunk replacement, and existing v4 fixed-array chunk replacement | Dense writer storage, variable-length writer allocation, modern chunk-index creation beyond v1 B-tree, free-space reuse, and general-purpose HDF5 writer parity with the C library |
 
 **Reading:**
 - Superblock v0-v3
@@ -104,15 +102,19 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 **Writing:**
 - v2 superblock with Jenkins lookup3 checksums
-- Groups, nested groups, datasets, attributes
-- Contiguous, compact, and chunked storage
-- Deflate and shuffle compression
+- Compact groups and nested groups
+- Primitive numeric datasets in contiguous, compact, and chunked storage
+- Compact fixed-length string and flat compound datasets
+- Explicit dataset fill-value messages with raw allocation-time and fill-time properties
+- Compact primitive numeric attributes
+- Deflate and shuffle compression for chunked datasets
 - Soft and external links
+- New chunked datasets use v1 B-tree chunk indexes. `MutableFile::open_rw()` supports limited in-place dataset resizing, v1 chunk B-tree append/replace/rebuild, filtered chunk replacement, and replacement of existing v4 fixed-array chunks. Creating new fixed-array or extensible-array chunk indexes is not implemented.
+- Writes append new metadata/raw data and do not implement libhdf5 free-space manager reuse.
 - Verified readable by h5dump and h5py
 
 **Other:**
 - `#[derive(H5Type)]` for user-defined structs and enums
-- `MutableFile::open_rw()` for limited in-place dataset resizing, v1 chunk B-tree append/replace/rebuild, and existing v4 fixed-array chunk replacement.
 - Property list queries (`ds.create_plist()`)
 - Most checked-in C-library reference files parse successfully; the exact count is enforced by tests rather than treated as a general compatibility guarantee.
 - Zero panics on corrupt/malformed files (CVE regression tested)
@@ -150,12 +152,12 @@ struct Measurement {
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `derive` | yes | `#[derive(H5Type)]` proc macro |
-| `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs) |
+| `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs). Manually verified with `cargo test --features blosc blosc`. |
 | `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. See `analysis/tracehash_divergence.md`. |
 
 ## Test Suite
 
-294 tests covering:
+The checked test count changes frequently; use `cargo test -- --list` for the current number. Coverage includes:
 - Selected C library reference files and generated fixtures
 - All primitive types, compound, enum, strings
 - All storage layouts and filter combinations

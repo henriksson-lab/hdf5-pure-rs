@@ -1,9 +1,12 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
+use crate::format::checksum::checksum_metadata;
 use crate::io::reader::{is_undef_addr, HdfReader, UNDEF_ADDR};
 
 use super::fixed_array::FixedArrayElement;
+
+const MAX_EXTENSIBLE_ARRAY_ELEMENTS: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 struct ExtensibleArrayHeader {
@@ -80,9 +83,15 @@ fn read_header<R: Read + Seek>(
     let _data_block_count = reader.read_length()?;
     let _data_block_size = reader.read_length()?;
     let max_index_set = reader.read_length()?;
+    let max_index_count = usize_from_u64(max_index_set, "extensible array max index")?;
+    if max_index_count > MAX_EXTENSIBLE_ARRAY_ELEMENTS {
+        return Err(Error::InvalidFormat(format!(
+            "extensible array max index {max_index_count} exceeds supported maximum {MAX_EXTENSIBLE_ARRAY_ELEMENTS}"
+        )));
+    }
     let _realized_elements = reader.read_length()?;
     let index_block_addr = reader.read_addr()?;
-    let _checksum = reader.read_u32()?;
+    verify_checksum(reader, addr, "extensible array header")?;
 
     let array_offset_size = max_elements_bits.div_ceil(8);
     let data_block_page_elements = 1usize
@@ -119,6 +128,27 @@ fn read_header<R: Read + Seek>(
         index_block_super_block_addrs,
         super_block_info,
     })
+}
+
+fn verify_checksum<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    start: u64,
+    context: &str,
+) -> Result<()> {
+    let checksum_pos = reader.position()?;
+    let stored_checksum = reader.read_u32()?;
+    let check_len = usize::try_from(checksum_pos - start)
+        .map_err(|_| Error::InvalidFormat(format!("{context} checksum span is too large")))?;
+    reader.seek(start)?;
+    let check_data = reader.read_bytes(check_len)?;
+    let computed = checksum_metadata(&check_data);
+    if stored_checksum != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
+        )));
+    }
+    reader.seek(checksum_pos + 4)?;
+    Ok(())
 }
 
 fn read_index_block<R: Read + Seek>(
@@ -169,7 +199,8 @@ fn read_index_block<R: Read + Seek>(
         )));
     }
 
-    let mut elements = Vec::with_capacity(header.max_index_set as usize);
+    let max_index_count = usize_from_u64(header.max_index_set, "extensible array max index")?;
+    let mut elements = Vec::with_capacity(max_index_count);
     for idx in 0..header.index_block_elements {
         let element = read_element(reader, filtered, chunk_size_len)?;
         if (idx as u64) < header.max_index_set {
@@ -229,7 +260,10 @@ fn read_spillover_blocks<R: Read + Seek>(
                         "extensible array data block address index out of bounds".into(),
                     ));
                 };
-                let remaining = (header.max_index_set - elements.len() as u64) as usize;
+                let remaining = usize_from_u64(
+                    header.max_index_set - elements.len() as u64,
+                    "extensible array remaining element count",
+                )?;
                 let count = info.data_block_elements.min(remaining);
                 append_data_block_elements(
                     reader,
@@ -283,7 +317,7 @@ fn read_super_block<R: Read + Seek>(
             header,
             info.data_blocks * info.data_block_elements,
             elements,
-        );
+        )?;
         return Ok(());
     }
 
@@ -340,7 +374,10 @@ fn read_super_block<R: Read + Seek>(
         if elements.len() as u64 >= header.max_index_set {
             break;
         }
-        let remaining = (header.max_index_set - elements.len() as u64) as usize;
+        let remaining = usize_from_u64(
+            header.max_index_set - elements.len() as u64,
+            "extensible array remaining element count",
+        )?;
         let count = info.data_block_elements.min(remaining);
         let page_init_for_block = if page_init_size > 0 {
             Some(
@@ -384,7 +421,7 @@ fn append_data_block_elements<R: Read + Seek>(
         return Ok(());
     }
     if is_undef_addr(data_block_addr) {
-        append_fill_elements(header, count, elements);
+        append_fill_elements(header, count, elements)?;
         return Ok(());
     }
 
@@ -448,7 +485,7 @@ fn append_data_block_elements<R: Read + Seek>(
                     elements.push(read_element(reader, filtered, chunk_size_len)?);
                 }
             } else {
-                append_fill_elements(header, page_elements, elements);
+                append_fill_elements(header, page_elements, elements)?;
             }
             remaining -= page_elements;
         }
@@ -484,8 +521,9 @@ fn append_fill_elements(
     header: &ExtensibleArrayHeader,
     count: usize,
     elements: &mut Vec<FixedArrayElement>,
-) {
-    let remaining = (header.max_index_set as usize).saturating_sub(elements.len());
+) -> Result<()> {
+    let remaining = usize_from_u64(header.max_index_set, "extensible array max index")?
+        .saturating_sub(elements.len());
     for _ in 0..count.min(remaining) {
         elements.push(FixedArrayElement {
             addr: UNDEF_ADDR,
@@ -493,6 +531,7 @@ fn append_fill_elements(
             filter_mask: 0,
         });
     }
+    Ok(())
 }
 
 fn build_super_block_info(
@@ -558,4 +597,9 @@ fn log2_power2(value: u64) -> Result<usize> {
         )));
     }
     Ok(value.trailing_zeros() as usize)
+}
+
+fn usize_from_u64(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
 }

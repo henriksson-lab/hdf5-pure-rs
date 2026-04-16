@@ -19,3 +19,22 @@ pub fn decompress(_data: &[u8]) -> Result<Vec<u8>> {
             .into(),
     ))
 }
+
+#[cfg(all(test, feature = "blosc"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blosc_feature_decompresses_blosc2_frame() {
+        let data = (0..128u32)
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let params = blosc2_pure_rs::compress::CParams {
+            typesize: 4,
+            ..Default::default()
+        };
+        let compressed = blosc2_pure_rs::compress::compress(&data, &params).unwrap();
+        let decoded = decompress(&compressed).unwrap();
+        assert_eq!(decoded, data);
+    }
+}

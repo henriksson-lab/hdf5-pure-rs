@@ -3,7 +3,38 @@
 
 use std::path::PathBuf;
 
+use hdf5_pure_rust::hl::types::{FieldDescriptor, H5Type, TypeClass};
 use hdf5_pure_rust::{File, MutableFile, WritableFile};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Point {
+    x: f64,
+    label: i32,
+}
+
+unsafe impl H5Type for Point {
+    fn type_size() -> usize {
+        std::mem::size_of::<Point>()
+    }
+
+    fn compound_fields() -> Option<Vec<FieldDescriptor>> {
+        Some(vec![
+            FieldDescriptor {
+                name: "x".to_string(),
+                offset: std::mem::offset_of!(Point, x),
+                size: std::mem::size_of::<f64>(),
+                type_class: TypeClass::Float,
+            },
+            FieldDescriptor {
+                name: "label".to_string(),
+                offset: std::mem::offset_of!(Point, label),
+                size: std::mem::size_of::<i32>(),
+                type_class: TypeClass::Integer { signed: true },
+            },
+        ])
+    }
+}
 
 fn tmp(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -102,6 +133,61 @@ fn t10b_h5py_verify() {
             "import h5py; f=h5py.File('{}','r'); \
              assert list(f['values'][:])==[1.5,2.5,3.5]; \
              assert f.attrs['version']==1; \
+             print('OK'); f.close()",
+            p.display()
+        ))
+        .output();
+    if let Ok(out) = out {
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn t10b_h5py_verify_fill_string_and_compound() {
+    let (_dir, p) = tmp("h5py_new_writer_features");
+    {
+        let mut wf = WritableFile::create(&p).unwrap();
+        wf.new_dataset_builder("filled")
+            .fill_properties(1, 2)
+            .fill_value::<i32>(-7)
+            .write::<i32>(&[1, 2, 3])
+            .unwrap();
+        wf.new_dataset_builder("names")
+            .compact()
+            .write_fixed_ascii_strings(&["red", "green"], 8)
+            .unwrap();
+        wf.new_dataset_builder("points")
+            .compact()
+            .write::<Point>(&[Point { x: 1.5, label: 10 }, Point { x: 2.5, label: 20 }])
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let dump = std::process::Command::new("h5dump").arg(&p).output();
+    if let Ok(out) = dump {
+        assert!(
+            out.status.success(),
+            "h5dump: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("red"));
+        assert!(s.contains("green"));
+    }
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import h5py; f=h5py.File('{}','r'); \
+             assert list(f['filled'][:])==[1,2,3]; \
+             assert [x.decode().rstrip('\\x00') for x in f['names'][:]]==['red','green']; \
+             assert list(f['points']['label'])==[10,20]; \
+             assert list(f['points']['x'])==[1.5,2.5]; \
              print('OK'); f.close()",
             p.display()
         ))

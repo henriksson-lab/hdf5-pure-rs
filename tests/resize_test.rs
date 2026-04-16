@@ -101,6 +101,64 @@ fn test_resize_then_write_appended_chunk() {
 }
 
 #[test]
+fn test_resize_shrink_hides_removed_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_shrink_hides_chunks.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[15])
+            .chunk(&[5])
+            .resizable()
+            .write::<i32>(&(0..15).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[6]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4, 5]);
+    }
+}
+
+#[test]
+fn test_resize_grow_uses_chunked_fill_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_grow_fill.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[5])
+            .chunk(&[5])
+            .resizable()
+            .fill_properties(1, 2)
+            .fill_value::<i32>(-7)
+            .write::<i32>(&(0..5).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[10]).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4, -7, -7, -7, -7, -7]);
+    }
+}
+
+#[test]
 fn test_write_chunk_replaces_existing_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replace_chunk.h5");
@@ -207,6 +265,133 @@ fn test_write_chunk_replaces_existing_v4_fixed_array_chunk() {
         let vals: Vec<i32> = f.dataset("fixed_array").unwrap().read::<i32>().unwrap();
         let mut expected: Vec<i32> = (0..100).collect();
         expected[..10].copy_from_slice(&(1000..1010).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+}
+
+#[test]
+fn test_resize_then_write_appended_v4_btree2_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("append_v4_btree2.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_btree2_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("btree_v2", &[12, 8]).unwrap();
+        let chunk: Vec<i32> = (64..80).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("btree_v2", &[8, 0], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("btree_v2").unwrap().read::<i32>().unwrap();
+        assert_eq!(vals.len(), 96);
+        assert_eq!(&vals[..64], &(0..64).collect::<Vec<_>>());
+        assert_eq!(&vals[64..68], &[64, 65, 66, 67]);
+        assert_eq!(&vals[72..76], &[68, 69, 70, 71]);
+        assert_eq!(&vals[80..84], &[72, 73, 74, 75]);
+        assert_eq!(&vals[88..92], &[76, 77, 78, 79]);
+        for idx in (68..72).chain(76..80).chain(84..88).chain(92..96) {
+            assert_eq!(vals[idx], 0);
+        }
+    }
+
+    let out = std::process::Command::new("h5dump")
+        .arg("-H")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -H failed on appended v2 B-tree file: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_resize_then_write_appended_v4_extensible_array_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("append_v4_extensible_array.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_extensible_array_chunks.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("extensible_array", &[100]).unwrap();
+        let chunk: Vec<f64> = (80..100).map(|value| value as f64).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f64>(),
+            )
+        };
+        mf.write_chunk("extensible_array", &[80], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<f64> = f
+            .dataset("extensible_array")
+            .unwrap()
+            .read::<f64>()
+            .unwrap();
+        let expected: Vec<f64> = (0..100).map(|value| value as f64).collect();
+        assert_eq!(vals, expected);
+    }
+
+    let out = std::process::Command::new("h5dump")
+        .arg("-H")
+        .arg(&path)
+        .output();
+    if let Ok(out) = out {
+        assert!(
+            out.status.success(),
+            "h5dump -H failed on appended extensible-array file: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_write_chunk_replaces_filtered_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_filtered_chunk.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[20])
+            .chunk(&[5])
+            .shuffle()
+            .deflate(4)
+            .write::<i32>(&(0..20).collect::<Vec<_>>())
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (1000..1005).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        mf.write_chunk("data", &[5], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
+        let mut expected: Vec<i32> = (0..20).collect();
+        expected[5..10].copy_from_slice(&(1000..1005).collect::<Vec<_>>());
         assert_eq!(vals, expected);
     }
 }

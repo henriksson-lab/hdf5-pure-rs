@@ -1,4 +1,5 @@
 pub mod attribute;
+pub(crate) mod conversion;
 pub mod dataset;
 pub mod dataset_builder;
 pub mod dataspace;

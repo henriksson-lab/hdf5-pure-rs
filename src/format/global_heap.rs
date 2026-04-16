@@ -5,6 +5,7 @@ use crate::io::reader::HdfReader;
 
 /// Global heap collection magic: "GCOL"
 const GCOL_MAGIC: [u8; 4] = [b'G', b'C', b'O', b'L'];
+const MAX_GLOBAL_HEAP_OBJECT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// A global heap object reference (collection address + object index).
 #[derive(Debug, Clone)]
@@ -42,32 +43,50 @@ impl GlobalHeapCollection {
         // Collection size (includes header)
         let collection_size = reader.read_length()?;
 
-        let mut objects = Vec::new();
+        let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
         let _header_size = 8 + reader.sizeof_size() as u64; // magic + ver + reserved + size
-        let data_end = addr + collection_size;
+        let data_end = addr
+            .checked_add(collection_size)
+            .ok_or_else(|| Error::InvalidFormat("global heap collection size overflow".into()))?;
 
         while reader.position()? < data_end {
             let pos = reader.position()?;
-            if pos + 8 > data_end {
+            if pos + 16 > data_end {
                 break;
             }
 
             let index = reader.read_u16()? as u32;
             if index == 0 {
-                // Object index 0 = free space marker, end of collection
+                // Object index 0 marks free space/end of the collection.
                 break;
             }
-
             let _reference_count = reader.read_u16()?;
             // Reserved (4 bytes)
             reader.skip(4)?;
             let obj_size = reader.read_length()?;
+            let obj_len = heap_object_len(obj_size, "global heap object size")?;
+            let padded = obj_size
+                .checked_add(7)
+                .map(|size| size & !7)
+                .ok_or_else(|| Error::InvalidFormat("global heap object size overflow".into()))?;
+            let next_pos = reader
+                .position()?
+                .checked_add(padded)
+                .ok_or_else(|| Error::InvalidFormat("global heap object offset overflow".into()))?;
+            if next_pos > data_end {
+                return Err(Error::InvalidFormat(
+                    "global heap object exceeds collection bounds".into(),
+                ));
+            }
 
-            let data = reader.read_bytes(obj_size as usize)?;
+            if index == 0 {
+                reader.skip(padded)?;
+                continue;
+            }
+            let data = reader.read_bytes(obj_len)?;
             objects.push((index, data));
 
             // Pad to 8-byte boundary
-            let padded = (obj_size + 7) & !7;
             let padding = padded - obj_size;
             if padding > 0 {
                 reader.skip(padding)?;
@@ -86,13 +105,24 @@ impl GlobalHeapCollection {
     }
 }
 
+fn heap_object_len(value: u64, context: &str) -> Result<usize> {
+    let len = usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))?;
+    if len > MAX_GLOBAL_HEAP_OBJECT_BYTES {
+        return Err(Error::InvalidFormat(format!(
+            "{context} {len} exceeds supported maximum {MAX_GLOBAL_HEAP_OBJECT_BYTES}"
+        )));
+    }
+    Ok(len)
+}
+
 /// Read a global heap object by its reference.
 pub fn read_global_heap_object<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     gh_ref: &GlobalHeapRef,
 ) -> Result<Vec<u8>> {
     let collection = GlobalHeapCollection::read_at(reader, gh_ref.collection_addr)?;
-    collection
+    let data = collection
         .get_object(gh_ref.object_index)
         .map(|d| d.to_vec())
         .ok_or_else(|| {
@@ -100,5 +130,21 @@ pub fn read_global_heap_object<R: Read + Seek>(
                 "global heap object {} not found in collection at {:#x}",
                 gh_ref.object_index, gh_ref.collection_addr
             ))
-        })
+        })?;
+    trace_global_heap_deref(gh_ref, &data);
+    Ok(data)
 }
+
+#[cfg(feature = "tracehash")]
+fn trace_global_heap_deref(gh_ref: &GlobalHeapRef, data: &[u8]) {
+    let mut th = tracehash::th_call!("hdf5.global_heap.deref");
+    th.input_u64(gh_ref.collection_addr);
+    th.input_u64(gh_ref.object_index as u64);
+    th.output_bool(true);
+    th.output_u64(data.len() as u64);
+    th.output_bytes(data);
+    th.finish();
+}
+
+#[cfg(not(feature = "tracehash"))]
+fn trace_global_heap_deref(_gh_ref: &GlobalHeapRef, _data: &[u8]) {}

@@ -17,6 +17,8 @@ pub fn unshuffle(data: &[u8], element_size: usize) -> Result<Vec<u8>> {
             out[i * element_size + j] = data[j * n_elements + i];
         }
     }
+    let grouped = n_elements * element_size;
+    out[grouped..].copy_from_slice(&data[grouped..]);
 
     Ok(out)
 }
@@ -35,6 +37,8 @@ pub fn shuffle(data: &[u8], element_size: usize) -> Result<Vec<u8>> {
             out[j * n_elements + i] = data[i * element_size + j];
         }
     }
+    let grouped = n_elements * element_size;
+    out[grouped..].copy_from_slice(&data[grouped..]);
 
     Ok(out)
 }
@@ -46,6 +50,14 @@ mod tests {
     #[test]
     fn test_shuffle_roundtrip() {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8]; // 2 elements of 4 bytes each
+        let shuffled = shuffle(&data, 4).unwrap();
+        let unshuffled = unshuffle(&shuffled, 4).unwrap();
+        assert_eq!(unshuffled, data);
+    }
+
+    #[test]
+    fn test_shuffle_roundtrip_preserves_trailing_bytes() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let shuffled = shuffle(&data, 4).unwrap();
         let unshuffled = unshuffle(&shuffled, 4).unwrap();
         assert_eq!(unshuffled, data);

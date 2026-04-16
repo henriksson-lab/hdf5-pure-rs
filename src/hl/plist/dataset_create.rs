@@ -7,6 +7,8 @@ pub struct DatasetCreate {
     pub layout: LayoutClass,
     pub chunk_dims: Option<Vec<u64>>,
     pub filters: Vec<FilterInfo>,
+    pub fill_alloc_time: Option<u8>,
+    pub fill_time: Option<u8>,
     pub fill_value_defined: bool,
     pub fill_value: Option<Vec<u8>>,
 }
@@ -55,6 +57,8 @@ impl DatasetCreate {
             layout: info.layout.layout_class,
             chunk_dims: info.layout.chunk_dims,
             filters,
+            fill_alloc_time: info.fill_value.as_ref().map(|fill| fill.alloc_time),
+            fill_time: info.fill_value.as_ref().map(|fill| fill.fill_time),
             fill_value_defined: info
                 .fill_value
                 .as_ref()

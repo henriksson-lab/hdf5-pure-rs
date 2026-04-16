@@ -1,5 +1,8 @@
 use crate::error::{Error, Result};
 
+const MAX_FILTERS: usize = 32;
+const MAX_FILTER_CLIENT_VALUES: usize = 1024;
+
 /// Filter IDs.
 pub const FILTER_DEFLATE: u16 = 1;
 pub const FILTER_SHUFFLE: u16 = 2;
@@ -34,11 +37,16 @@ impl FilterPipelineMessage {
 
         let version = data[0];
         let nfilters = data[1] as usize;
+        if nfilters > MAX_FILTERS {
+            return Err(Error::InvalidFormat(format!(
+                "filter pipeline has too many filters: {nfilters}"
+            )));
+        }
 
         let result = match version {
             1 => Self::decode_v1(data, nfilters),
             2 => Self::decode_v2(data, nfilters),
-            _ => Err(Error::Unsupported(format!(
+            _ => Err(Error::InvalidFormat(format!(
                 "filter pipeline version {version}"
             ))),
         };
@@ -68,6 +76,11 @@ impl FilterPipelineMessage {
             let flags = read_u16_le(data, &mut pos, "filter pipeline v1 flags")?;
             let cd_nelmts =
                 read_u16_le(data, &mut pos, "filter pipeline v1 client data count")? as usize;
+            if cd_nelmts > MAX_FILTER_CLIENT_VALUES {
+                return Err(Error::InvalidFormat(format!(
+                    "filter pipeline v1 client data count {cd_nelmts} exceeds supported maximum {MAX_FILTER_CLIENT_VALUES}"
+                )));
+            }
 
             // Name (null-terminated, padded to 8-byte boundary)
             let name = if name_len > 0 {
@@ -145,6 +158,11 @@ impl FilterPipelineMessage {
             let flags = read_u16_le(data, &mut pos, "filter pipeline v2 flags")?;
             let cd_nelmts =
                 read_u16_le(data, &mut pos, "filter pipeline v2 client data count")? as usize;
+            if cd_nelmts > MAX_FILTER_CLIENT_VALUES {
+                return Err(Error::InvalidFormat(format!(
+                    "filter pipeline v2 client data count {cd_nelmts} exceeds supported maximum {MAX_FILTER_CLIENT_VALUES}"
+                )));
+            }
 
             let mut client_data = Vec::with_capacity(cd_nelmts);
             for _ in 0..cd_nelmts {

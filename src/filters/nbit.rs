@@ -359,3 +359,42 @@ impl<'a> BitStream<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn atomic_params(precision: u32, offset: u32) -> Vec<u32> {
+        vec![8, 0, 1, NBIT_ATOMIC, 2, NBIT_ORDER_LE, precision, offset]
+    }
+
+    #[test]
+    fn rejects_zero_precision() {
+        let err = decompress(&[], &atomic_params(0, 0)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid nbit datatype precision/offset"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_precision_larger_than_datatype() {
+        let err = decompress(&[], &atomic_params(17, 0)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid nbit datatype precision/offset"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_precision_plus_offset_larger_than_datatype() {
+        let err = decompress(&[], &atomic_params(12, 8)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid nbit datatype precision/offset"),
+            "unexpected error: {err}"
+        );
+    }
+}
