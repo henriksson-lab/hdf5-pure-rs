@@ -658,13 +658,13 @@ impl FractalHeapHeader {
         th.input_u64(block_addr);
         th.input_u64(block_offset);
         th.input_u64(object_len);
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(block_addr);
         th.output_u64(block_size);
         th.output_u64(block_offset);
         th.output_u64(object_len);
         th.output_u64(0);
-        th.output_bool(filtered);
+        th.output_value(&(filtered));
         th.finish();
     }
 
@@ -693,12 +693,12 @@ impl FractalHeapHeader {
         let mut th = tracehash::th_call!("hdf5.fractal_heap.huge_object");
         th.input_u64(self.heap_addr);
         th.input_bytes(heap_id);
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(addr);
         th.output_u64(stored_len);
         th.output_u64(object_len);
         th.output_u64(filter_mask as u64);
-        th.output_bool(filtered);
+        th.output_value(&(filtered));
         th.finish();
     }
 
@@ -719,7 +719,7 @@ impl FractalHeapHeader {
         let mut th = tracehash::th_call!("hdf5.fractal_heap.tiny_object");
         th.input_u64(self.heap_addr);
         th.input_bytes(heap_id);
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(object_len);
         th.finish();
     }

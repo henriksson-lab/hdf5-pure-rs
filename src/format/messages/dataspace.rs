@@ -101,6 +101,15 @@ impl DataspaceMessage {
             }
         };
 
+        // Scalar and Null dataspaces have no dimensions; a non-zero rank is
+        // a corrupted message (matches `H5O__sdspace_decode`'s "invalid rank
+        // for scalar or NULL dataspace" check).
+        if matches!(space_type, DataspaceType::Scalar | DataspaceType::Null) && ndims != 0 {
+            return Err(Error::InvalidFormat(format!(
+                "dataspace type {space_type:?} has rank {ndims}, expected 0"
+            )));
+        }
+
         let has_max = flags & 0x01 != 0;
         let mut pos = 4;
 
@@ -132,7 +141,7 @@ impl DataspaceMessage {
 fn trace_dataspace_extent(data: &[u8], flags: u8, message: &DataspaceMessage) {
     let mut th = tracehash::th_call!("hdf5.dataspace.extent");
     th.input_bytes(data);
-    th.output_bool(true);
+    th.output_value(&(true));
     th.output_u64(message.version as u64);
     th.output_u64(message.ndims as u64);
     th.output_u64(flags as u64);
@@ -145,7 +154,7 @@ fn trace_dataspace_extent(data: &[u8], flags: u8, message: &DataspaceMessage) {
     for &dim in &message.dims {
         th.output_u64(dim);
     }
-    th.output_bool(message.max_dims.is_some());
+    th.output_value(&(message.max_dims.is_some()));
     if let Some(max_dims) = &message.max_dims {
         th.output_u64(max_dims.len() as u64);
         for &dim in max_dims {

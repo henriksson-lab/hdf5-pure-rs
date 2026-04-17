@@ -40,6 +40,9 @@ pub struct File {
 
 impl File {
     const MAX_SOFT_LINK_TRAVERSALS: usize = 40;
+    /// Per-component byte cap, matching upstream `H5G_TRAVERSE_PATH_MAX`.
+    /// Bounds the length of any single name segment between '/' separators.
+    const MAX_PATH_COMPONENT_LEN: usize = 1024;
 
     /// Open an HDF5 file for reading.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -138,6 +141,15 @@ impl File {
                 .filter(|part| !part.is_empty())
                 .map(str::to_string)
                 .collect();
+            for part in &parts {
+                if part.len() > Self::MAX_PATH_COMPONENT_LEN {
+                    return Err(Error::InvalidFormat(format!(
+                        "path component exceeds {}-byte limit ({} bytes)",
+                        Self::MAX_PATH_COMPONENT_LEN,
+                        part.len()
+                    )));
+                }
+            }
             let mut current = self.root_group()?;
             let mut current_path = String::from("/");
 

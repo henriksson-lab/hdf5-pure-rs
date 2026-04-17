@@ -9,8 +9,11 @@ before committing the HDF5 faithfulness work.
 - `analysis/`: documents unsupported features, tracehash parity work, and this
   audit.
 - `scripts/`: contains tracehash runners and C-library fixture generation.
-- `tools/tracehash/`: vendored local tracehash crate used by the optional
-  `tracehash` feature.
+- `tools/tracehash/`: optional local checkout of the
+  [`tracehash-rs`](https://crates.io/crates/tracehash-rs) crate, gitignored.
+  The Rust-side `tracehash` feature pulls the library from crates.io; this
+  local checkout is only needed when building the patched libhdf5 C-side
+  probes, which `#include "../../tools/tracehash/c/tracehash_c.h"`.
 - `hdf5/`: vendored HDF5 C source used for source-level comparison, patched-C
   tracehash probe target selection, and fixture-generation parity checks. The
   exact source revision is recorded in `hdf5-source.json`.

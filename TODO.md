@@ -283,6 +283,15 @@
 ### Tracehash Divergence Tracking
 - [x] Document the vendored tracehash path: `tools/tracehash`.
 - [x] Add an optional `tracehash` feature for Rust-side probes without enabling it in normal builds.
+- [x] Switch the Rust-side `tracehash` dependency to the published
+  [`tracehash-rs`](https://crates.io/crates/tracehash-rs) 0.1 crate
+  (`package = "tracehash-rs"` rename so call sites keep importing
+  `tracehash::...`). Updated `output_bool`/`output_bytes` call sites to
+  the new `output_value(&T)` API since the published crate dropped the
+  explicit helpers in favor of the generic `TraceHash`-based path.
+  `scripts/tracehash-compare.sh` now prefers a `tracehash-compare`
+  binary on `$PATH` (installed via `cargo install tracehash-rs`) and
+  falls back to `cargo run --package tracehash-rs`.
 - [x] Instrument Rust-side probes for datatype message decode (`DatatypeMessage::decode`).
 - [x] Instrument Rust-side probes for object header message decode (`ObjectHeader::read_at`).
 - [x] Instrument Rust-side probes for data layout and filter pipeline decode.
@@ -294,3 +303,73 @@
 - [x] Document C-side probe targets for chunk index resolution: v1 B-tree, v2 B-tree, fixed array, extensible array, and single chunk.
 - [x] Document C-side probe targets for fractal heap object lookup and dense link/attribute traversal.
 - [x] Defer representative divergence reports until a patched HDF5 C build emits `/tmp/c.tsv`.
+
+## Concerns from ccc-rs cross-language scan (2026-04-17)
+
+Scanned with `ccc-rs compare` and `ccc-rs constants-diff` against
+`hdf5/src` using the project's `map.toml`. After clearing false positives
+(named constants, optimization unrolling, tracehash gates, scratch-pad
+layout literals, and an analyzer hex-parse bug since fixed upstream),
+three items remain:
+
+- [x] `format/btree_v2.rs::BTreeV2Header::read_at` now rejects
+  `split_pct > 100`, `merge_pct > 100`, and `merge_pct >= split_pct` with
+  `InvalidFormat` (matching upstream `H5B2__hdr_init`). Covered by four
+  tests in `tests/robustness_test.rs`.
+- [x] `hl/file.rs::resolve_path` enforces a 1024-byte per-component cap
+  (`MAX_PATH_COMPONENT_LEN`, matching `H5G_TRAVERSE_PATH_MAX`). Covered by
+  two tests in `tests/group_test.rs`.
+- [x] `engine/writer.rs::build_v2_object_header` dead `8`/`_` match arms
+  removed; `chunk0_bytes` is now `match`ed exhaustively over the only
+  values it can take (1, 2, 4) with a single `unreachable!()` fallback.
+- [x] `format/messages/datatype.rs::DatatypeMessage::decode` now validates
+  FixedPoint and BitField `bit_offset` and `precision` against the byte
+  size: rejects `precision == 0`, `bit_offset > size*8`, and
+  `bit_offset + precision > size*8`, matching upstream
+  `H5O__dtype_decode_helper`. Six tests in `tests/robustness_test.rs`
+  cover the rejection paths and the canonical-width acceptance paths.
+  This validation also caught six pre-existing fixtures in
+  `tests/robustness_test.rs` whose `precision` bytes were encoded
+  big-endian instead of little-endian per spec; those have been
+  corrected.
+- [x] `format/messages/datatype.rs::DatatypeMessage::decode` now validates
+  FloatingPoint properties: rejects `precision == 0`, `exp_size == 0`,
+  `mant_size == 0`, sign bit position outside precision, and
+  exp/mantissa location+size overflowing precision. Six tests cover the
+  rejection paths plus a canonical IEEE-754 binary32 acceptance test.
+- [x] `format/messages/filter_pipeline.rs` v1 decoder now rejects
+  filter `name_length` values that are not a multiple of eight, matching
+  upstream `H5O__pline_decode`. Covered by one focused test in
+  `tests/robustness_test.rs`.
+- [x] `format/object_header.rs::read_v1` now cross-checks the declared
+  `num_messages` field against the actual decoded count: a v1 object
+  header that decodes more non-NIL/non-continuation messages than its
+  prefix declares is rejected. Per spec the stored count is an upper
+  bound, so the check is `decoded ≤ declared`.
+- [x] `format/messages/dataspace.rs::decode_v2` now rejects Scalar and
+  Null dataspaces with a non-zero rank, matching upstream
+  `H5O__sdspace_decode`'s "invalid rank for scalar or NULL dataspace"
+  check. Three tests cover the rejection paths and the canonical
+  scalar acceptance path.
+- [x] `format/messages/attribute.rs` (v1/v2/v3) now rejects messages
+  with `name_size == 0`, matching upstream `H5O__attr_decode`. Covered
+  by one test.
+- [x] `format/messages/data_layout.rs` (v1/v2/v3/v4) now rejects chunk
+  layouts with any chunk dimension equal to zero (matches
+  `H5O__layout_decode`'s "chunk dimension must be positive"). Covered
+  by one focused v3 test.
+
+Cleared on inspection (recorded so a future scan doesn't re-flag them):
+
+- `format/checksum.rs::fletcher32` — `360` batch size is present (line 47);
+  the prior diff was an analyzer artifact, since fixed in ccc-rs.
+- `format/superblock.rs::read_v0_v1` — literal `32`/`16`/`16`/`16` are
+  `HDF5_BTREE_CHUNK_IK_DEF` and the spec-fixed scratch-pad size.
+- `format/btree_v2.rs::read_internal_records` — literals `10` and `11` are
+  the chunk-no-filter / chunk-with-filter B-tree types used to gate the
+  `tracehash` probe; not magic numbers.
+- `format/symbol_table.rs::read_entry` — literal `16`/`12` are the
+  spec-fixed `H5G_SIZEOF_SCRATCH = 16` scratch-pad and its remainder for
+  `cache_type==2`.
+- `filters/shuffle.rs` — does not unroll per-element-size like
+  `H5Z__filter_shuffle`; performance trade-off, not correctness.

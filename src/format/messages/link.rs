@@ -171,9 +171,9 @@ fn trace_external_link_resolve(filename: &str, obj_path: &str) {
     let mut th = tracehash::th_call!("hdf5.external_link.resolve");
     th.input_bytes(filename.as_bytes());
     th.input_bytes(obj_path.as_bytes());
-    th.output_bool(true);
-    th.output_bytes(filename.as_bytes());
-    th.output_bytes(obj_path.as_bytes());
+    th.output_value(&(true));
+    th.output_value(filename.as_bytes());
+    th.output_value(obj_path.as_bytes());
     th.finish();
 }
 

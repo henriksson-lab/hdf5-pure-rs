@@ -153,7 +153,7 @@ struct Measurement {
 |---------|---------|-------------|
 | `derive` | yes | `#[derive(H5Type)]` proc macro |
 | `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs). Manually verified with `cargo test --features blosc blosc`. |
-| `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. Requires an external `tracehash` checkout at `tools/tracehash` or a local manifest patch; it is not needed for normal builds. See `analysis/tracehash_divergence.md`. |
+| `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. Pulls [`tracehash-rs`](https://crates.io/crates/tracehash-rs) from crates.io. The C-side helpers (`tracehash_c.c`, `tracehash_c.h`) used by a patched libhdf5 build live under `tools/tracehash/c/` and are shipped alongside the crate. Not needed for normal builds. See `analysis/tracehash_divergence.md`. |
 
 ## Test Suite
 

@@ -36,6 +36,11 @@ impl AttributeMessage {
         let name_size = u16::from_le_bytes([raw[2], raw[3]]) as usize;
         let dt_size = u16::from_le_bytes([raw[4], raw[5]]) as usize;
         let ds_size = u16::from_le_bytes([raw[6], raw[7]]) as usize;
+        if name_size == 0 {
+            return Err(Error::InvalidFormat(
+                "attribute message name length is zero".into(),
+            ));
+        }
         let mut pos = 8;
 
         // Name (null-padded to 8-byte boundary)
@@ -81,6 +86,11 @@ impl AttributeMessage {
         let name_size = u16::from_le_bytes([raw[2], raw[3]]) as usize;
         let dt_size = u16::from_le_bytes([raw[4], raw[5]]) as usize;
         let ds_size = u16::from_le_bytes([raw[6], raw[7]]) as usize;
+        if name_size == 0 {
+            return Err(Error::InvalidFormat(
+                "attribute message name length is zero".into(),
+            ));
+        }
         let mut pos = 8;
 
         // Name (NOT padded in v2)
@@ -121,6 +131,11 @@ impl AttributeMessage {
         let dt_size = u16::from_le_bytes([raw[4], raw[5]]) as usize;
         let ds_size = u16::from_le_bytes([raw[6], raw[7]]) as usize;
         let _encoding = raw[8]; // character encoding: 0=ASCII, 1=UTF-8
+        if name_size == 0 {
+            return Err(Error::InvalidFormat(
+                "attribute message name length is zero".into(),
+            ));
+        }
         let mut pos = 9;
 
         ensure_available(raw, pos, name_size, "attribute v3 name")?;

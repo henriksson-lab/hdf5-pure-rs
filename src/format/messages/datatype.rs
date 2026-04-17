@@ -130,6 +130,89 @@ impl DatatypeMessage {
             _ => {}
         }
 
+        // Validate FixedPoint / BitField bit_offset and precision against
+        // the byte size, matching the upstream `H5O__dtype_decode_helper`
+        // checks ("precision is zero" / "integer offset out of bounds" /
+        // "integer offset+precision out of bounds"). The properties layout
+        // is bit_offset(u16 LE) + precision(u16 LE).
+        if matches!(class, DatatypeClass::FixedPoint | DatatypeClass::BitField) {
+            let bit_offset = u16::from_le_bytes([properties[0], properties[1]]) as u64;
+            let precision = u16::from_le_bytes([properties[2], properties[3]]) as u64;
+            let size_bits = (size as u64).saturating_mul(8);
+            if precision == 0 {
+                return Err(Error::InvalidFormat(
+                    "datatype precision is zero".into(),
+                ));
+            }
+            if bit_offset > size_bits {
+                return Err(Error::InvalidFormat(format!(
+                    "datatype bit offset {bit_offset} exceeds size {size_bits} bits"
+                )));
+            }
+            if bit_offset + precision > size_bits {
+                return Err(Error::InvalidFormat(format!(
+                    "datatype bit offset+precision ({}) exceeds size {size_bits} bits",
+                    bit_offset + precision
+                )));
+            }
+        }
+
+        // Validate FloatingPoint properties against the byte size, matching
+        // upstream `H5O__dtype_decode_helper` ("sign bit position out of
+        // bounds" / "exponent size can't be zero" / "exponent starting
+        // position out of bounds" / "mantissa starting position out of
+        // bounds"). Property layout: bit_offset(u16) + precision(u16) +
+        // exp_loc(u8) + exp_size(u8) + mant_loc(u8) + mant_size(u8) +
+        // exp_bias(u32). Sign bit position lives in class_bits[1].
+        if class == DatatypeClass::FloatingPoint {
+            let bit_offset = u16::from_le_bytes([properties[0], properties[1]]) as u64;
+            let precision = u16::from_le_bytes([properties[2], properties[3]]) as u64;
+            let exp_loc = properties[4] as u64;
+            let exp_size = properties[5] as u64;
+            let mant_loc = properties[6] as u64;
+            let mant_size = properties[7] as u64;
+            let sign_loc = class_bits[1] as u64;
+            let size_bits = (size as u64).saturating_mul(8);
+            if precision == 0 {
+                return Err(Error::InvalidFormat(
+                    "floating-point precision is zero".into(),
+                ));
+            }
+            if bit_offset + precision > size_bits {
+                return Err(Error::InvalidFormat(format!(
+                    "floating-point bit offset+precision ({}) exceeds size {size_bits} bits",
+                    bit_offset + precision
+                )));
+            }
+            if exp_size == 0 {
+                return Err(Error::InvalidFormat(
+                    "floating-point exponent size is zero".into(),
+                ));
+            }
+            if mant_size == 0 {
+                return Err(Error::InvalidFormat(
+                    "floating-point mantissa size is zero".into(),
+                ));
+            }
+            if sign_loc >= precision {
+                return Err(Error::InvalidFormat(format!(
+                    "floating-point sign bit position {sign_loc} is outside precision {precision}"
+                )));
+            }
+            if exp_loc + exp_size > precision {
+                return Err(Error::InvalidFormat(format!(
+                    "floating-point exponent location+size ({}) exceeds precision {precision}",
+                    exp_loc + exp_size
+                )));
+            }
+            if mant_loc + mant_size > precision {
+                return Err(Error::InvalidFormat(format!(
+                    "floating-point mantissa location+size ({}) exceeds precision {precision}",
+                    mant_loc + mant_size
+                )));
+            }
+        }
+
         let message = Self {
             version,
             class,
@@ -142,18 +225,18 @@ impl DatatypeMessage {
         {
             let mut th = tracehash::th_call!("hdf5.datatype.decode");
             th.input_bytes(data);
-            th.output_bool(true);
+            th.output_value(&(true));
             th.output_u64(class_val as u64);
             th.finish();
 
             let mut th = tracehash::th_call!("hdf5.datatype.properties");
             th.input_bytes(data);
-            th.output_bool(true);
+            th.output_value(&(true));
             th.output_u64(version as u64);
             th.output_u64(class_val as u64);
-            th.output_bytes(&class_bits);
+            th.output_value(&class_bits[..]);
             th.output_u64(size as u64);
-            th.output_bytes(&message.properties);
+            th.output_value(&message.properties);
             th.finish();
         }
 

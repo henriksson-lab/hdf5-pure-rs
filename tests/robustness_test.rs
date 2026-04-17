@@ -16,6 +16,8 @@ use hdf5_pure_rust::format::messages::link_info::LinkInfoMessage;
 use hdf5_pure_rust::format::object_header::{
     ObjectHeader, MSG_DATATYPE, MSG_HEADER_CONTINUATION, MSG_SHARED_MSG_TABLE,
 };
+use hdf5_pure_rust::format::btree_v2::BTreeV2Header;
+use hdf5_pure_rust::format::checksum::checksum_metadata;
 use hdf5_pure_rust::format::superblock::Superblock;
 use hdf5_pure_rust::format::{extensible_array, fixed_array};
 use hdf5_pure_rust::io::reader::UNDEF_ADDR;
@@ -623,7 +625,7 @@ fn test_compound_fields_reject_truncated_member_metadata() {
             let mut data = vec![0x36, 2, 0, 0, 4, 0, 0, 0];
             data.extend_from_slice(b"x\0");
             data.extend_from_slice(&0u32.to_le_bytes());
-            data.extend_from_slice(&[0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 32]);
+            data.extend_from_slice(&[0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0]);
             data
         },
         {
@@ -678,8 +680,8 @@ fn test_enum_members_reject_truncated_metadata() {
     let enum_header = |version: u8| vec![(version << 4) | 8, 1, 0, 0, 1, 0, 0, 0];
     let enum_header_n =
         |version: u8, nmembers: u8| vec![(version << 4) | 8, nmembers, 0, 0, 1, 0, 0, 0];
-    let base_u8 = [0x10, 0, 0, 0, 1, 0, 0, 0, 0, 8, 0, 8];
-    let base_u16 = [0x10, 0, 0, 0, 2, 0, 0, 0, 0, 16, 0, 16];
+    let base_u8 = [0x10, 0, 0, 0, 1, 0, 0, 0, 0, 0, 8, 0];
+    let base_u16 = [0x10, 0, 0, 0, 2, 0, 0, 0, 0, 0, 16, 0];
     let cases = [
         {
             let mut data = enum_header(3);
@@ -741,7 +743,7 @@ fn test_enum_members_reject_truncated_metadata() {
 
 #[test]
 fn test_array_dims_base_rejects_truncated_metadata() {
-    let base_i32 = [0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 32];
+    let base_i32 = [0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0];
     let cases = [
         vec![0x3a, 0, 0, 0, 4, 0, 0, 0],
         vec![0x4a, 0, 0, 0, 4, 0, 0, 0, 33],
@@ -772,7 +774,7 @@ fn test_array_dims_base_rejects_truncated_metadata() {
 
 #[test]
 fn test_array_dims_base_handles_v2_v3_v4_and_rejects_v1() {
-    let base_i16 = [0x10, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 16];
+    let base_i16 = [0x10, 0, 0, 0, 2, 0, 0, 0, 0, 0, 16, 0];
 
     let mut v1 = vec![0x1a, 0, 0, 0, 12, 0, 0, 0, 2, 0, 0, 0];
     v1.extend_from_slice(&2u32.to_le_bytes());
@@ -803,7 +805,7 @@ fn test_array_dims_base_handles_v2_v3_v4_and_rejects_v1() {
 
 #[test]
 fn test_vlen_base_distinguishes_sequence_and_string_metadata() {
-    let base_i32 = [0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 32];
+    let base_i32 = [0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0];
 
     let mut direct_sequence = vec![0x39, 0, 0, 0, 16, 0, 0, 0];
     direct_sequence.extend_from_slice(&base_i32);
@@ -831,7 +833,7 @@ fn test_vlen_base_rejects_truncated_or_ambiguous_metadata() {
         vec![0x39, 0, 0, 0, 16, 0, 0, 0, 1, 2],
         vec![0x39, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0],
         vec![
-            0x39, 0, 0, 0, 16, 0, 0, 0, 0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 32, 99,
+            0x39, 0, 0, 0, 16, 0, 0, 0, 0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0, 99,
         ],
     ];
 
@@ -1254,4 +1256,323 @@ fn test_open_non_hdf5_file() {
     std::fs::write(&path, b"This is not an HDF5 file").unwrap();
     let result = hdf5_pure_rust::File::open(&path);
     assert!(result.is_err());
+}
+
+/// Build a syntactically valid v2 B-tree header with specified split/merge
+/// percent bytes, including a correct metadata checksum so that the
+/// validation under test fires on the percent fields, not the checksum.
+fn btree_v2_header_bytes(split_pct: u8, merge_pct: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(28);
+    buf.extend_from_slice(b"BTHD"); // magic
+    buf.push(0); // version
+    buf.push(5); // tree_type (chunked dataset, no filter)
+    buf.extend_from_slice(&512u32.to_le_bytes()); // node_size
+    buf.extend_from_slice(&8u16.to_le_bytes()); // record_size
+    buf.extend_from_slice(&0u16.to_le_bytes()); // depth
+    buf.push(split_pct);
+    buf.push(merge_pct);
+    buf.extend_from_slice(&0u64.to_le_bytes()); // root_addr (sizeof_addr=8)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // root_nrecords
+    buf.extend_from_slice(&0u64.to_le_bytes()); // total_records (sizeof_size=8)
+    let checksum = checksum_metadata(&buf);
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    buf
+}
+
+#[test]
+fn test_btree_v2_rejects_split_percent_over_100() {
+    let bytes = btree_v2_header_bytes(101, 40);
+    let mut reader = HdfReader::new(Cursor::new(bytes));
+    let err = BTreeV2Header::read_at(&mut reader, 0).unwrap_err();
+    assert!(
+        format!("{err}").contains("split percent"),
+        "expected split-percent error, got: {err}"
+    );
+}
+
+#[test]
+fn test_btree_v2_rejects_merge_percent_over_100() {
+    let bytes = btree_v2_header_bytes(100, 200);
+    let mut reader = HdfReader::new(Cursor::new(bytes));
+    let err = BTreeV2Header::read_at(&mut reader, 0).unwrap_err();
+    assert!(
+        format!("{err}").contains("merge percent"),
+        "expected merge-percent error, got: {err}"
+    );
+}
+
+#[test]
+fn test_btree_v2_rejects_merge_pct_not_less_than_split_pct() {
+    // 60 <= 60 violates merge < split.
+    let bytes = btree_v2_header_bytes(60, 60);
+    let mut reader = HdfReader::new(Cursor::new(bytes));
+    let err = BTreeV2Header::read_at(&mut reader, 0).unwrap_err();
+    assert!(
+        format!("{err}").contains("less than split percent"),
+        "expected merge<split error, got: {err}"
+    );
+}
+
+#[test]
+fn test_btree_v2_accepts_canonical_percents() {
+    // 100 / 40 are HDF5's defaults; must still parse.
+    let bytes = btree_v2_header_bytes(100, 40);
+    let mut reader = HdfReader::new(Cursor::new(bytes));
+    let hdr = BTreeV2Header::read_at(&mut reader, 0).expect("canonical 100/40 must parse");
+    assert_eq!(hdr.split_pct, 100);
+    assert_eq!(hdr.merge_pct, 40);
+}
+
+/// Build a minimal v1 FixedPoint datatype message with explicit bit_offset
+/// and bit_precision fields (each u16 little-endian).
+fn fixed_point_datatype_bytes(size_bytes: u32, bit_offset: u16, precision: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.push(0x10); // version=1, class=0 (FixedPoint)
+    buf.extend_from_slice(&[0, 0, 0]); // class_bits
+    buf.extend_from_slice(&size_bytes.to_le_bytes());
+    buf.extend_from_slice(&bit_offset.to_le_bytes());
+    buf.extend_from_slice(&precision.to_le_bytes());
+    buf
+}
+
+#[test]
+fn test_datatype_rejects_zero_precision() {
+    let bytes = fixed_point_datatype_bytes(4, 0, 0);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("precision is zero"),
+        "expected precision-is-zero error, got: {err}"
+    );
+}
+
+#[test]
+fn test_datatype_rejects_bit_offset_over_size() {
+    // size = 2 bytes = 16 bits; offset of 17 is out of bounds.
+    let bytes = fixed_point_datatype_bytes(2, 17, 1);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bit offset"),
+        "expected bit-offset error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_datatype_rejects_offset_plus_precision_over_size() {
+    // size = 4 bytes = 32 bits; offset+precision = 16+24 = 40 > 32.
+    let bytes = fixed_point_datatype_bytes(4, 16, 24);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bit offset+precision"),
+        "expected offset+precision error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_datatype_accepts_canonical_integer_widths() {
+    // i8/i16/i32/i64 with offset=0 and precision = size*8 must all parse.
+    for size_bytes in [1u32, 2, 4, 8] {
+        let bytes = fixed_point_datatype_bytes(size_bytes, 0, (size_bytes * 8) as u16);
+        let dt = DatatypeMessage::decode(&bytes)
+            .unwrap_or_else(|e| panic!("size={size_bytes} should parse: {e}"));
+        assert_eq!(dt.size, size_bytes);
+    }
+}
+
+#[test]
+fn test_datatype_accepts_subbyte_field_within_size() {
+    // 4-byte payload, 12 bits of meaningful precision starting at bit 4 — well-formed.
+    let bytes = fixed_point_datatype_bytes(4, 4, 12);
+    let dt = DatatypeMessage::decode(&bytes).expect("sub-field within size must parse");
+    assert_eq!(dt.size, 4);
+}
+
+#[test]
+fn test_datatype_bitfield_validates_precision_too() {
+    // BitField shares the layout — same checks apply.
+    let mut bytes = fixed_point_datatype_bytes(2, 0, 0);
+    bytes[0] = 0x14; // version=1, class=4 (BitField)
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("precision is zero"),
+        "expected BitField precision-is-zero error, got: {err}"
+    );
+}
+
+/// Build a v1 FloatingPoint datatype message with explicit field positions.
+/// Class bits layout: byte 0 default 0; byte 1 = sign location.
+fn float_datatype_bytes(
+    size_bytes: u32,
+    sign_loc: u8,
+    bit_offset: u16,
+    precision: u16,
+    exp_loc: u8,
+    exp_size: u8,
+    mant_loc: u8,
+    mant_size: u8,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
+    buf.push(0x11); // version=1, class=1 (FloatingPoint)
+    buf.push(0); // class_bits[0]
+    buf.push(sign_loc); // class_bits[1] = sign location
+    buf.push(0); // class_bits[2]
+    buf.extend_from_slice(&size_bytes.to_le_bytes());
+    buf.extend_from_slice(&bit_offset.to_le_bytes());
+    buf.extend_from_slice(&precision.to_le_bytes());
+    buf.push(exp_loc);
+    buf.push(exp_size);
+    buf.push(mant_loc);
+    buf.push(mant_size);
+    buf.extend_from_slice(&127u32.to_le_bytes()); // exp_bias (irrelevant)
+    buf
+}
+
+#[test]
+fn test_float_datatype_accepts_canonical_f32_layout() {
+    // IEEE 754 binary32: size=4, sign@31, exp@23 (8 bits), mant@0 (23 bits),
+    // precision=32. Must parse cleanly.
+    let bytes = float_datatype_bytes(4, 31, 0, 32, 23, 8, 0, 23);
+    let dt = DatatypeMessage::decode(&bytes).expect("canonical f32 must parse");
+    assert_eq!(dt.size, 4);
+}
+
+#[test]
+fn test_float_datatype_rejects_zero_exp_size() {
+    let bytes = float_datatype_bytes(4, 31, 0, 32, 0, 0, 0, 23);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("exponent size is zero"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_float_datatype_rejects_zero_mant_size() {
+    let bytes = float_datatype_bytes(4, 31, 0, 32, 23, 8, 0, 0);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("mantissa size is zero"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_float_datatype_rejects_sign_outside_precision() {
+    // sign_loc must be < precision.
+    let bytes = float_datatype_bytes(4, 32, 0, 32, 23, 8, 0, 23);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("sign bit position"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_float_datatype_rejects_exp_overflow_precision() {
+    // exp_loc + exp_size > precision.
+    let bytes = float_datatype_bytes(4, 31, 0, 32, 25, 8, 0, 23);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("exponent location+size"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_float_datatype_rejects_mant_overflow_precision() {
+    // mant_loc + mant_size > precision.
+    let bytes = float_datatype_bytes(4, 31, 0, 32, 23, 8, 23, 10);
+    let err = DatatypeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("mantissa location+size"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_dataspace_v2_rejects_scalar_with_nonzero_rank() {
+    // Build a v2 dataspace header with space_type=Scalar (0) and ndims=3.
+    // Bytes: version(1)=2, ndims(1)=3, flags(1)=0, space_type(1)=0,
+    // followed by three u64 dims so the truncation check doesn't fire first.
+    let mut bytes = vec![2u8, 3, 0, 0];
+    bytes.extend_from_slice(&[0u8; 24]); // 3 dims of u64 = 24 bytes
+    let err = DataspaceMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("Scalar") && format!("{err}").contains("rank 3"),
+        "expected scalar-rank error, got: {err}"
+    );
+}
+
+#[test]
+fn test_dataspace_v2_rejects_null_with_nonzero_rank() {
+    let mut bytes = vec![2u8, 1, 0, 2];
+    bytes.extend_from_slice(&[0u8; 8]);
+    let err = DataspaceMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("Null") && format!("{err}").contains("rank 1"),
+        "expected null-rank error, got: {err}"
+    );
+}
+
+#[test]
+fn test_dataspace_v2_accepts_scalar_with_zero_rank() {
+    // Canonical scalar: ndims=0, space_type=Scalar.
+    let bytes = vec![2u8, 0, 0, 0];
+    let ds = DataspaceMessage::decode(&bytes).expect("scalar with rank 0 must parse");
+    assert_eq!(ds.ndims, 0);
+}
+
+#[test]
+fn test_attribute_message_rejects_zero_name_length() {
+    // v1 attribute with name_size=0 (everything else zeroed) — must reject.
+    let mut bytes = vec![1u8, 0]; // version=1, reserved
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // name_size=0 (BAD)
+    bytes.extend_from_slice(&8u16.to_le_bytes()); // dt_size
+    bytes.extend_from_slice(&8u16.to_le_bytes()); // ds_size
+    let err = AttributeMessage::decode(&bytes).unwrap_err();
+    assert!(
+        format!("{err}").contains("name length is zero"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_layout_v3_rejects_zero_chunk_dimension() {
+    // Build a v3 chunked layout with chunk_dims = [4, 0] (the zero is bad)
+    // and element_size = 4. Wire format: version(1)=3, class(1)=2 (Chunked),
+    // ndims(1)=3 (= 2 chunk dims + 1 element-size dim), addr(8 bytes for
+    // sizeof_addr=8), then 3 × u32 dims.
+    let mut bytes = vec![3u8, 2, 3];
+    bytes.extend_from_slice(&[0u8; 8]); // chunk index addr
+    bytes.extend_from_slice(&4u32.to_le_bytes()); // chunk dim 0
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // chunk dim 1 = 0 (BAD)
+    bytes.extend_from_slice(&4u32.to_le_bytes()); // element size
+    let err = DataLayoutMessage::decode(&bytes, 8, 8).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("must be positive"),
+        "expected zero-chunk-dim error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_filter_pipeline_v1_rejects_non_multiple_of_eight_name_length() {
+    // Build a minimal v1 filter pipeline with a single filter whose
+    // declared name_length is 7 — must be rejected.
+    let mut buf = Vec::new();
+    buf.push(1); // version
+    buf.push(1); // nfilters
+    buf.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // 6 reserved bytes (header is 8 bytes total)
+    buf.extend_from_slice(&1u16.to_le_bytes()); // filter id (deflate)
+    buf.extend_from_slice(&7u16.to_le_bytes()); // name_length = 7 (BAD)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(&0u16.to_le_bytes()); // cd_nelmts
+    let err = hdf5_pure_rust::format::messages::filter_pipeline::FilterPipelineMessage::decode(&buf)
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a multiple of eight"),
+        "got: {msg}"
+    );
 }

@@ -187,6 +187,17 @@ impl ObjectHeader {
             )?;
         }
 
+        // The v1 spec says the stored message count is an upper bound on the
+        // actual count (including NIL and HEADER_CONTINUATION); we strip both
+        // before pushing, so the kept count must be ≤ declared. A `messages`
+        // count exceeding `num_messages` indicates a corrupted header.
+        if messages.len() > num_messages as usize {
+            return Err(Error::InvalidFormat(format!(
+                "object header v1 declared {num_messages} messages but decoded {} non-NIL/non-continuation messages",
+                messages.len()
+            )));
+        }
+
         Ok(ObjectHeader {
             version: 1,
             flags: 0,

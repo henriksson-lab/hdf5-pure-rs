@@ -1932,7 +1932,7 @@ impl Dataset {
         let mut th = tracehash::Call::new(function, file!(), line!());
         th.input_u64(index_addr);
         th.input_u64(chunk_index);
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(addr);
         th.output_u64(if crate::io::reader::is_undef_addr(addr) {
             0
@@ -1967,7 +1967,7 @@ impl Dataset {
         for coord in scaled {
             th.input_u64(*coord);
         }
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(addr);
         th.output_u64(if crate::io::reader::is_undef_addr(addr) {
             0
@@ -2001,7 +2001,7 @@ impl Dataset {
         for coord in scaled {
             th.input_u64(*coord);
         }
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(addr);
         th.output_u64(if crate::io::reader::is_undef_addr(addr) {
             0
@@ -2032,7 +2032,7 @@ impl Dataset {
     ) {
         let mut th = tracehash::th_call!("hdf5.chunk_index.btree2.record_decode");
         th.input_bytes(record);
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(addr);
         th.output_u64(nbytes);
         th.output_u64(filter_mask as u64);
@@ -2417,7 +2417,7 @@ fn read_le_uint(bytes: &[u8], size: usize) -> Result<u64> {
 fn trace_selection_deserialize(data: &[u8], sel_type: u32) {
     let mut th = tracehash::th_call!("hdf5.selection.deserialize");
     th.input_bytes(data);
-    th.output_bool(true);
+    th.output_value(&(true));
     th.output_u64(sel_type as u64);
     th.finish();
 }
@@ -2429,8 +2429,8 @@ fn trace_selection_deserialize(_data: &[u8], _sel_type: u32) {}
 fn trace_vlen_read(len: u64, data: &[u8]) {
     let mut th = tracehash::th_call!("hdf5.vlen.read");
     th.input_u64(len);
-    th.output_bool(true);
-    th.output_bytes(data);
+    th.output_value(&(true));
+    th.output_value(data);
     th.finish();
 }
 
@@ -2442,9 +2442,9 @@ fn trace_vds_source_resolve(file_name: &str, dataset_name: &str) {
     let mut th = tracehash::th_call!("hdf5.vds.source.resolve");
     th.input_bytes(file_name.as_bytes());
     th.input_bytes(dataset_name.as_bytes());
-    th.output_bool(file_name == ".");
-    th.output_bytes(file_name.as_bytes());
-    th.output_bytes(dataset_name.as_bytes());
+    th.output_value(&(file_name == "."));
+    th.output_value(file_name.as_bytes());
+    th.output_value(dataset_name.as_bytes());
     th.finish();
 }
 

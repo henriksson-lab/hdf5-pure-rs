@@ -52,6 +52,21 @@ impl BTreeV2Header {
         let depth = reader.read_u16()?;
         let split_pct = reader.read_u8()?;
         let merge_pct = reader.read_u8()?;
+        if split_pct > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "v2 B-tree split percent {split_pct} exceeds 100"
+            )));
+        }
+        if merge_pct > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "v2 B-tree merge percent {merge_pct} exceeds 100"
+            )));
+        }
+        if merge_pct >= split_pct {
+            return Err(Error::InvalidFormat(format!(
+                "v2 B-tree merge percent {merge_pct} must be less than split percent {split_pct}"
+            )));
+        }
         let root_addr = reader.read_addr()?;
         let root_nrecords = reader.read_u16()?;
         let total_records = reader.read_length()?;
@@ -272,7 +287,7 @@ fn trace_internal_child(
     th.input_u64(depth as u64);
     th.input_u64(child_index as u64);
     th.input_u64(child_addr);
-    th.output_bool(true);
+    th.output_value(&(true));
     th.output_u64(child_nrecords as u64);
     th.output_u64(child_all_records);
     th.finish();

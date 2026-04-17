@@ -87,3 +87,38 @@ fn test_group_len() {
     assert_eq!(g1.len().unwrap(), 0);
     assert!(g1.is_empty().unwrap());
 }
+
+#[test]
+fn test_path_component_length_cap_rejects_oversized_segment() {
+    // A single path component longer than 1024 bytes must be rejected
+    // before traversal starts. The shape of the rest of the path doesn't
+    // matter; we just need to confirm the cap fires with the documented
+    // error rather than returning a generic "not found".
+    let f = File::open("tests/data/simple_v0.h5").unwrap();
+    let huge = "a".repeat(1025);
+    let msg = match f.group(&huge) {
+        Ok(_) => panic!("oversized component must not resolve"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        msg.contains("path component exceeds 1024-byte limit"),
+        "expected length-cap error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_path_component_length_cap_accepts_at_limit() {
+    // Exactly 1024 bytes must NOT trigger the cap (it's a strict >, not >=).
+    // The lookup will of course fail with a "not found" error — we just
+    // assert the failure mode is *not* the length-cap one.
+    let f = File::open("tests/data/simple_v0.h5").unwrap();
+    let at_limit = "a".repeat(1024);
+    let msg = match f.group(&at_limit) {
+        Ok(_) => panic!("a 1024-byte component should not resolve in this fixture"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        !msg.contains("path component exceeds"),
+        "1024-byte component should pass the cap, but got: {msg}"
+    );
+}

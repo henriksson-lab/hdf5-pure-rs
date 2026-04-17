@@ -1,0 +1,777 @@
+# Rust ↔ C function name mapping for ccc-rs cross-language compare.
+#
+# Used with:
+#   ccc-rs compare hdf5_rust.json hdf5_c.json --mapping map.toml
+#   ccc-rs missing hdf5_rust.json hdf5_c.json --mapping map.toml
+#   ccc-rs constants-diff hdf5_rust.json hdf5_c.json --mapping map.toml
+#
+# Mapping rules:
+# - "rust"       — Rust function name as ccc-rs sees it (no module path).
+# - "rust_path"  — optional path-suffix constraint on the Rust source file,
+#                  used to disambiguate names that appear in multiple modules.
+# - "other"      — upstream C symbol from hdf5/src/H5*.c.
+# - "other_path" — optional path-suffix constraint on the C source file.
+# - Pure Rust helpers with no C analog (read_u32, ensure_available, finalize,
+#   etc.) are intentionally omitted.
+
+# ---------------------------------------------------------------------------
+# format/checksum.rs — H5checksum.c (Jenkins lookup3, metadata checksum)
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "checksum_lookup3"
+rust_path = "format/checksum.rs"
+other = "H5_checksum_lookup3"
+
+[[entries]]
+rust = "checksum_metadata"
+rust_path = "format/checksum.rs"
+other = "H5_checksum_metadata"
+
+# ---------------------------------------------------------------------------
+# format/superblock.rs — H5Fsuper_cache.c
+# Single dispatching C deserializer for all superblock versions.
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_v0_v1"
+rust_path = "format/superblock.rs"
+other = "H5F__cache_superblock_deserialize"
+
+[[entries]]
+rust = "read_v2_v3"
+rust_path = "format/superblock.rs"
+other = "H5F__cache_superblock_deserialize"
+
+[[entries]]
+rust = "validate_sizes"
+rust_path = "format/superblock.rs"
+other = "H5F__superblock_prefix_decode"
+
+# ---------------------------------------------------------------------------
+# format/btree_v1.rs — H5B.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_at"
+rust_path = "format/btree_v1.rs"
+other = "H5B__cache_deserialize"
+
+[[entries]]
+rust = "collect_symbol_table_addrs"
+rust_path = "format/btree_v1.rs"
+other = "H5B_iterate"
+
+# ---------------------------------------------------------------------------
+# format/btree_v2.rs — H5B2*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_at"
+rust_path = "format/btree_v2.rs"
+other = "H5B2__cache_hdr_deserialize"
+
+[[entries]]
+rust = "compute_node_info"
+rust_path = "format/btree_v2.rs"
+other = "H5B2__hdr_init"
+
+[[entries]]
+rust = "read_internal_records"
+rust_path = "format/btree_v2.rs"
+other = "H5B2__cache_int_deserialize"
+
+[[entries]]
+rust = "read_child_records"
+rust_path = "format/btree_v2.rs"
+other = "H5B2__cache_leaf_deserialize"
+
+[[entries]]
+rust = "collect_all_records"
+rust_path = "format/btree_v2.rs"
+other = "H5B2_iterate"
+
+# ---------------------------------------------------------------------------
+# format/fractal_heap.rs — H5HF*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_huge"
+rust_path = "format/fractal_heap.rs"
+other = "H5HF__huge_op_real"
+
+[[entries]]
+rust = "decode_huge_record"
+rust_path = "format/fractal_heap.rs"
+other = "H5HF__huge_get_obj_off"
+
+[[entries]]
+rust = "read_managed"
+rust_path = "format/fractal_heap.rs"
+other = "H5HF__man_op_real"
+
+[[entries]]
+rust = "read_managed_object"
+rust_path = "format/fractal_heap.rs"
+other = "H5HF__man_op"
+
+[[entries]]
+rust = "read_from_indirect_block_rows"
+rust_path = "format/fractal_heap.rs"
+other = "H5HF__cache_iblock_deserialize"
+
+[[entries]]
+rust = "read_from_filtered_indirect_block"
+rust_path = "format/fractal_heap.rs"
+other = "H5HF__cache_iblock_deserialize"
+
+# ---------------------------------------------------------------------------
+# format/extensible_array.rs — H5EA*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_header"
+rust_path = "format/extensible_array.rs"
+other = "H5EA__cache_hdr_deserialize"
+
+[[entries]]
+rust = "read_super_block"
+rust_path = "format/extensible_array.rs"
+other = "H5EA__cache_sblock_deserialize"
+
+[[entries]]
+rust = "read_index_block"
+rust_path = "format/extensible_array.rs"
+other = "H5EA__cache_iblock_deserialize"
+
+[[entries]]
+rust = "read_data_block"
+rust_path = "format/extensible_array.rs"
+other = "H5EA__cache_dblock_deserialize"
+
+[[entries]]
+rust = "read_spillover_blocks"
+rust_path = "format/extensible_array.rs"
+other = "H5EA__cache_dblk_page_deserialize"
+
+[[entries]]
+rust = "read_extensible_array_chunks"
+rust_path = "format/extensible_array.rs"
+other = "H5EA_iterate"
+
+[[entries]]
+rust = "append_data_block_elements"
+rust_path = "format/extensible_array.rs"
+other = "H5EA__cache_dblock_serialize"
+
+# ---------------------------------------------------------------------------
+# format/fixed_array.rs — H5FA*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_header"
+rust_path = "format/fixed_array.rs"
+other = "H5FA__cache_hdr_deserialize"
+
+[[entries]]
+rust = "read_data_block"
+rust_path = "format/fixed_array.rs"
+other = "H5FA__cache_dblock_deserialize"
+
+[[entries]]
+rust = "read_element"
+rust_path = "format/fixed_array.rs"
+other = "H5FA_get"
+
+[[entries]]
+rust = "locate_fixed_array_element"
+rust_path = "format/fixed_array.rs"
+other = "H5FA__lookup_elmt"
+
+[[entries]]
+rust = "verify_checksum"
+rust_path = "format/fixed_array.rs"
+other = "H5FA__cache_dblock_verify_chksum"
+
+[[entries]]
+rust = "read_fixed_array_chunks"
+rust_path = "format/fixed_array.rs"
+other = "H5FA_iterate"
+
+# ---------------------------------------------------------------------------
+# format/global_heap.rs — H5HG*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_at"
+rust_path = "format/global_heap.rs"
+other = "H5HG__cache_heap_deserialize"
+
+[[entries]]
+rust = "read_global_heap_object"
+rust_path = "format/global_heap.rs"
+other = "H5HG_read"
+
+[[entries]]
+rust = "heap_object_len"
+rust_path = "format/global_heap.rs"
+other = "H5HG_get_obj_size"
+
+# ---------------------------------------------------------------------------
+# format/local_heap.rs — H5HL*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_at"
+rust_path = "format/local_heap.rs"
+other = "H5HL__cache_prefix_deserialize"
+
+[[entries]]
+rust = "get_string"
+rust_path = "format/local_heap.rs"
+other = "H5HL_offset_into"
+
+# ---------------------------------------------------------------------------
+# format/object_header.rs — H5O*.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_at"
+rust_path = "format/object_header.rs"
+other = "H5O_protect"
+
+[[entries]]
+rust = "read_v2"
+rust_path = "format/object_header.rs"
+other = "H5O__cache_deserialize"
+
+[[entries]]
+rust = "read_v1_messages"
+rust_path = "format/object_header.rs"
+other = "H5O__chunk_protect"
+
+[[entries]]
+rust = "read_v2_messages"
+rust_path = "format/object_header.rs"
+other = "H5O__chunk_protect"
+
+[[entries]]
+rust = "validate_shared_message_table"
+rust_path = "format/object_header.rs"
+other = "H5SM_get_info"
+
+[[entries]]
+rust = "validate_shared_message_reference"
+rust_path = "format/object_header.rs"
+other = "H5SM_get_info"
+
+# ---------------------------------------------------------------------------
+# format/symbol_table.rs — H5G symbol table entries
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_at"
+rust_path = "format/symbol_table.rs"
+other = "H5G__node_iterate"
+
+[[entries]]
+rust = "read_entry"
+rust_path = "format/symbol_table.rs"
+other = "H5G_ent_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/datatype.rs — H5Odtype.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/datatype.rs"
+other = "H5O__dtype_decode"
+
+[[entries]]
+rust = "datatype_encoded_len"
+rust_path = "format/messages/datatype.rs"
+other = "H5O__dtype_size"
+
+[[entries]]
+rust = "compound_fields"
+rust_path = "format/messages/datatype.rs"
+other = "H5O__dtype_decode_helper"
+
+[[entries]]
+rust = "enum_members"
+rust_path = "format/messages/datatype.rs"
+other = "H5O__dtype_decode_helper"
+
+[[entries]]
+rust = "array_dims_base"
+rust_path = "format/messages/datatype.rs"
+other = "H5O__dtype_decode_helper"
+
+# ---------------------------------------------------------------------------
+# format/messages/dataspace.rs — H5Osdspace.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/dataspace.rs"
+other = "H5O__sdspace_decode"
+
+[[entries]]
+rust = "decode_v1"
+rust_path = "format/messages/dataspace.rs"
+other = "H5O__sdspace_decode"
+
+[[entries]]
+rust = "decode_v2"
+rust_path = "format/messages/dataspace.rs"
+other = "H5O__sdspace_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/data_layout.rs — H5Olayout.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/data_layout.rs"
+other = "H5O__layout_decode"
+
+[[entries]]
+rust = "decode_v1_v2"
+rust_path = "format/messages/data_layout.rs"
+other = "H5O__layout_decode"
+
+[[entries]]
+rust = "decode_v3"
+rust_path = "format/messages/data_layout.rs"
+other = "H5O__layout_decode"
+
+[[entries]]
+rust = "decode_v4"
+rust_path = "format/messages/data_layout.rs"
+other = "H5O__layout_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/fill_value.rs — H5Ofill.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/fill_value.rs"
+other = "H5O__fill_new_decode"
+
+[[entries]]
+rust = "decode_v2"
+rust_path = "format/messages/fill_value.rs"
+other = "H5O__fill_new_decode"
+
+[[entries]]
+rust = "decode_v3"
+rust_path = "format/messages/fill_value.rs"
+other = "H5O__fill_new_decode"
+
+[[entries]]
+rust = "decode_old"
+rust_path = "format/messages/fill_value.rs"
+other = "H5O__fill_old_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/filter_pipeline.rs — H5Opline.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/filter_pipeline.rs"
+other = "H5O__pline_decode"
+
+[[entries]]
+rust = "decode_v1"
+rust_path = "format/messages/filter_pipeline.rs"
+other = "H5O__pline_decode"
+
+[[entries]]
+rust = "decode_v2"
+rust_path = "format/messages/filter_pipeline.rs"
+other = "H5O__pline_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/link.rs — H5Olink.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/link.rs"
+other = "H5O__link_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/link_info.rs — H5Olinfo.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/link_info.rs"
+other = "H5O__linfo_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/attribute.rs — H5Oattr.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/attribute.rs"
+other = "H5O__attr_decode"
+
+[[entries]]
+rust = "decode_v1"
+rust_path = "format/messages/attribute.rs"
+other = "H5O__attr_decode"
+
+[[entries]]
+rust = "decode_v2"
+rust_path = "format/messages/attribute.rs"
+other = "H5O__attr_decode"
+
+[[entries]]
+rust = "decode_v3"
+rust_path = "format/messages/attribute.rs"
+other = "H5O__attr_decode"
+
+[[entries]]
+rust = "num_elements"
+rust_path = "format/messages/attribute.rs"
+other = "H5O__attr_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/attribute_info.rs — H5Oainfo.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/attribute_info.rs"
+other = "H5O__ainfo_decode"
+
+# ---------------------------------------------------------------------------
+# format/messages/symbol_table.rs — H5Ostab.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decode"
+rust_path = "format/messages/symbol_table.rs"
+other = "H5O__stab_decode"
+
+# ---------------------------------------------------------------------------
+# filters/deflate.rs — H5Zdeflate.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decompress"
+rust_path = "filters/deflate.rs"
+other = "H5Z__filter_deflate"
+
+[[entries]]
+rust = "compress"
+rust_path = "filters/deflate.rs"
+other = "H5Z__filter_deflate"
+
+# ---------------------------------------------------------------------------
+# filters/shuffle.rs — H5Zshuffle.c (single C function does both directions)
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "shuffle"
+rust_path = "filters/shuffle.rs"
+other = "H5Z__filter_shuffle"
+
+[[entries]]
+rust = "unshuffle"
+rust_path = "filters/shuffle.rs"
+other = "H5Z__filter_shuffle"
+
+# ---------------------------------------------------------------------------
+# filters/fletcher32.rs — H5Zfletcher32.c + H5checksum.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "fletcher32"
+rust_path = "filters/fletcher32.rs"
+other = "H5_checksum_fletcher32"
+
+[[entries]]
+rust = "fletcher32_reversed"
+rust_path = "filters/fletcher32.rs"
+other = "H5_checksum_fletcher32"
+
+[[entries]]
+rust = "verify_and_strip"
+rust_path = "filters/fletcher32.rs"
+other = "H5Z__filter_fletcher32"
+
+# ---------------------------------------------------------------------------
+# filters/scaleoffset.rs — H5Zscaleoffset.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decompress"
+rust_path = "filters/scaleoffset.rs"
+other = "H5Z__scaleoffset_decompress"
+
+[[entries]]
+rust = "decompress_atomic"
+rust_path = "filters/scaleoffset.rs"
+other = "H5Z__scaleoffset_decompress_one_atomic"
+
+[[entries]]
+rust = "postprocess_float"
+rust_path = "filters/scaleoffset.rs"
+other = "H5Z__scaleoffset_postdecompress_fd"
+
+[[entries]]
+rust = "postprocess_integer"
+rust_path = "filters/scaleoffset.rs"
+other = "H5Z__scaleoffset_postdecompress_i"
+
+# ---------------------------------------------------------------------------
+# filters/nbit.rs — H5Znbit.c
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decompress"
+rust_path = "filters/nbit.rs"
+other = "H5Z__filter_nbit"
+
+[[entries]]
+rust = "decompress_atomic"
+rust_path = "filters/nbit.rs"
+other = "H5Z__nbit_decompress_one_atomic"
+
+[[entries]]
+rust = "decompress_array"
+rust_path = "filters/nbit.rs"
+other = "H5Z__nbit_decompress_one_array"
+
+[[entries]]
+rust = "decompress_compound"
+rust_path = "filters/nbit.rs"
+other = "H5Z__nbit_decompress_one_compound"
+
+[[entries]]
+rust = "decompress_atomic_byte"
+rust_path = "filters/nbit.rs"
+other = "H5Z__nbit_decompress_one_byte"
+
+# ---------------------------------------------------------------------------
+# filters/lzf.rs / blosc.rs / szip.rs — no upstream HDF5 implementation, but
+# the filter slots themselves correspond to plugin registrations.
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "decompress"
+rust_path = "filters/szip.rs"
+other = "H5Z__can_apply_szip"
+
+# ---------------------------------------------------------------------------
+# hl/file.rs — high-level file & path resolution
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "resolve_path"
+rust_path = "hl/file.rs"
+other = "H5G__traverse_real"
+
+[[entries]]
+rust = "object_type_from_messages"
+rust_path = "hl/file.rs"
+other = "H5O__obj_class_real"
+
+[[entries]]
+rust = "canonical_path"
+rust_path = "hl/file.rs"
+other = "H5G_loc_find"
+
+[[entries]]
+rust = "collect_v1_group_members"
+rust_path = "hl/file.rs"
+other = "H5G__node_iterate"
+
+[[entries]]
+rust = "collect_v2_link_members"
+rust_path = "hl/file.rs"
+other = "H5G__dense_iterate"
+
+# ---------------------------------------------------------------------------
+# hl/group.rs — H5G open / iterate
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "find_link_by_name"
+rust_path = "hl/group.rs"
+other = "H5G__obj_lookup"
+
+[[entries]]
+rust = "open_group"
+rust_path = "hl/group.rs"
+other = "H5G_open"
+
+[[entries]]
+rust = "open_dataset"
+rust_path = "hl/group.rs"
+other = "H5D__open_name"
+
+[[entries]]
+rust = "members"
+rust_path = "hl/group.rs"
+other = "H5G__node_iterate"
+
+[[entries]]
+rust = "read_dense_link_messages"
+rust_path = "hl/group.rs"
+other = "H5G__dense_lookup"
+
+# ---------------------------------------------------------------------------
+# hl/dataset.rs — read paths
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "read_chunked"
+rust_path = "hl/dataset.rs"
+other = "H5D__chunk_read"
+
+[[entries]]
+rust = "read_slice"
+rust_path = "hl/dataset.rs"
+other = "H5D__virtual_read"
+
+[[entries]]
+rust = "decode_value"
+rust_path = "hl/dataset.rs"
+other = "H5T__conv_struct"
+
+[[entries]]
+rust = "collect_btree_v1_chunks"
+rust_path = "hl/dataset.rs"
+other = "H5D__btree_idx_iterate"
+
+[[entries]]
+rust = "decode_virtual_selection"
+rust_path = "hl/dataset.rs"
+other = "H5S__hyper_deserialize"
+
+[[entries]]
+rust = "decode_virtual_mappings"
+rust_path = "hl/dataset.rs"
+other = "H5D__virtual_load_layout"
+
+[[entries]]
+rust = "copy_chunk_nd"
+rust_path = "hl/dataset.rs"
+other = "H5D__chunk_copy"
+
+# ---------------------------------------------------------------------------
+# hl/mutable_file.rs — write paths
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "write_chunk"
+rust_path = "hl/mutable_file.rs"
+other = "H5D__chunk_write"
+
+[[entries]]
+rust = "create_extensible_array_data_block"
+rust_path = "hl/mutable_file.rs"
+other = "H5EA__dblock_create"
+
+[[entries]]
+rust = "read_extensible_array_header"
+rust_path = "hl/mutable_file.rs"
+other = "H5EA__cache_hdr_deserialize"
+
+[[entries]]
+rust = "write_extensible_array_page"
+rust_path = "hl/mutable_file.rs"
+other = "H5EA__cache_dblk_page_serialize"
+
+[[entries]]
+rust = "rewrite_leaf_chunk_btree"
+rust_path = "hl/mutable_file.rs"
+other = "H5B2__internal_serialize"
+
+[[entries]]
+rust = "rewrite_extensible_array_super_block"
+rust_path = "hl/mutable_file.rs"
+other = "H5EA__cache_sblock_serialize"
+
+[[entries]]
+rust = "append_extensible_array_super_block_elements"
+rust_path = "hl/mutable_file.rs"
+other = "H5EA__cache_sblock_serialize"
+
+[[entries]]
+rust = "append_btree_v2_depth1_internal_node"
+rust_path = "hl/mutable_file.rs"
+other = "H5B2__create_internal"
+
+[[entries]]
+rust = "rebuild_btree_v2_chunk_tree"
+rust_path = "hl/mutable_file.rs"
+other = "H5D__bt2_idx_create"
+
+[[entries]]
+rust = "encode_global_heap_collection"
+rust_path = "hl/mutable_file.rs"
+other = "H5HG__cache_heap_serialize"
+
+[[entries]]
+rust = "write_dense_name_btree"
+rust_path = "hl/mutable_file.rs"
+other = "H5G__dense_create"
+
+[[entries]]
+rust = "write_managed_fractal_heap"
+rust_path = "hl/mutable_file.rs"
+other = "H5HF__man_dblock_create"
+
+# ---------------------------------------------------------------------------
+# engine/writer.rs — H5O / H5D create paths
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "create_vlen_utf8_string_dataset"
+rust_path = "engine/writer.rs"
+other = "H5D__create"
+
+[[entries]]
+rust = "build_v2_object_header"
+rust_path = "engine/writer.rs"
+other = "H5O_create"
+
+[[entries]]
+rust = "extract_chunk"
+rust_path = "engine/writer.rs"
+other = "H5D__chunk_lock"
+
+# ---------------------------------------------------------------------------
+# hl/conversion.rs — H5T type conversions
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "for_dataset"
+rust_path = "hl/conversion.rs"
+other = "H5T_path_find"
+
+[[entries]]
+rust = "clamp_float_to_integer"
+rust_path = "hl/conversion.rs"
+other = "H5T__conv_f_i"
+
+[[entries]]
+rust = "clamp_integer"
+rust_path = "hl/conversion.rs"
+other = "H5T__conv_i_i"
+
+[[entries]]
+rust = "convert_integer_bytes"
+rust_path = "hl/conversion.rs"
+other = "H5T__conv_i_i"
+
+[[entries]]
+rust = "target_integer"
+rust_path = "hl/conversion.rs"
+other = "H5T__conv_f_i"
+
+# ---------------------------------------------------------------------------
+# hl/attribute.rs — H5A iteration
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "collect_attributes"
+rust_path = "hl/attribute.rs"
+other = "H5A__attr_iterate_table"
+
+# ---------------------------------------------------------------------------
+# tracehash_corpus.rs — corpus walker
+# ---------------------------------------------------------------------------
+[[entries]]
+rust = "walk_object"
+rust_path = "tracehash_corpus.rs"
+other = "H5O_msg_iterate"
+
+[[entries]]
+rust = "read_dense_attrs"
+rust_path = "tracehash_corpus.rs"
+other = "H5A__dense_iterate"
+
+[[entries]]
+rust = "read_dense_links"
+rust_path = "tracehash_corpus.rs"
+other = "H5G__dense_iterate"
+
+[[entries]]
+rust = "group_members_from_messages"
+rust_path = "tracehash_corpus.rs"
+other = "H5G__node_iterate"

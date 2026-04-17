@@ -140,9 +140,9 @@ fn trace_global_heap_deref(gh_ref: &GlobalHeapRef, data: &[u8]) {
     let mut th = tracehash::th_call!("hdf5.global_heap.deref");
     th.input_u64(gh_ref.collection_addr);
     th.input_u64(gh_ref.object_index as u64);
-    th.output_bool(true);
+    th.output_value(&(true));
     th.output_u64(data.len() as u64);
-    th.output_bytes(data);
+    th.output_value(data);
     th.finish();
 }
 

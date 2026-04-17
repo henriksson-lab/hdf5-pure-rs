@@ -177,17 +177,17 @@ fn trace_fill_value(
 ) {
     let mut th = tracehash::th_call!("hdf5.fill_value.decode");
     th.input_bytes(data);
-    th.output_bool(true);
+    th.output_value(&(true));
     th.output_u64(version as u64);
     th.output_u64(alloc_time as u64);
     th.output_u64(fill_time as u64);
-    th.output_bool(defined);
+    th.output_value(&(defined));
     if let Some(value) = value {
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(value.len() as u64);
-        th.output_bytes(value);
+        th.output_value(value);
     } else {
-        th.output_bool(false);
+        th.output_value(&(false));
         th.output_u64(0);
     }
     th.finish();

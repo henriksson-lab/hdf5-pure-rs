@@ -107,7 +107,7 @@ fn apply_pipeline_reverse_with_mask_and_expected(
 
     #[cfg(feature = "tracehash")]
     {
-        th.output_bool(true);
+        th.output_value(&(true));
         th.output_u64(0);
         th.output_u64(buf.len() as u64);
         th.finish();

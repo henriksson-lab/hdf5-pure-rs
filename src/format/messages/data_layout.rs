@@ -77,7 +77,7 @@ impl DataLayoutMessage {
         if let Ok(message) = &result {
             let mut th = tracehash::th_call!("hdf5.data_layout.decode");
             th.input_bytes(data);
-            th.output_bool(true);
+            th.output_value(&(true));
             th.output_u64(message.version as u64);
             th.output_u64(message.layout_class as u64);
             th.output_u64(message.chunk_index_type.map(|t| t as u64).unwrap_or(0));
@@ -167,8 +167,10 @@ impl DataLayoutMessage {
             LayoutClass::Chunked => {
                 result.chunk_index_addr = data_addr;
                 if let Some(&last) = dims.last() {
+                    let chunk_dims = &dims[..dims.len() - 1];
+                    validate_chunk_dims_positive(chunk_dims, "data layout v1/v2")?;
                     result.chunk_element_size = Some(last as u32);
-                    result.chunk_dims = Some(dims[..dims.len() - 1].to_vec());
+                    result.chunk_dims = Some(chunk_dims.to_vec());
                 }
             }
             _ => {}
@@ -246,8 +248,10 @@ impl DataLayoutMessage {
 
                 // Last dimension is the element size
                 if let Some(&last) = dims.last() {
+                    let chunk_dims = &dims[..dims.len() - 1];
+                    validate_chunk_dims_positive(chunk_dims, "data layout v3")?;
                     result.chunk_element_size = Some(last as u32);
-                    result.chunk_dims = Some(dims[..dims.len() - 1].to_vec());
+                    result.chunk_dims = Some(chunk_dims.to_vec());
                 }
 
                 result.chunk_index_addr = Some(addr);
@@ -338,6 +342,7 @@ impl DataLayoutMessage {
                     )?;
                     dims.push(d);
                 }
+                validate_chunk_dims_positive(&dims, "data layout v4")?;
                 result.chunk_dims = Some(dims);
                 result.chunk_flags = Some(flags);
 
@@ -490,4 +495,18 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
     }
     *pos += size;
     Ok(val)
+}
+
+/// Reject any chunk dimension equal to zero — matches upstream
+/// `H5O__layout_decode`'s "chunk dimension must be positive" check. A
+/// zero-sized chunk yields no data and is a corrupted layout message.
+fn validate_chunk_dims_positive(dims: &[u64], context: &str) -> Result<()> {
+    for (i, &d) in dims.iter().enumerate() {
+        if d == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "{context} chunk dimension {i} must be positive (got 0)"
+            )));
+        }
+    }
+    Ok(())
 }

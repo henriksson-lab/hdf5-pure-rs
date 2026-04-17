@@ -55,7 +55,7 @@ impl FilterPipelineMessage {
         if let Ok(message) = &result {
             let mut th = tracehash::th_call!("hdf5.filter_pipeline.decode");
             th.input_bytes(data);
-            th.output_bool(true);
+            th.output_value(&(true));
             th.output_u64(message.version as u64);
             th.output_u64(message.filters.len() as u64);
             th.finish();
@@ -73,6 +73,14 @@ impl FilterPipelineMessage {
         for _ in 0..nfilters {
             let id = read_u16_le(data, &mut pos, "filter pipeline v1 filter id")?;
             let name_len = read_u16_le(data, &mut pos, "filter pipeline v1 name length")? as usize;
+            // The v1 spec requires the name length (including null terminator
+            // and 8-byte padding) to itself be a multiple of eight; matches
+            // upstream `H5O__pline_decode`.
+            if name_len % 8 != 0 {
+                return Err(Error::InvalidFormat(format!(
+                    "filter pipeline v1 name length {name_len} is not a multiple of eight"
+                )));
+            }
             let flags = read_u16_le(data, &mut pos, "filter pipeline v1 flags")?;
             let cd_nelmts =
                 read_u16_le(data, &mut pos, "filter pipeline v1 client data count")? as usize;

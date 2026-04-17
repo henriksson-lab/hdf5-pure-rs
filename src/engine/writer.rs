@@ -670,7 +670,6 @@ fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Vec<u8> {
         1 => buf.push(chunk_data_size as u8),
         2 => buf.extend_from_slice(&(chunk_data_size as u16).to_le_bytes()),
         4 => buf.extend_from_slice(&(chunk_data_size as u32).to_le_bytes()),
-        8 => buf.extend_from_slice(&(chunk_data_size as u64).to_le_bytes()),
         _ => unreachable!(),
     }
 

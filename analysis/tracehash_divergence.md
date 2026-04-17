@@ -1,10 +1,11 @@
 # Tracehash Divergence Tracking
 
-This project vendors the tracehash toolkit at:
-
-```text
-tools/tracehash
-```
+The Rust side pulls the tracehash library from crates.io
+([`tracehash-rs`](https://crates.io/crates/tracehash-rs)). The C-side
+helpers (`tracehash_c.c`, `tracehash_c.h`) that a patched libhdf5 build
+links against ship inside the same crate under `c/`; for local use the
+crate can be checked out at `tools/tracehash` (gitignored) so the
+patched HDF5 sources can `#include "../../tools/tracehash/c/tracehash_c.h"`.
 
 The optional Cargo feature is disabled by default:
 

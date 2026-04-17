@@ -17,8 +17,10 @@ if [ -z "${HDF5_TRACEHASH_CMD:-}" ]; then
   cat >&2 <<'EOF'
 Set HDF5_TRACEHASH_CMD to a patched HDF5 C corpus command.
 
-The patched C build should include tools/tracehash/c/tracehash_c.c and probes
-from analysis/tracehash_divergence.md. This runner exports:
+The patched C build should include the tracehash_c.c helper shipped
+under `c/` in the `tracehash-rs` crate on crates.io (version 0.1), plus
+the probes documented in analysis/tracehash_divergence.md. This runner
+exports:
   TRACEHASH_OUT=/tmp/c.tsv
   TRACEHASH_SIDE=c
   TRACEHASH_RUN_ID=hdf5-corpus

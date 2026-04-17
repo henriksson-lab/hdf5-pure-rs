@@ -163,8 +163,8 @@ fn touch_vlen_strings<R: std::io::Read + std::io::Seek>(
 fn trace_vlen_read(len: u64, data: &[u8]) {
     let mut th = tracehash::th_call!("hdf5.vlen.read");
     th.input_u64(len);
-    th.output_bool(true);
-    th.output_bytes(data);
+    th.output_value(&(true));
+    th.output_value(data);
     th.finish();
 }
 
