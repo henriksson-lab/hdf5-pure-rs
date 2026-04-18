@@ -1,9 +1,9 @@
 # Rust ↔ C function name mapping for ccc-rs cross-language compare.
 #
 # Used with:
-#   ccc-rs compare hdf5_rust.json hdf5_c.json --mapping map.toml
-#   ccc-rs missing hdf5_rust.json hdf5_c.json --mapping map.toml
-#   ccc-rs constants-diff hdf5_rust.json hdf5_c.json --mapping map.toml
+#   ccc-rs compare hdf5_rust.json hdf5_c.json --mapping ccc_mapping.toml
+#   ccc-rs missing hdf5_rust.json hdf5_c.json --mapping ccc_mapping.toml
+#   ccc-rs constants-diff hdf5_rust.json hdf5_c.json --mapping ccc_mapping.toml
 #
 # Mapping rules:
 # - "rust"       — Rust function name as ccc-rs sees it (no module path).
@@ -334,6 +334,11 @@ other = "H5O__layout_decode"
 
 [[entries]]
 rust = "decode_v4"
+rust_path = "format/messages/data_layout.rs"
+other = "H5O__layout_decode"
+
+[[entries]]
+rust = "validate_chunk_dims_positive"
 rust_path = "format/messages/data_layout.rs"
 other = "H5O__layout_decode"
 

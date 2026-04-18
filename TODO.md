@@ -292,6 +292,15 @@
   `scripts/tracehash-compare.sh` now prefers a `tracehash-compare`
   binary on `$PATH` (installed via `cargo install tracehash-rs`) and
   falls back to `cargo run --package tracehash-rs`.
+
+### blosc dependency
+
+- [ ] Publish `blosc2-pure-rs` 0.3.0 to crates.io. The dependency in
+  `Cargo.toml` now requires `^0.3` (was `^0.2`); a `[patch.crates-io]`
+  entry overrides resolution to the in-tree sibling checkout at
+  `../blosc2-rs` so local development continues to work, but
+  `cargo publish` will fail until 0.3.0 is on crates.io. Drop the
+  `[patch.crates-io]` entry once published.
 - [x] Instrument Rust-side probes for datatype message decode (`DatatypeMessage::decode`).
 - [x] Instrument Rust-side probes for object header message decode (`ObjectHeader::read_at`).
 - [x] Instrument Rust-side probes for data layout and filter pipeline decode.
@@ -307,7 +316,7 @@
 ## Concerns from ccc-rs cross-language scan (2026-04-17)
 
 Scanned with `ccc-rs compare` and `ccc-rs constants-diff` against
-`hdf5/src` using the project's `map.toml`. After clearing false positives
+`hdf5/src` using the project's `ccc_mapping.toml`. After clearing false positives
 (named constants, optimization unrolling, tracehash gates, scratch-pad
 layout literals, and an analyzer hex-parse bug since fixed upstream),
 three items remain:

@@ -18,7 +18,7 @@ crc32fast = "1.4"
 parking_lot = "0.12"
 ndarray = "0.15"
 hdf5-pure-rust-derive = { version = "0.3", path = "derive", optional = true }
-blosc2-pure-rs = { version = "0.2", optional = true }
+blosc2-pure-rs = { version = "0.3", optional = true }
 tracehash = { package = "tracehash-rs", version = "0.1", optional = true }
 
 [features]
@@ -39,3 +39,9 @@ required-features = ["tracehash"]
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.9"
+
+# Local dev override: use the in-tree blosc2-pure-rs checkout (sibling
+# directory) instead of the crates.io build. Drop this once the local
+# changes are published.
+[patch.crates-io]
+blosc2-pure-rs = { path = "../blosc2-rs" }
