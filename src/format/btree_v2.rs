@@ -201,15 +201,27 @@ fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<N
     Ok(node_info)
 }
 
-fn read_internal_records<R: Read + Seek>(
+/// Decoded v2 B-tree internal node — magic, version, the record array,
+/// and the child-pointer table. Mirrors `H5B2__cache_int_deserialize`:
+/// pure parsing, no traversal of children.
+#[derive(Debug, Clone)]
+pub struct BTreeV2InternalNode {
+    pub records: Vec<Vec<u8>>,
+    /// One entry per child pointer: `(child_addr, child_nrecords)`.
+    /// `records.len() + 1` entries total.
+    pub children: Vec<(u64, u16)>,
+}
+
+/// Pure deserializer for a v2 B-tree internal node — mirrors libhdf5's
+/// `H5B2__cache_int_deserialize`.
+fn decode_internal_node<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &BTreeV2Header,
     node_info: &[NodeInfo],
     addr: u64,
     nrecords: u16,
     depth: u16,
-    records: &mut Vec<Vec<u8>>,
-) -> Result<()> {
+) -> Result<BTreeV2InternalNode> {
     reader.seek(addr).map_err(|err| {
         Error::InvalidFormat(format!(
             "failed to seek to v2 B-tree internal node {addr}: {err}"
@@ -226,9 +238,9 @@ fn read_internal_records<R: Read + Seek>(
     let _version = reader.read_u8()?;
     let _type = reader.read_u8()?;
 
-    let mut node_records = Vec::with_capacity(nrecords as usize);
+    let mut records = Vec::with_capacity(nrecords as usize);
     for _ in 0..nrecords {
-        node_records.push(reader.read_bytes(header.record_size as usize)?);
+        records.push(reader.read_bytes(header.record_size as usize)?);
     }
 
     let max_nrec_size = bytes_needed(node_info[0].max_nrec as u64);
@@ -259,15 +271,31 @@ fn read_internal_records<R: Read + Seek>(
         children.push((child_addr, child_nrecords));
     }
 
-    for idx in 0..node_records.len() {
-        read_child_records(reader, header, node_info, children[idx], depth - 1, records)?;
-        records.push(node_records[idx].clone());
+    Ok(BTreeV2InternalNode { records, children })
+}
+
+/// Drive the decoded internal-node into the depth-first record stream —
+/// mirrors libhdf5's `H5B2_iterate` for an internal node.
+fn read_internal_records<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    header: &BTreeV2Header,
+    node_info: &[NodeInfo],
+    addr: u64,
+    nrecords: u16,
+    depth: u16,
+    records: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let node = decode_internal_node(reader, header, node_info, addr, nrecords, depth)?;
+
+    for idx in 0..node.records.len() {
+        read_child_records(reader, header, node_info, node.children[idx], depth - 1, records)?;
+        records.push(node.records[idx].clone());
     }
     read_child_records(
         reader,
         header,
         node_info,
-        children[node_records.len()],
+        node.children[node.records.len()],
         depth - 1,
         records,
     )?;

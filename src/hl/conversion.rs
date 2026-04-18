@@ -38,67 +38,29 @@ enum ConversionKind {
 
 impl ReadConversion {
     pub(crate) fn for_dataset<T: H5Type>(datatype: &DatatypeMessage) -> Result<Self> {
+        if datatype.class == DatatypeClass::Time {
+            return Err(Error::Unsupported(
+                "typed reads for HDF5 time datatypes are not supported".into(),
+            ));
+        }
         let requested = T::type_size();
         let stored = datatype.size as usize;
         let byte_order = datatype.byte_order();
 
-        let kind = if datatype.class == DatatypeClass::Time {
-            return Err(Error::Unsupported(
-                "typed reads for HDF5 time datatypes are not supported".into(),
-            ));
-        } else if matches!(
-            datatype.class,
-            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField
-        ) {
-            if let Some((dst_signed, dst_size)) = target_integer::<T>() {
-                if requested == stored {
-                    ConversionKind::SameSizeBytes
-                } else {
-                    ConversionKind::Integer {
-                        src_size: stored,
-                        src_signed: datatype.is_signed().unwrap_or(false),
-                        dst_size,
-                        dst_signed,
-                    }
-                }
-            } else if let Some(dst_size) = target_float::<T>() {
-                ConversionKind::IntegerToFloat {
-                    src_size: stored,
-                    src_signed: datatype.is_signed().unwrap_or(false),
-                    dst_size,
-                }
-            } else {
-                return Err(Error::InvalidFormat(format!(
-                    "requested element size {requested} does not match dataset element size {stored}"
-                )));
+        // Dispatch on source class — each per-class helper picks the
+        // matching `ConversionKind` (mirroring how libhdf5's
+        // `H5T_path_find` registers per-class converters in
+        // `H5T__conv_*`). Same-size byte copies are handled in the
+        // dispatcher's fallthrough so each helper can stay focused on
+        // the type-class-specific decisions.
+        let kind = match datatype.class {
+            DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField => {
+                Self::kind_for_integer_source::<T>(datatype, requested, stored)?
             }
-        } else if datatype.class == DatatypeClass::FloatingPoint {
-            if let Some(dst_size) = target_float::<T>() {
-                if requested == stored {
-                    ConversionKind::SameSizeBytes
-                } else {
-                    ConversionKind::FloatToFloat {
-                        src_size: stored,
-                        dst_size,
-                    }
-                }
-            } else if let Some((dst_signed, dst_size)) = target_integer::<T>() {
-                ConversionKind::FloatToInteger {
-                    src_size: stored,
-                    dst_size,
-                    dst_signed,
-                }
-            } else {
-                return Err(Error::InvalidFormat(format!(
-                    "requested element size {requested} does not match dataset element size {stored}"
-                )));
+            DatatypeClass::FloatingPoint => {
+                Self::kind_for_float_source::<T>(requested, stored)?
             }
-        } else if requested == stored {
-            ConversionKind::SameSizeBytes
-        } else {
-            return Err(Error::InvalidFormat(format!(
-                "requested element size {requested} does not match dataset element size {stored}"
-            )));
+            _ => Self::kind_for_passthrough(requested, stored)?,
         };
 
         Ok(Self {
@@ -106,6 +68,82 @@ impl ReadConversion {
             byte_order,
             kind,
         })
+    }
+
+    /// Source class is FixedPoint / Enum / BitField. Mirrors libhdf5's
+    /// `H5T__conv_i_i` / `H5T__conv_i_f` selection.
+    fn kind_for_integer_source<T: H5Type>(
+        datatype: &DatatypeMessage,
+        requested: usize,
+        stored: usize,
+    ) -> Result<ConversionKind> {
+        if let Some((dst_signed, dst_size)) = target_integer::<T>() {
+            Ok(if requested == stored {
+                ConversionKind::SameSizeBytes
+            } else {
+                ConversionKind::Integer {
+                    src_size: stored,
+                    src_signed: datatype.is_signed().unwrap_or(false),
+                    dst_size,
+                    dst_signed,
+                }
+            })
+        } else if let Some(dst_size) = target_float::<T>() {
+            Ok(ConversionKind::IntegerToFloat {
+                src_size: stored,
+                src_signed: datatype.is_signed().unwrap_or(false),
+                dst_size,
+            })
+        } else {
+            Err(Error::InvalidFormat(format!(
+                "requested element size {requested} does not match dataset element size {stored}"
+            )))
+        }
+    }
+
+    /// Source class is FloatingPoint. Mirrors libhdf5's
+    /// `H5T__conv_f_f` / `H5T__conv_f_i` selection.
+    fn kind_for_float_source<T: H5Type>(
+        requested: usize,
+        stored: usize,
+    ) -> Result<ConversionKind> {
+        if let Some(dst_size) = target_float::<T>() {
+            Ok(if requested == stored {
+                ConversionKind::SameSizeBytes
+            } else {
+                ConversionKind::FloatToFloat {
+                    src_size: stored,
+                    dst_size,
+                }
+            })
+        } else if let Some((dst_signed, dst_size)) = target_integer::<T>() {
+            Ok(ConversionKind::FloatToInteger {
+                src_size: stored,
+                dst_size,
+                dst_signed,
+            })
+        } else {
+            Err(Error::InvalidFormat(format!(
+                "requested element size {requested} does not match dataset element size {stored}"
+            )))
+        }
+    }
+
+    /// Source classes that fall through to a same-size byte copy
+    /// (String / Opaque / Reference / Compound / Array / VarLen). The
+    /// caller must pre-validate that a typed read is meaningful for the
+    /// given source class.
+    fn kind_for_passthrough(
+        requested: usize,
+        stored: usize,
+    ) -> Result<ConversionKind> {
+        if requested == stored {
+            Ok(ConversionKind::SameSizeBytes)
+        } else {
+            Err(Error::InvalidFormat(format!(
+                "requested element size {requested} does not match dataset element size {stored}"
+            )))
+        }
     }
 
     pub(crate) fn bytes_to_vec<T: H5Type>(&self, mut bytes: Vec<u8>) -> Result<Vec<T>> {

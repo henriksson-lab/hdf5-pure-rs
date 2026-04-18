@@ -52,6 +52,15 @@ enum VirtualSelection {
     Regular(RegularHyperslab),
 }
 
+/// Output of `decode_chunk_btree_node`: either a leaf node's chunk
+/// records (coords, addr, size, filter_mask) or an internal node's
+/// child-pointer addresses. Mirrors the structural distinction libhdf5
+/// makes via the `H5B_t` `level == 0` test.
+enum ChunkBTreeNode {
+    Leaf(Vec<(Vec<u64>, u64, u64, u32)>),
+    Internal(Vec<u64>),
+}
+
 #[derive(Debug, Clone)]
 struct RegularHyperslab {
     start: Vec<u64>,
@@ -2169,11 +2178,16 @@ impl Dataset {
 
     /// Collect all chunk entries from a v1 B-tree.
     /// Returns Vec<(coordinates, chunk_addr, chunk_size, filter_mask)>.
-    fn collect_btree_v1_chunks<R: Read + Seek>(
+    /// Pure deserializer for one v1 chunk-index B-tree node — returns
+    /// either the leaf chunk records or the list of child addresses,
+    /// depending on the node level. Mirrors libhdf5's
+    /// `H5B__cache_deserialize` for the chunk-index node type. No I/O
+    /// after the read; no recursion.
+    fn decode_chunk_btree_node<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         addr: u64,
         ndims: usize,
-    ) -> Result<Vec<(Vec<u64>, u64, u64, u32)>> {
+    ) -> Result<ChunkBTreeNode> {
         reader.seek(addr)?;
 
         let magic = reader.read_bytes(4)?;
@@ -2194,67 +2208,65 @@ impl Dataset {
         let _right_sibling = reader.read_addr()?;
 
         if level == 0 {
-            // Leaf node: read chunk records
-            let mut chunks = Vec::new();
-
+            let mut records = Vec::with_capacity(entries_used);
             for _ in 0..entries_used {
-                // Key: chunk_size(4) + filter_mask(4) + ndims+1 dim offsets(each 8 bytes)
                 let chunk_size = reader.read_u32()? as u64;
                 let filter_mask = reader.read_u32()?;
                 let mut coords = Vec::with_capacity(ndims);
                 for _ in 0..ndims {
                     coords.push(reader.read_u64()?);
                 }
-                // Skip the extra dimension (dataset element dimension, always 0)
                 let _extra = reader.read_u64()?;
-
-                // Child pointer: chunk address
                 let chunk_addr = reader.read_addr()?;
-
-                chunks.push((coords, chunk_addr, chunk_size, filter_mask));
+                records.push((coords, chunk_addr, chunk_size, filter_mask));
             }
-
-            // Read final key (not used but need to advance past it)
-            // Actually for leaf nodes we've already read all entries
-            // The final key is after the last entry
+            // Read final key to leave the reader past the node.
             let _final_chunk_size = reader.read_u32()?;
             let _final_filter_mask = reader.read_u32()?;
             for _ in 0..=ndims {
                 let _ = reader.read_u64()?;
             }
-
-            Ok(chunks)
+            Ok(ChunkBTreeNode::Leaf(records))
         } else {
-            // Internal node: collect child pointers first, then recurse. Recursing
-            // while scanning the node would leave the reader positioned in the
-            // child subtree instead of at the next internal entry.
             let mut child_addrs = Vec::with_capacity(entries_used);
             for _ in 0..entries_used {
-                // Key
                 let _chunk_size = reader.read_u32()?;
                 let _filter_mask = reader.read_u32()?;
                 for _ in 0..=ndims {
                     let _ = reader.read_u64()?;
                 }
-
-                // Child pointer
                 let child_addr = reader.read_addr()?;
                 child_addrs.push(child_addr);
             }
-
-            // Read final key before leaving the node.
             let _final_chunk_size = reader.read_u32()?;
             let _final_filter_mask = reader.read_u32()?;
             for _ in 0..=ndims {
                 let _ = reader.read_u64()?;
             }
+            Ok(ChunkBTreeNode::Internal(child_addrs))
+        }
+    }
 
-            let mut all_chunks = Vec::new();
-            for child_addr in child_addrs {
-                let mut child_chunks = Self::collect_btree_v1_chunks(reader, child_addr, ndims)?;
-                all_chunks.append(&mut child_chunks);
+    /// Walk a v1 chunk-index B-tree, depth-first. Mirrors libhdf5's
+    /// `H5D__btree_idx_iterate` / `H5B__iterate_helper`: the actual
+    /// node decoding lives in `decode_chunk_btree_node`.
+    fn collect_btree_v1_chunks<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        ndims: usize,
+    ) -> Result<Vec<(Vec<u64>, u64, u64, u32)>> {
+        let node = Self::decode_chunk_btree_node(reader, addr, ndims)?;
+        match node {
+            ChunkBTreeNode::Leaf(records) => Ok(records),
+            ChunkBTreeNode::Internal(child_addrs) => {
+                let mut all_chunks = Vec::new();
+                for child_addr in child_addrs {
+                    let mut child_chunks =
+                        Self::collect_btree_v1_chunks(reader, child_addr, ndims)?;
+                    all_chunks.append(&mut child_chunks);
+                }
+                Ok(all_chunks)
             }
-            Ok(all_chunks)
         }
     }
 

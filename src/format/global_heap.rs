@@ -14,6 +14,17 @@ pub struct GlobalHeapRef {
     pub object_index: u32,
 }
 
+/// Decoded global-heap header — the 16-byte (or so) prefix that precedes
+/// the object table. Mirrors the work `H5HG__cache_heap_deserialize` does
+/// in libhdf5: magic + version + collection size, no object iteration.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalHeapHeader {
+    /// Address the collection lives at (anchor for object-table walking).
+    pub addr: u64,
+    /// Total collection size (includes the header itself).
+    pub collection_size: u64,
+}
+
 /// A global heap collection containing objects.
 #[derive(Debug)]
 pub struct GlobalHeapCollection {
@@ -22,7 +33,22 @@ pub struct GlobalHeapCollection {
 
 impl GlobalHeapCollection {
     /// Read a global heap collection at the given address.
+    ///
+    /// Composition mirrors the C cache layer: `decode_header` parses the
+    /// fixed prefix, then `walk_objects` consumes the decoded header to
+    /// iterate the variable-length object table.
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
+        let header = Self::decode_header(reader, addr)?;
+        Self::walk_objects(reader, &header)
+    }
+
+    /// Pure header decode: validate magic+version, return `(addr,
+    /// collection_size)`. Leaves the reader positioned at the first object
+    /// entry so that callers don't have to reseek.
+    pub fn decode_header<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+    ) -> Result<GlobalHeapHeader> {
         reader.seek(addr)?;
 
         let magic = reader.read_bytes(4)?;
@@ -43,10 +69,23 @@ impl GlobalHeapCollection {
         // Collection size (includes header)
         let collection_size = reader.read_length()?;
 
+        Ok(GlobalHeapHeader {
+            addr,
+            collection_size,
+        })
+    }
+
+    /// Walk the object table from the reader's current position (which the
+    /// header decoder already advanced to). Stops at the end of the
+    /// declared collection or at an index-0 sentinel entry.
+    pub fn walk_objects<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        header: &GlobalHeapHeader,
+    ) -> Result<Self> {
         let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
-        let _header_size = 8 + reader.sizeof_size() as u64; // magic + ver + reserved + size
-        let data_end = addr
-            .checked_add(collection_size)
+        let data_end = header
+            .addr
+            .checked_add(header.collection_size)
             .ok_or_else(|| Error::InvalidFormat("global heap collection size overflow".into()))?;
 
         while reader.position()? < data_end {
@@ -79,10 +118,6 @@ impl GlobalHeapCollection {
                 ));
             }
 
-            if index == 0 {
-                reader.skip(padded)?;
-                continue;
-            }
             let data = reader.read_bytes(obj_len)?;
             objects.push((index, data));
 

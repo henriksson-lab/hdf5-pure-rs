@@ -293,6 +293,152 @@
   binary on `$PATH` (installed via `cargo install tracehash-rs`) and
   falls back to `cargo run --package tracehash-rs`.
 
+### Format-layer 1:1 mapping refactor (2026-04-18)
+
+- [x] Split fused decode+traverse functions across `src/format/` so each
+  half maps cleanly to its libhdf5 counterpart. Pure prefix-deserialize
+  helpers now live as `decode_*` (mirroring `H5*_cache_*_deserialize`),
+  with the existing `read_*` entry points either retained as thin
+  compose wrappers (where backward compatibility matters) or replaced
+  by separate traversal halves. Files touched:
+  - `format/local_heap.rs`: `decode_prefix` + `load_data_segment`.
+  - `format/global_heap.rs`: `decode_header` + `walk_objects`.
+  - `format/btree_v2.rs`: `decode_internal_node` (was inlined into
+    `read_internal_records`).
+  - `format/fixed_array.rs`: `decode_data_block_prefix` +
+    `collect_data_block_elements`.
+  - `format/extensible_array.rs`: `decode_data_block_prefix`,
+    `decode_super_block`, `decode_index_block`.
+  - `format/fractal_heap.rs`: `decode_indirect_block` +
+    `lookup_in_indirect_block`, `decode_filtered_indirect_block` +
+    `lookup_in_filtered_indirect_block` (the originating case from the
+    `read_from_indirect_block_rows` analysis).
+  No public API change; tests stay green at 468. `ccc_mapping.toml`
+  refreshed to point the canonical `H5*_cache_*_deserialize` targets at
+  the new `decode_*` halves.
+- [x] Mirror libhdf5's file/module split for the `format/` tree
+  (2026-04-18). Four files moved into directories whose layout mirrors
+  the matching `H5*.c` files in libhdf5:
+  - `format/fixed_array/{mod,hdr,dblock}.rs` ← `H5FA{,hdr,dblock,dblkpage}.c`
+    (dblkpage folded into dblock — Rust port has no separate page-cache).
+  - `format/extensible_array/{mod,hdr,iblock,sblock,dblock}.rs` ←
+    `H5EA{,hdr,iblock,sblock,dblock,dblkpage}.c`.
+  - `format/fractal_heap/{mod,hdr,iblock,dblock,man,huge,tiny,dtable}.rs` ←
+    `H5HF{,hdr,iblock,dblock,man,huge,tiny,dtable}.c`.
+  - `format/object_header/{mod,cache,chunk,msg}.rs` ← `H5O{cache,chunk,
+    message,pkg}.c`.
+  Tests stayed at 471 throughout. The smaller files
+  (`btree_v1.rs`, `btree_v2.rs`, `checksum.rs`, `global_heap.rs`,
+  `local_heap.rs`, `superblock.rs`, `symbol_table.rs`) didn't need
+  splitting — each fits on a single screen and already maps cleanly to
+  one C file.
+
+- [ ] Mirror libhdf5's file/module split for the `hl/` tree. Two
+  oversized files remain:
+  - `src/hl/mutable_file.rs` → split by subsystem (chunk-btree update,
+    extensible-array update, object-header rewrite, dense-storage
+    update, allocator/io).
+  - `src/hl/dataset.rs` (~3300 LOC) → split read paths (chunked /
+    contiguous / virtual) into siblings under `src/hl/dataset/`.
+  Bigger refactor than the `format/` tree because libhdf5 doesn't have
+  one-to-one analogs; we'd be partitioning by Rust-internal subsystem
+  rather than mirroring C exactly.
+
+- [x] Closer-to-1:1 audit (no-fusion + naming-drift, 2026-04-18). Two
+  more fusion candidates found and split:
+  - `hl/conversion.rs::for_dataset` extracted into per-source-class
+    helpers (`kind_for_integer_source`, `kind_for_float_source`,
+    `kind_for_passthrough`) mirroring libhdf5's `H5T__conv_*` family.
+    The dispatcher itself now matches on `DatatypeClass` and delegates,
+    instead of nesting 30+ lines of per-class branching.
+  - `hl/dataset.rs::collect_btree_v1_chunks` extracted a pure
+    `decode_chunk_btree_node` (returns `ChunkBTreeNode::Leaf|Internal`)
+    that mirrors `H5B__cache_deserialize` for the chunk-index node
+    type. The recursive driver becomes a thin `match` over the
+    decoded node.
+  Naming-drift audit: 451 mapped pairs have name divergence from the C
+  side, but inspection shows almost all are deliberate — Rust uses
+  descriptive names where C uses abbreviations (`compound_fields` vs
+  `H5O__dtype_decode_helper`, `read_at` vs `H5*_protect`,
+  `datatype_encoded_len` vs `H5O__dtype_size`). Renaming Rust to match
+  C's abbreviations would degrade readability for marginal TUI
+  benefit; the mapping file already bridges the two.
+
+- [x] Translation-gap audit driven by the now-comprehensive
+  `ccc_mapping.toml` (2026-04-18). Three concrete C-side validation
+  checks were missing on the Rust side and have been added:
+  - `format/fractal_heap.rs::read_managed_object` now validates the
+    heap-ID version bits (top 2 bits of byte 0). Mirrors libhdf5's
+    `H5HF_get_obj_len` "incorrect heap ID version" check.
+  - `format/fractal_heap.rs::read_managed` now bounds the decoded
+    object offset against `2^max_heap_size` and the object length
+    against `max_managed_obj_size`. Mirrors `H5HF__man_op_real`.
+  - `format/messages/link_info.rs::decode` now rejects
+    `max_creation_index > u32::MAX`, matching upstream
+    `H5O__linfo_decode`'s `H5L_MAX_CRT_IDX_VAL` bound. Covered by two
+    tests in `tests/robustness_test.rs`.
+  Other C-only error strings were investigated and cleared as
+  non-actionable: most are runtime identifier checks that don't apply
+  to a typed Rust API, validation that already lives in a different
+  function, or cross-checks against state we don't have at decode time
+  (datatype-vs-fill-value-size).
+
+- [x] `ccc_mapping.toml` extended to **100% coverage** (732/732 Rust
+  functions, 691 entries — was 19% / 140 entries before this work).
+  Every Rust function in `src/` has a mapping to its closest libhdf5
+  counterpart. Categories covered, with the C target each maps to:
+  - High-level public API (`hl/file.rs`, `hl/group.rs`, `hl/dataset.rs`,
+    `hl/attribute.rs`, `hl/datatype.rs`, `hl/dataspace.rs`,
+    `hl/writable_file.rs`, `hl/mutable_file.rs`, `hl/dataset_builder.rs`,
+    `hl/types.rs`, `hl/selection.rs`, `hl/conversion.rs`,
+    `hl/plist/*`) → `H5{F,G,D,A,T,S,L,P,R,I,Z}*` API + `H5*__cache_*`.
+  - Format-layer decoders / encoders / lookups (`format/*`,
+    `format/messages/*`) → `H5O__*_decode/encode/size`,
+    `H5{B,B2,EA,FA,HF,HG,HL,F}__cache_*`, `H5*_iterate`, `H5*__man_op_real`.
+  - Engine layer (`engine/{writer,handle,allocator}.rs`) → `H5{I,F,MF}*`.
+  - I/O primitives (`io/reader.rs`/`io/writer.rs`) →
+    `H5F__{en,de}code_uint{8,16,32,64}` / `H5F_addr_{en,de}code` /
+    `H5F_{EN,DE}CODE_LENGTH` / `H5FD_{read,write,seek}`.
+  - Filter pipeline (`filters/*`) → `H5Z_pipeline` + `H5Z__filter_{deflate,
+    shuffle,fletcher32,scaleoffset,nbit,szip,blosc,lzf}` and helpers.
+  - Pure utility helpers (`ensure_available`, `read_le_u64`, `read_u8`,
+    `bit_is_set`, `log2_*`, `bytes_needed`, `usize_from_u64`) →
+    `UINT*DECODE` macro family / `H5_IS_BUFFER_OVERFLOW` /
+    `H5VM_{bit_get,log2_*}` / `H5_ASSIGN_OVERFLOW`.
+  - Trait impls (`Display::fmt`, `Error::source`, `From::from`,
+    `Default::default`) → `H5E*` / `H5I_init_interface` / `H5F__super_init`.
+  - Constructor `new` methods → `H5*_create` / `H5*_init`.
+  - `inner` / `inner_mut` accessors → `H5F_get_intent`.
+  - Test functions → mapped to the C function under test
+    (e.g. `test_lzf_*` → `H5Z__filter_lzf`).
+  - Tracehash probe `#[cfg]` companion bodies → mapped to the C
+    function whose behavior the probe captures.
+
+- [x] Write-side fusion audit (no-fusion rule, 2026-04-18). Audited
+  `hl/mutable_file.rs` and `engine/writer.rs`. Of the four originally
+  flagged candidates, two were genuine fusions and have been split
+  (encode-half extracted into a pure `encode_*` returning `Vec<u8>`,
+  with the wrapper composing alloc + encode + write):
+  - `encode_extensible_array_data_block_prefix` ↔ `H5EA__cache_dblock_serialize`
+  - `encode_extensible_array_data_block_page` ↔ `H5EA__cache_dblk_page_serialize`
+  - `encode_chunk_btree_node` ↔ `H5B__cache_serialize` (extracted from
+    `write_chunk_btree_node`).
+  Two were false positives: `rewrite_extensible_array_super_block` is
+  read-modify-write (patches existing on-disk bytes, no encode-from-scratch
+  step to extract); `rewrite_leaf_chunk_btree` is an orchestrator over
+  already-separate primitives (`write_btree_entry`, `write_btree_final_key`,
+  `rebuild_chunk_btree_from_entries`). The split is allocation-neutral —
+  the original code was already building the same `Vec<u8>` internally.
+
+- [ ] ccc-rs limitation: each C function can only be bound once via
+  `[[entries]]`, so when two Rust halves correspond to the same
+  fused-on-the-C-side deserializer (e.g. `decode_indirect_block` and
+  `decode_filtered_indirect_block` both → `H5HF__cache_iblock_deserialize`,
+  or `decode_header` and `walk_objects` both →
+  `H5HG__cache_heap_deserialize`), only one gets the explicit mapping.
+  The other falls through to fingerprint matching. Worth either teaching
+  ccc-rs to allow N→1 explicit bindings, or accepting the noise.
+
 ### blosc dependency
 
 - [ ] Publish `blosc2-pure-rs` 0.3.0 to crates.io. The dependency in

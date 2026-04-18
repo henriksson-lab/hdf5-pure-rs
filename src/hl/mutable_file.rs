@@ -1294,21 +1294,20 @@ impl MutableFile {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_extensible_array_data_block(
-        &mut self,
+    /// Pure encoder for the EADB prefix (+ inline elements when the block
+    /// is not paginated). Mirrors the serialize half of libhdf5's
+    /// `H5EA__cache_dblock_serialize`: no I/O, bytes out.
+    fn encode_extensible_array_data_block_prefix(
+        &self,
         header_addr: u64,
         header: &MutableExtensibleArrayHeader,
         block_offset: u64,
         data_block_elements: usize,
         initial: Option<(usize, u64, u64, bool, usize)>,
-        initialized_page: Option<usize>,
-    ) -> Result<u64> {
-        let data_block_size = self.extensible_array_data_block_size(header, data_block_elements);
-        let data_block_addr = self.append_aligned_zeros(data_block_size, 8)?;
+    ) -> Vec<u8> {
         let pages = Self::extensible_array_data_block_pages(header, data_block_elements);
         let prefix_size =
             4 + 1 + 1 + self.superblock.sizeof_addr as usize + header.array_offset_size as usize;
-
         let mut prefix = Vec::with_capacity(
             prefix_size
                 + if pages == 0 {
@@ -1351,57 +1350,73 @@ impl MutableFile {
                     prefix.extend_from_slice(&0u32.to_le_bytes());
                 }
             }
-            let checksum = checksum_metadata(&prefix);
-            prefix.extend_from_slice(&checksum.to_le_bytes());
-            self.write_handle.seek(SeekFrom::Start(data_block_addr))?;
-            self.write_handle.write_all(&prefix)?;
-            return Ok(data_block_addr);
         }
-
         let checksum = checksum_metadata(&prefix);
         prefix.extend_from_slice(&checksum.to_le_bytes());
+        prefix
+    }
+
+    /// Allocate + encode + write an extensible-array data block. Composes
+    /// `encode_extensible_array_data_block_prefix` with file I/O. C-side
+    /// analogue: `H5EA__dblock_create`.
+    fn create_extensible_array_data_block(
+        &mut self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        block_offset: u64,
+        data_block_elements: usize,
+        initial: Option<(usize, u64, u64, bool, usize)>,
+        initialized_page: Option<usize>,
+    ) -> Result<u64> {
+        let data_block_size = self.extensible_array_data_block_size(header, data_block_elements);
+        let data_block_addr = self.append_aligned_zeros(data_block_size, 8)?;
+
+        let prefix = self.encode_extensible_array_data_block_prefix(
+            header_addr,
+            header,
+            block_offset,
+            data_block_elements,
+            initial,
+        );
         self.write_handle.seek(SeekFrom::Start(data_block_addr))?;
         self.write_handle.write_all(&prefix)?;
 
-        if let Some(page_index) = initialized_page {
-            let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) = initial
-            else {
-                return Err(Error::InvalidFormat(
-                    "initialized extensible-array page requires an initial element".into(),
-                ));
-            };
-            self.write_extensible_array_page(
-                data_block_addr,
-                header,
-                page_index,
-                Some((
-                    initial_idx % header.max_data_block_page_elements,
-                    chunk_addr,
-                    chunk_size,
-                    filtered,
-                    chunk_size_len,
-                )),
-            )?;
+        let pages = Self::extensible_array_data_block_pages(header, data_block_elements);
+        if pages > 0 {
+            if let Some(page_index) = initialized_page {
+                let Some((initial_idx, chunk_addr, chunk_size, filtered, chunk_size_len)) = initial
+                else {
+                    return Err(Error::InvalidFormat(
+                        "initialized extensible-array page requires an initial element".into(),
+                    ));
+                };
+                self.write_extensible_array_page(
+                    data_block_addr,
+                    header,
+                    page_index,
+                    Some((
+                        initial_idx % header.max_data_block_page_elements,
+                        chunk_addr,
+                        chunk_size,
+                        filtered,
+                        chunk_size_len,
+                    )),
+                )?;
+            }
         }
 
         Ok(data_block_addr)
     }
 
-    fn write_extensible_array_page(
-        &mut self,
-        data_block_addr: u64,
+    /// Pure encoder for one extensible-array data-block page (element
+    /// records + trailing checksum). Mirrors the per-page serialize path
+    /// in libhdf5's `H5EA__cache_dblk_page_serialize`.
+    fn encode_extensible_array_data_block_page(
+        &self,
         header: &MutableExtensibleArrayHeader,
-        page_index: usize,
         initial: Option<(usize, u64, u64, bool, usize)>,
-    ) -> Result<()> {
+    ) -> Vec<u8> {
         let page_size = header.max_data_block_page_elements * header.raw_element_size + 4;
-        let prefix_size = 4
-            + 1
-            + 1
-            + self.superblock.sizeof_addr as usize
-            + header.array_offset_size as usize
-            + 4;
-        let page_addr = data_block_addr + prefix_size as u64 + (page_index * page_size) as u64;
         let mut page = Vec::with_capacity(page_size);
         let fill_addr = crate::io::reader::UNDEF_ADDR.to_le_bytes();
         for idx in 0..header.max_data_block_page_elements {
@@ -1429,6 +1444,26 @@ impl MutableFile {
         }
         let checksum = checksum_metadata(&page);
         page.extend_from_slice(&checksum.to_le_bytes());
+        page
+    }
+
+    /// Encode + write one extensible-array data-block page.
+    fn write_extensible_array_page(
+        &mut self,
+        data_block_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        page_index: usize,
+        initial: Option<(usize, u64, u64, bool, usize)>,
+    ) -> Result<()> {
+        let page_size = header.max_data_block_page_elements * header.raw_element_size + 4;
+        let prefix_size = 4
+            + 1
+            + 1
+            + self.superblock.sizeof_addr as usize
+            + header.array_offset_size as usize
+            + 4;
+        let page_addr = data_block_addr + prefix_size as u64 + (page_index * page_size) as u64;
+        let page = self.encode_extensible_array_data_block_page(header, initial);
         self.write_handle.seek(SeekFrom::Start(page_addr))?;
         self.write_handle.write_all(&page)?;
         Ok(())
@@ -1568,6 +1603,35 @@ impl MutableFile {
 
         let super_block_size = self.extensible_array_super_block_size(header, super_info);
         let super_block_addr = self.append_aligned_zeros(super_block_size, 8)?;
+        let block = self.encode_extensible_array_super_block(
+            header_addr,
+            header,
+            super_info,
+            local_data_block_index,
+            page_index,
+            data_block_addr,
+            super_block_size,
+        )?;
+        self.write_handle.seek(SeekFrom::Start(super_block_addr))?;
+        self.write_handle.write_all(&block)?;
+        Ok((super_block_addr, data_block_addr))
+    }
+
+    /// Pure encoder for an extensible-array super block (EASB magic +
+    /// header-addr + offset + page-init bitmap + data-block addr table +
+    /// checksum). Mirrors the serialize half of libhdf5's
+    /// `H5EA__cache_sblock_serialize`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_extensible_array_super_block(
+        &self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        super_info: &MutableExtensibleArraySuperBlockInfo,
+        local_data_block_index: usize,
+        page_index: Option<usize>,
+        data_block_addr: u64,
+        super_block_size: usize,
+    ) -> Result<Vec<u8>> {
         let page_init_size =
             Self::extensible_array_page_init_size(header, super_info.data_block_elements);
         let mut block = Vec::with_capacity(super_block_size);
@@ -1600,9 +1664,7 @@ impl MutableFile {
         }
         let checksum = checksum_metadata(&block);
         block.extend_from_slice(&checksum.to_le_bytes());
-        self.write_handle.seek(SeekFrom::Start(super_block_addr))?;
-        self.write_handle.write_all(&block)?;
-        Ok((super_block_addr, data_block_addr))
+        Ok(block)
     }
 
     fn read_extensible_array_super_block_data_addr(
@@ -1938,7 +2000,13 @@ impl MutableFile {
         )
     }
 
-    fn append_btree_v2_leaf(&mut self, header: &BTreeV2Header, records: &[Vec<u8>]) -> Result<u64> {
+    /// Pure encoder for a v2 B-tree leaf node (BTLF magic + records +
+    /// checksum). Mirrors the serialize half of libhdf5's
+    /// `H5B2__cache_leaf_serialize`.
+    fn encode_btree_v2_leaf(
+        header: &BTreeV2Header,
+        records: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
         if records.len() > u16::MAX as usize {
             return Err(Error::Unsupported(
                 "v2 B-tree leaf record count exceeds u16".into(),
@@ -1958,18 +2026,27 @@ impl MutableFile {
         }
         let checksum = checksum_metadata(&leaf);
         leaf.extend_from_slice(&checksum.to_le_bytes());
+        Ok(leaf)
+    }
+
+    /// Allocate + encode + write a v2 B-tree leaf node.
+    fn append_btree_v2_leaf(&mut self, header: &BTreeV2Header, records: &[Vec<u8>]) -> Result<u64> {
+        let leaf = Self::encode_btree_v2_leaf(header, records)?;
         let addr = self.append_aligned_zeros(leaf.len(), 8)?;
         self.write_handle.seek(SeekFrom::Start(addr))?;
         self.write_handle.write_all(&leaf)?;
         Ok(addr)
     }
 
-    fn append_btree_v2_depth1_internal(
-        &mut self,
+    /// Pure encoder for a v2 B-tree depth-1 internal node (BTIN magic +
+    /// separators + child pointers + checksum). Mirrors the serialize
+    /// half of libhdf5's `H5B2__cache_int_serialize`.
+    fn encode_btree_v2_depth1_internal(
+        &self,
         header: &BTreeV2Header,
         separators: &[Vec<u8>],
         children: &[(u64, u16)],
-    ) -> Result<u64> {
+    ) -> Result<Vec<u8>> {
         if children.len() != separators.len() + 1 {
             return Err(Error::InvalidFormat(
                 "v2 B-tree internal child/record count mismatch".into(),
@@ -2002,6 +2079,17 @@ impl MutableFile {
         }
         let checksum = checksum_metadata(&node);
         node.extend_from_slice(&checksum.to_le_bytes());
+        Ok(node)
+    }
+
+    /// Allocate + encode + write a v2 B-tree depth-1 internal node.
+    fn append_btree_v2_depth1_internal(
+        &mut self,
+        header: &BTreeV2Header,
+        separators: &[Vec<u8>],
+        children: &[(u64, u16)],
+    ) -> Result<u64> {
+        let node = self.encode_btree_v2_depth1_internal(header, separators, children)?;
         let addr = self.append_aligned_zeros(node.len(), 8)?;
         self.write_handle.seek(SeekFrom::Start(addr))?;
         self.write_handle.write_all(&node)?;
@@ -2539,14 +2627,17 @@ impl MutableFile {
         Ok(pos)
     }
 
-    fn write_chunk_btree_node(
-        &mut self,
-        pos: u64,
+    /// Pure encoder for a v1 chunk-index B-tree node (TREE magic, header,
+    /// up to 64 (key, child) pairs, trailing key, zero-padded to
+    /// `chunk_btree_node_size`). Mirrors libhdf5's `H5B__cache_serialize`
+    /// for chunk-index B-trees.
+    fn encode_chunk_btree_node(
+        &self,
         level: u8,
         entries: &[ChunkBTreeEntry],
         element_size: u32,
         sizeof_addr: usize,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         if entries.len() > 64 {
             return Err(Error::InvalidFormat(
                 "chunk B-tree node entry count exceeds v1 node capacity".into(),
@@ -2584,7 +2675,19 @@ impl MutableFile {
         }
         buf.extend_from_slice(&(element_size as u64).to_le_bytes());
         buf.resize(node_size, 0);
+        Ok(buf)
+    }
 
+    /// Encode + write a v1 chunk-index B-tree node.
+    fn write_chunk_btree_node(
+        &mut self,
+        pos: u64,
+        level: u8,
+        entries: &[ChunkBTreeEntry],
+        element_size: u32,
+        sizeof_addr: usize,
+    ) -> Result<()> {
+        let buf = self.encode_chunk_btree_node(level, entries, element_size, sizeof_addr)?;
         self.write_handle.seek(SeekFrom::Start(pos))?;
         self.write_handle.write_all(&buf)?;
         Ok(())

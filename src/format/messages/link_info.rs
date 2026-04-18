@@ -38,6 +38,15 @@ impl LinkInfoMessage {
 
         let max_creation_index = if has_max_crt_order {
             let val = read_le_u64(data, &mut pos, 8, "link info max creation index")?;
+            // libhdf5 bounds this field at H5L_MAX_CRT_IDX_VAL == (uint32_t)-1.
+            // Reject larger values to match `H5O__linfo_decode`'s "invalid
+            // max creation order value for message" check.
+            if val > u32::MAX as u64 {
+                return Err(Error::InvalidFormat(format!(
+                    "link info max creation index {val} exceeds supported maximum {}",
+                    u32::MAX
+                )));
+            }
             Some(val)
         } else {
             None

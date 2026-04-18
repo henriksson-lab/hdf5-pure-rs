@@ -7,6 +7,16 @@ use crate::io::reader::HdfReader;
 const HEAP_MAGIC: [u8; 4] = [b'H', b'E', b'A', b'P'];
 const MAX_LOCAL_HEAP_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Parsed local-heap prefix (the on-disk header that precedes the data
+/// segment). Mirrors the work `H5HL__cache_prefix_deserialize` does in
+/// libhdf5: header bytes in, struct out, no data-segment I/O.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalHeapPrefix {
+    pub data_size: u64,
+    pub free_list_offset: u64,
+    pub data_addr: u64,
+}
+
 /// A local heap stores variable-length strings (link names) for v1 groups.
 #[derive(Debug, Clone)]
 pub struct LocalHeap {
@@ -16,7 +26,21 @@ pub struct LocalHeap {
 
 impl LocalHeap {
     /// Read a local heap from the given address.
+    ///
+    /// Composition mirrors the C side: `decode_prefix` parses the on-disk
+    /// header (`H5HL__cache_prefix_deserialize`), then we follow the
+    /// `data_addr` pointer to pull the actual heap bytes.
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
+        let prefix = Self::decode_prefix(reader, addr)?;
+        Self::load_data_segment(reader, &prefix)
+    }
+
+    /// Pure header decode: read & validate the local-heap prefix at `addr`,
+    /// returning its parsed fields. No I/O against the data segment.
+    pub fn decode_prefix<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+    ) -> Result<LocalHeapPrefix> {
         reader.seek(addr)?;
 
         // Magic
@@ -38,15 +62,25 @@ impl LocalHeap {
         let data_size = reader.read_length()?;
 
         // Free list head offset
-        let _free_list_offset = reader.read_length()?;
+        let free_list_offset = reader.read_length()?;
 
         // Data segment address
         let data_addr = reader.read_addr()?;
 
-        // Read the data segment
-        reader.seek(data_addr)?;
-        let data = reader.read_bytes(heap_len(data_size, "local heap data size")?)?;
+        Ok(LocalHeapPrefix {
+            data_size,
+            free_list_offset,
+            data_addr,
+        })
+    }
 
+    /// Follow a decoded prefix to load the heap's data segment.
+    pub fn load_data_segment<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        prefix: &LocalHeapPrefix,
+    ) -> Result<Self> {
+        reader.seek(prefix.data_addr)?;
+        let data = reader.read_bytes(heap_len(prefix.data_size, "local heap data size")?)?;
         Ok(Self { data })
     }
 
