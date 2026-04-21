@@ -24,6 +24,10 @@ pub struct DataspaceMessage {
 
 impl DataspaceMessage {
     pub fn decode(data: &[u8]) -> Result<Self> {
+        Self::decode_impl(data)
+    }
+
+    fn decode_impl(data: &[u8]) -> Result<Self> {
         if data.len() < 4 {
             return Err(Error::InvalidFormat("dataspace message too short".into()));
         }

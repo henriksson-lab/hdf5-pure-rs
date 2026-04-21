@@ -75,6 +75,36 @@ const MAX_DATATYPE_MEMBERS: usize = 4096;
 
 impl DatatypeMessage {
     pub fn decode(data: &[u8]) -> Result<Self> {
+        let message = Self::decode_impl(data)?;
+
+        #[cfg(feature = "tracehash")]
+        {
+            let class_val = data[0] & 0x0F;
+            let version = (data[0] >> 4) & 0x0F;
+            let class_bits = [data[1], data[2], data[3]];
+            let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+            let mut th = tracehash::th_call!("hdf5.datatype.decode");
+            th.input_bytes(data);
+            th.output_value(&(true));
+            th.output_u64(class_val as u64);
+            th.finish();
+
+            let mut th = tracehash::th_call!("hdf5.datatype.properties");
+            th.input_bytes(data);
+            th.output_value(&(true));
+            th.output_u64(version as u64);
+            th.output_u64(class_val as u64);
+            th.output_value(&class_bits[..]);
+            th.output_u64(size as u64);
+            th.output_value(&message.properties);
+            th.finish();
+        }
+
+        Ok(message)
+    }
+
+    fn decode_impl(data: &[u8]) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::InvalidFormat("datatype message too short".into()));
         }
@@ -140,9 +170,7 @@ impl DatatypeMessage {
             let precision = u16::from_le_bytes([properties[2], properties[3]]) as u64;
             let size_bits = (size as u64).saturating_mul(8);
             if precision == 0 {
-                return Err(Error::InvalidFormat(
-                    "datatype precision is zero".into(),
-                ));
+                return Err(Error::InvalidFormat("datatype precision is zero".into()));
             }
             if bit_offset > size_bits {
                 return Err(Error::InvalidFormat(format!(
@@ -213,34 +241,13 @@ impl DatatypeMessage {
             }
         }
 
-        let message = Self {
+        Ok(Self {
             version,
             class,
             class_bits,
             size,
             properties,
-        };
-
-        #[cfg(feature = "tracehash")]
-        {
-            let mut th = tracehash::th_call!("hdf5.datatype.decode");
-            th.input_bytes(data);
-            th.output_value(&(true));
-            th.output_u64(class_val as u64);
-            th.finish();
-
-            let mut th = tracehash::th_call!("hdf5.datatype.properties");
-            th.input_bytes(data);
-            th.output_value(&(true));
-            th.output_u64(version as u64);
-            th.output_u64(class_val as u64);
-            th.output_value(&class_bits[..]);
-            th.output_u64(size as u64);
-            th.output_value(&message.properties);
-            th.finish();
-        }
-
-        Ok(message)
+        })
     }
 
     /// Get byte order for numeric types.
@@ -294,6 +301,10 @@ impl DatatypeMessage {
     /// Parse compound type member fields.
     /// Returns field names, byte offsets, member sizes, and member datatypes.
     pub fn compound_fields(&self) -> Result<Vec<CompoundField>> {
+        self.decode_compound_fields_impl()
+    }
+
+    fn decode_compound_fields_impl(&self) -> Result<Vec<CompoundField>> {
         let nmembers = self
             .compound_nmembers()
             .ok_or_else(|| Error::InvalidFormat("not a compound datatype".into()))?
@@ -339,28 +350,79 @@ impl DatatypeMessage {
             let byte_offset = read_le_var_usize(&data[p..p + offset_size]);
             p += offset_size;
 
-            // Version 1/2: skip dimension info (1+3+4+4+16 = 28 bytes)
-            if self.version < 3 {
+            let member_dt = if self.version == 1 {
+                // Version 1 compound members may carry inline arrayness that
+                // newer encodings represent as a dedicated array datatype.
                 if p + 28 > data.len() {
                     return Err(Error::InvalidFormat(
                         "compound datatype member dimension block is truncated".into(),
                     ));
                 }
-                p += 28;
-            }
 
-            // Embedded member datatype
-            if p + 8 > data.len() {
-                return Err(Error::InvalidFormat(
-                    "compound datatype member datatype is truncated".into(),
-                ));
-            }
-            let encoded_len = datatype_encoded_len(&data[p..])?;
-            let member_dt = DatatypeMessage::decode(&data[p..p + encoded_len])?;
+                let ndims = data[p] as usize;
+                if ndims > 4 {
+                    return Err(Error::InvalidFormat(
+                        "compound datatype inline array rank exceeds supported maximum 4".into(),
+                    ));
+                }
+                let dims_start = p + 12;
+                let mut dims = Vec::with_capacity(ndims);
+                for idx in 0..4 {
+                    let base = dims_start + idx * 4;
+                    let dim = u32::from_le_bytes([
+                        data[base],
+                        data[base + 1],
+                        data[base + 2],
+                        data[base + 3],
+                    ]) as u64;
+                    if idx < ndims {
+                        if dim == 0 {
+                            return Err(Error::InvalidFormat(
+                                "compound datatype inline array dimension must be positive".into(),
+                            ));
+                        }
+                        dims.push(dim);
+                    }
+                }
+                p += 28;
+
+                if p + 8 > data.len() {
+                    return Err(Error::InvalidFormat(
+                        "compound datatype member datatype is truncated".into(),
+                    ));
+                }
+                let encoded_len = datatype_encoded_len(&data[p..])?;
+                let base_dt = DatatypeMessage::decode(&data[p..p + encoded_len])?;
+                p += encoded_len;
+
+                if dims.is_empty() {
+                    base_dt
+                } else {
+                    create_legacy_compound_array_member(base_dt, dims)?
+                }
+            } else {
+                if self.version < 3 {
+                    if p + 28 > data.len() {
+                        return Err(Error::InvalidFormat(
+                            "compound datatype member dimension block is truncated".into(),
+                        ));
+                    }
+                    p += 28;
+                }
+
+                if p + 8 > data.len() {
+                    return Err(Error::InvalidFormat(
+                        "compound datatype member datatype is truncated".into(),
+                    ));
+                }
+                let encoded_len = datatype_encoded_len(&data[p..])?;
+                let member_dt = DatatypeMessage::decode(&data[p..p + encoded_len])?;
+                p += encoded_len;
+                member_dt
+            };
             let member_type_size = member_dt.size as usize;
             let member_class = member_dt.class;
             let byte_order = member_dt.byte_order();
-            p += encoded_len;
 
             let member_end = byte_offset.checked_add(member_type_size).ok_or_else(|| {
                 Error::InvalidFormat("compound datatype member offset overflow".into())
@@ -838,4 +900,68 @@ fn read_unsigned_value(bytes: &[u8], little_endian: bool) -> u64 {
         }
     }
     value
+}
+
+fn create_legacy_compound_array_member(
+    base_dt: DatatypeMessage,
+    dims: Vec<u64>,
+) -> Result<DatatypeMessage> {
+    let nelem = dims.iter().try_fold(1u64, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| Error::InvalidFormat("array datatype size overflow".into()))
+    })?;
+    let total_size = nelem
+        .checked_mul(base_dt.size as u64)
+        .ok_or_else(|| Error::InvalidFormat("array datatype size overflow".into()))?;
+    let size = u32::try_from(total_size)
+        .map_err(|_| Error::InvalidFormat("array datatype size overflow".into()))?;
+
+    let mut properties = vec![dims.len() as u8];
+    properties.extend_from_slice(&[0; 3]);
+    for dim in &dims {
+        let dim = u32::try_from(*dim)
+            .map_err(|_| Error::InvalidFormat("array datatype dimension exceeds u32".into()))?;
+        properties.extend_from_slice(&dim.to_le_bytes());
+    }
+    for _ in &dims {
+        properties.extend_from_slice(&0u32.to_le_bytes());
+    }
+    properties.extend_from_slice(&encode_embedded_datatype_message(&base_dt)?);
+
+    Ok(DatatypeMessage {
+        version: 2,
+        class: DatatypeClass::Array,
+        class_bits: [0, 0, 0],
+        size,
+        properties,
+    })
+}
+
+fn encode_embedded_datatype_message(message: &DatatypeMessage) -> Result<Vec<u8>> {
+    let class = match message.class {
+        DatatypeClass::FixedPoint => 0u8,
+        DatatypeClass::FloatingPoint => 1,
+        DatatypeClass::Time => 2,
+        DatatypeClass::String => 3,
+        DatatypeClass::BitField => 4,
+        DatatypeClass::Opaque => 5,
+        DatatypeClass::Compound => 6,
+        DatatypeClass::Reference => 7,
+        DatatypeClass::Enum => 8,
+        DatatypeClass::VarLen => 9,
+        DatatypeClass::Array => 10,
+    };
+    if message.version == 0 || message.version > 0x0f {
+        return Err(Error::InvalidFormat(format!(
+            "datatype message version {} cannot be re-encoded",
+            message.version
+        )));
+    }
+
+    let mut buf = Vec::with_capacity(8 + message.properties.len());
+    buf.push((message.version << 4) | class);
+    buf.extend_from_slice(&message.class_bits);
+    buf.extend_from_slice(&message.size.to_le_bytes());
+    buf.extend_from_slice(&message.properties);
+    Ok(buf)
 }

@@ -57,9 +57,7 @@ impl ReadConversion {
             DatatypeClass::FixedPoint | DatatypeClass::Enum | DatatypeClass::BitField => {
                 Self::kind_for_integer_source::<T>(datatype, requested, stored)?
             }
-            DatatypeClass::FloatingPoint => {
-                Self::kind_for_float_source::<T>(requested, stored)?
-            }
+            DatatypeClass::FloatingPoint => Self::kind_for_float_source::<T>(requested, stored)?,
             _ => Self::kind_for_passthrough(requested, stored)?,
         };
 
@@ -103,10 +101,7 @@ impl ReadConversion {
 
     /// Source class is FloatingPoint. Mirrors libhdf5's
     /// `H5T__conv_f_f` / `H5T__conv_f_i` selection.
-    fn kind_for_float_source<T: H5Type>(
-        requested: usize,
-        stored: usize,
-    ) -> Result<ConversionKind> {
+    fn kind_for_float_source<T: H5Type>(requested: usize, stored: usize) -> Result<ConversionKind> {
         if let Some(dst_size) = target_float::<T>() {
             Ok(if requested == stored {
                 ConversionKind::SameSizeBytes
@@ -133,10 +128,7 @@ impl ReadConversion {
     /// (String / Opaque / Reference / Compound / Array / VarLen). The
     /// caller must pre-validate that a typed read is meaningful for the
     /// given source class.
-    fn kind_for_passthrough(
-        requested: usize,
-        stored: usize,
-    ) -> Result<ConversionKind> {
+    fn kind_for_passthrough(requested: usize, stored: usize) -> Result<ConversionKind> {
         if requested == stored {
             Ok(ConversionKind::SameSizeBytes)
         } else {

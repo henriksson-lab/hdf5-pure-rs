@@ -24,9 +24,9 @@ pub(super) fn read_v1_continuation<R: Read + Seek>(
     reader.seek(addr)?;
 
     // V1 continuation chunks are just raw messages, no header.
-    let chunk_end = addr.checked_add(length).ok_or_else(|| {
-        Error::InvalidFormat("object header continuation range overflow".into())
-    })?;
+    let chunk_end = addr
+        .checked_add(length)
+        .ok_or_else(|| Error::InvalidFormat("object header continuation range overflow".into()))?;
     let mut continuations = Vec::new();
     read_v1_messages(
         reader,
@@ -76,9 +76,7 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
     let data_end = addr
         .checked_add(length)
         .and_then(|end| end.checked_sub(4))
-        .ok_or_else(|| {
-            Error::InvalidFormat("object header continuation range overflow".into())
-        })?; // minus checksum
+        .ok_or_else(|| Error::InvalidFormat("object header continuation range overflow".into()))?; // minus checksum
 
     let mut continuations = Vec::new();
     read_v2_messages(
@@ -133,9 +131,9 @@ pub(super) fn reserve_continuation_range<R: Read + Seek>(
             "object header continuation chunk is too small".into(),
         ));
     }
-    let end = addr.checked_add(length).ok_or_else(|| {
-        Error::InvalidFormat("object header continuation range overflow".into())
-    })?;
+    let end = addr
+        .checked_add(length)
+        .ok_or_else(|| Error::InvalidFormat("object header continuation range overflow".into()))?;
     let file_len = reader.len()?;
     if end > file_len {
         return Err(Error::InvalidFormat(

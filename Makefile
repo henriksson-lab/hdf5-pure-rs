@@ -1,4 +1,14 @@
 all:
+
+
+cloc_rs:
+	cloc src
+
+cloc_orig:
+	cloc hdf5/c++/
+
+
+
 publish:
 	cargo ws publish
 

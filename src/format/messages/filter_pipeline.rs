@@ -29,6 +29,22 @@ pub struct FilterPipelineMessage {
 
 impl FilterPipelineMessage {
     pub fn decode(data: &[u8]) -> Result<Self> {
+        let result = Self::decode_impl(data);
+
+        #[cfg(feature = "tracehash")]
+        if let Ok(message) = &result {
+            let mut th = tracehash::th_call!("hdf5.filter_pipeline.decode");
+            th.input_bytes(data);
+            th.output_value(&(true));
+            th.output_u64(message.version as u64);
+            th.output_u64(message.filters.len() as u64);
+            th.finish();
+        }
+
+        result
+    }
+
+    fn decode_impl(data: &[u8]) -> Result<Self> {
         if data.len() < 2 {
             return Err(Error::InvalidFormat(
                 "filter pipeline message too short".into(),
@@ -50,16 +66,6 @@ impl FilterPipelineMessage {
                 "filter pipeline version {version}"
             ))),
         };
-
-        #[cfg(feature = "tracehash")]
-        if let Ok(message) = &result {
-            let mut th = tracehash::th_call!("hdf5.filter_pipeline.decode");
-            th.input_bytes(data);
-            th.output_value(&(true));
-            th.output_u64(message.version as u64);
-            th.output_u64(message.filters.len() as u64);
-            th.finish();
-        }
 
         result
     }

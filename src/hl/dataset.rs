@@ -121,6 +121,7 @@ impl Dataset {
         let mut layout = None;
         let mut filter_pipeline = None;
         let mut fill_value = None;
+        let mut old_fill_value_raw = None;
         let mut has_external_file_list = false;
 
         for msg in messages {
@@ -145,7 +146,7 @@ impl Dataset {
                     fill_value = Some(FillValueMessage::decode(&msg.data)?);
                 }
                 object_header::MSG_FILL_VALUE_OLD => {
-                    fill_value = Some(FillValueMessage::decode_old(&msg.data)?);
+                    old_fill_value_raw = Some(msg.data.as_slice());
                 }
                 object_header::MSG_EXTERNAL_FILE_LIST => {
                     has_external_file_list = true;
@@ -158,6 +159,15 @@ impl Dataset {
             return Err(Error::Unsupported(
                 "external raw data storage is not implemented".into(),
             ));
+        }
+
+        if fill_value.is_none() {
+            if let (Some(raw), Some(datatype)) = (old_fill_value_raw, datatype.as_ref()) {
+                fill_value = Some(FillValueMessage::decode_old_with_datatype_size(
+                    raw,
+                    Some(datatype.size as usize),
+                )?);
+            }
         }
 
         Ok(DatasetInfo {
@@ -602,13 +612,20 @@ impl Dataset {
                 object_index: index,
             },
         )?;
-        trace_vlen_read(data.len() as u64, &data);
-
         let Some(base) = base else {
-            return Ok(H5Value::Raw(data));
+            trace_vlen_read(seq_len as u64, &data[..data.len().min(seq_len)]);
+            return Ok(H5Value::Raw(data[..data.len().min(seq_len)].to_vec()));
         };
 
         if base.class == crate::format::messages::datatype::DatatypeClass::String {
+            if data.len() < seq_len {
+                return Err(Error::InvalidFormat(format!(
+                    "variable-length string payload too short: expected {seq_len} bytes, got {}",
+                    data.len()
+                )));
+            }
+            let data = &data[..seq_len];
+            trace_vlen_read(seq_len as u64, data);
             return Ok(H5Value::String(
                 String::from_utf8_lossy(&data)
                     .trim_end_matches('\0')
@@ -617,12 +634,25 @@ impl Dataset {
         }
 
         let elem_size = base.size as usize;
-        if elem_size == 0 || data.len() < seq_len.saturating_mul(elem_size) {
-            return Ok(H5Value::Raw(data));
+        if elem_size == 0 {
+            let data = &data[..data.len().min(seq_len)];
+            trace_vlen_read(seq_len as u64, data);
+            return Ok(H5Value::Raw(data.to_vec()));
         }
+        let expected_len = seq_len
+            .checked_mul(elem_size)
+            .ok_or_else(|| Error::InvalidFormat("variable-length payload size overflow".into()))?;
+        if data.len() < expected_len {
+            return Err(Error::InvalidFormat(format!(
+                "variable-length payload too short: expected {expected_len} bytes, got {}",
+                data.len()
+            )));
+        }
+        let data = &data[..expected_len];
+        trace_vlen_read(expected_len as u64, data);
 
         let mut values = Vec::with_capacity(seq_len);
-        for chunk in data[..seq_len * elem_size].chunks_exact(elem_size) {
+        for chunk in data.chunks_exact(elem_size) {
             values.push(Self::decode_value(base, chunk, sizeof_addr, reader)?);
         }
 
@@ -2604,9 +2634,38 @@ fn decode_fixed_string_with_padding(bytes: &[u8], padding: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn le_u32(value: u32, out: &mut Vec<u8>) {
         out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn build_global_heap_collection(
+        collection_addr: usize,
+        object_index: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = vec![0; collection_addr];
+        bytes.extend_from_slice(b"GCOL");
+        bytes.push(1);
+        bytes.extend_from_slice(&[0; 3]);
+
+        let aligned = (payload.len() as u64 + 7) & !7;
+        let total_size = 16u64 + 16u64 + aligned + 16u64;
+        bytes.extend_from_slice(&total_size.to_le_bytes());
+
+        bytes.extend_from_slice(&object_index.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes.resize(collection_addr + 16 + 16 + aligned as usize, 0);
+
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes
     }
 
     #[test]
@@ -2694,8 +2753,6 @@ mod tests {
 
     #[test]
     fn filtered_implicit_chunk_index_is_rejected() {
-        use std::io::Cursor;
-
         let info = DatasetInfo {
             dataspace: DataspaceMessage {
                 version: 2,
@@ -2748,6 +2805,107 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("v4 implicit chunk index with filters"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn old_fill_value_must_match_datatype_size_during_dataset_parse() {
+        let messages = vec![
+            RawMessage {
+                msg_type: object_header::MSG_DATASPACE,
+                flags: 0,
+                creation_index: None,
+                chunk_index: 0,
+                data: vec![2, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+            },
+            RawMessage {
+                msg_type: object_header::MSG_DATATYPE,
+                flags: 0,
+                creation_index: None,
+                chunk_index: 0,
+                data: vec![0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0],
+            },
+            RawMessage {
+                msg_type: object_header::MSG_LAYOUT,
+                flags: 0,
+                creation_index: None,
+                chunk_index: 0,
+                data: vec![3, 0, 0, 0],
+            },
+            RawMessage {
+                msg_type: object_header::MSG_FILL_VALUE_OLD,
+                flags: 0,
+                creation_index: None,
+                chunk_index: 0,
+                data: vec![2, 0, 0, 0, 1, 2],
+            },
+        ];
+
+        let err = Dataset::parse_info(&messages, 8, 8)
+            .expect_err("old fill value with mismatched datatype size should fail");
+        assert!(
+            err.to_string().contains("does not match datatype size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vlen_sequence_reads_only_requested_bytes() {
+        let heap_addr = 32u64;
+        let heap = build_global_heap_collection(heap_addr as usize, 1, &[1, 2, 3, 4, 99, 100]);
+        let mut reader = HdfReader::new(Cursor::new(heap));
+        reader.set_sizeof_size(8);
+
+        let base = DatatypeMessage {
+            version: 1,
+            class: crate::format::messages::datatype::DatatypeClass::FixedPoint,
+            class_bits: [0, 0, 0],
+            size: 2,
+            properties: vec![0, 0, 16, 0],
+        };
+
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&2u32.to_le_bytes());
+        descriptor.extend_from_slice(&heap_addr.to_le_bytes());
+        descriptor.extend_from_slice(&1u32.to_le_bytes());
+
+        let value = Dataset::decode_vlen_value(Some(&base), &descriptor, 8, &mut reader)
+            .expect("exact-length vlen read should succeed");
+        match value {
+            H5Value::VarLen(values) => {
+                assert_eq!(values.len(), 2);
+                assert!(matches!(values[0], H5Value::UInt(513)));
+                assert!(matches!(values[1], H5Value::UInt(1027)));
+            }
+            other => panic!("expected VarLen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vlen_string_rejects_short_heap_payload() {
+        let heap_addr = 32u64;
+        let heap = build_global_heap_collection(heap_addr as usize, 1, b"abc");
+        let mut reader = HdfReader::new(Cursor::new(heap));
+        reader.set_sizeof_size(8);
+
+        let base = DatatypeMessage {
+            version: 1,
+            class: crate::format::messages::datatype::DatatypeClass::String,
+            class_bits: [0, 0, 0],
+            size: 1,
+            properties: Vec::new(),
+        };
+
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&4u32.to_le_bytes());
+        descriptor.extend_from_slice(&heap_addr.to_le_bytes());
+        descriptor.extend_from_slice(&1u32.to_le_bytes());
+
+        let err = Dataset::decode_vlen_value(Some(&base), &descriptor, 8, &mut reader)
+            .expect_err("short vlen string payload should fail");
+        assert!(
+            err.to_string().contains("payload too short"),
             "unexpected error: {err}"
         );
     }

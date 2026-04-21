@@ -8,9 +8,7 @@ use std::io::{Read, Seek};
 use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
 
-use super::{
-    read_le_uint, verify_metadata_checksum, FractalHeapHeader, FHIB_MAGIC,
-};
+use super::{read_le_uint, verify_metadata_checksum, FractalHeapHeader, FHIB_MAGIC};
 
 /// Decoded fractal-heap indirect block: row count + flat list of child
 /// pointers in (row, column) order. Output of `decode_indirect_block`,

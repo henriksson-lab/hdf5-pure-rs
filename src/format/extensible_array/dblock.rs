@@ -90,8 +90,13 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
         return Ok(());
     }
 
-    let prefix =
-        decode_data_block_prefix(reader, header_addr, header, data_block_addr, data_block_elements)?;
+    let prefix = decode_data_block_prefix(
+        reader,
+        header_addr,
+        header,
+        data_block_addr,
+        data_block_elements,
+    )?;
     if prefix.pages == 0 {
         for _ in 0..count {
             elements.push(read_element(reader, filtered, chunk_size_len)?);

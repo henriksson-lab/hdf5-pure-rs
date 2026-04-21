@@ -1,5 +1,8 @@
 use crate::error::{Error, Result};
 
+const EXTERNAL_LINK_VERSION: u8 = 0;
+const EXTERNAL_LINK_FLAGS_ALL: u8 = 0;
+
 /// Link type values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkType {
@@ -31,6 +34,10 @@ pub struct LinkMessage {
 impl LinkMessage {
     /// Decode a link message from raw bytes.
     pub fn decode(data: &[u8], sizeof_addr: u8) -> Result<Self> {
+        Self::decode_impl(data, sizeof_addr)
+    }
+
+    fn decode_impl(data: &[u8], sizeof_addr: u8) -> Result<Self> {
         let mut pos = 0;
 
         // Version
@@ -123,28 +130,7 @@ impl LinkMessage {
                     ));
                 }
                 ensure_available(data, pos, info_len, "external link info")?;
-                let ext_version = read_u8(data, &mut pos, "external link version")?;
-                let mut info_consumed = 1;
-                if ext_version >= 1 {
-                    let _ext_flags = read_u8(data, &mut pos, "external link flags")?;
-                    info_consumed += 1;
-                }
-                let end = pos + info_len - info_consumed;
-
-                // Filename (null-terminated)
-                let null_pos = data[pos..end]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(end - pos);
-                let filename = String::from_utf8_lossy(&data[pos..pos + null_pos]).to_string();
-                pos = (pos + null_pos + 1).min(end);
-
-                // Object path (null-terminated)
-                let null_pos2 = data[pos..end]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(end - pos);
-                let obj_path = String::from_utf8_lossy(&data[pos..pos + null_pos2]).to_string();
+                let (filename, obj_path) = unpack_external_link_value(&data[pos..pos + info_len])?;
                 trace_external_link_resolve(&filename, &obj_path);
 
                 external_link = Some((filename, obj_path));
@@ -210,4 +196,59 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
     }
     *pos += size;
     Ok(val)
+}
+
+fn unpack_external_link_value(data: &[u8]) -> Result<(String, String)> {
+    if data.is_empty() {
+        return Err(Error::InvalidFormat(
+            "not a valid external link buffer".into(),
+        ));
+    }
+
+    let header = data[0];
+    let ext_version = (header >> 4) & 0x0f;
+    let ext_flags = header & 0x0f;
+    if ext_version > EXTERNAL_LINK_VERSION {
+        return Err(Error::InvalidFormat(format!(
+            "external link version {ext_version} exceeds supported version {EXTERNAL_LINK_VERSION}"
+        )));
+    }
+    if ext_flags & !EXTERNAL_LINK_FLAGS_ALL != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "external link flags {ext_flags:#x} are invalid"
+        )));
+    }
+    if data.len() <= 2 {
+        return Err(Error::InvalidFormat(
+            "not a valid external link buffer".into(),
+        ));
+    }
+    if data[data.len() - 1] != 0 {
+        return Err(Error::InvalidFormat(
+            "external link buffer is not NULL-terminated".into(),
+        ));
+    }
+
+    let payload = &data[1..];
+    let filename_end = payload.iter().position(|&b| b == 0).ok_or_else(|| {
+        Error::InvalidFormat("external link buffer does not contain an object path".into())
+    })?;
+    if filename_end + 1 >= payload.len() {
+        return Err(Error::InvalidFormat(
+            "external link buffer does not contain an object path".into(),
+        ));
+    }
+    let obj_payload = &payload[filename_end + 1..];
+    let obj_end = obj_payload.iter().position(|&b| b == 0).ok_or_else(|| {
+        Error::InvalidFormat("external link buffer does not contain an object path".into())
+    })?;
+    if obj_end == 0 {
+        return Err(Error::InvalidFormat(
+            "external link buffer does not contain an object path".into(),
+        ));
+    }
+
+    let filename = String::from_utf8_lossy(&payload[..filename_end]).to_string();
+    let obj_path = String::from_utf8_lossy(&obj_payload[..obj_end]).to_string();
+    Ok((filename, obj_path))
 }

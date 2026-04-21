@@ -12,7 +12,10 @@ use crate::io::reader::HdfReader;
 use super::chunk::read_v1_continuation;
 use super::chunk::read_v2_continuation;
 use super::msg::{read_v1_messages, read_v2_messages};
-use super::{ObjectHeader, OHDR_MAGIC, HDR_ATTR_CRT_ORDER_TRACKED, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK, HDR_STORE_TIMES};
+use super::{
+    ObjectHeader, HDR_ATTR_CRT_ORDER_TRACKED, HDR_ATTR_STORE_PHASE_CHANGE, HDR_CHUNK0_SIZE_MASK,
+    HDR_STORE_TIMES, OHDR_MAGIC,
+};
 
 impl ObjectHeader {
     /// Read a v1 object header. Mirrors `H5O__cache_deserialize` for

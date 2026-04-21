@@ -15,6 +15,10 @@ pub struct AttributeMessage {
 
 impl AttributeMessage {
     pub fn decode(raw: &[u8]) -> Result<Self> {
+        Self::decode_impl(raw)
+    }
+
+    fn decode_impl(raw: &[u8]) -> Result<Self> {
         if raw.len() < 6 {
             return Err(Error::InvalidFormat("attribute message too short".into()));
         }

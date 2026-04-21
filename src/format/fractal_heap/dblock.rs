@@ -8,9 +8,7 @@ use std::io::{Read, Seek};
 use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
 
-use super::{
-    heap_object_len, verify_direct_block_checksum, FractalHeapHeader,
-};
+use super::{heap_object_len, verify_direct_block_checksum, FractalHeapHeader};
 
 impl FractalHeapHeader {
     pub(super) fn read_from_direct_block<R: Read + Seek>(

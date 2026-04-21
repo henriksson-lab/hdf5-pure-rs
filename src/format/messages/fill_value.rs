@@ -19,6 +19,10 @@ pub struct FillValueMessage {
 impl FillValueMessage {
     /// Decode fill value message (type 0x0005, version 2 or 3).
     pub fn decode(data: &[u8]) -> Result<Self> {
+        Self::decode_impl(data)
+    }
+
+    fn decode_impl(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::InvalidFormat("empty fill value message".into()));
         }
@@ -140,6 +144,15 @@ impl FillValueMessage {
 
     /// Decode old-style fill value message (type 0x0004).
     pub fn decode_old(data: &[u8]) -> Result<Self> {
+        Self::decode_old_with_datatype_size(data, None)
+    }
+
+    /// Decode old-style fill value message (type 0x0004), optionally
+    /// validating that the payload width matches the dataset datatype size.
+    pub(crate) fn decode_old_with_datatype_size(
+        data: &[u8],
+        datatype_size: Option<usize>,
+    ) -> Result<Self> {
         if data.len() < 4 {
             return Err(Error::InvalidFormat("old fill value too short".into()));
         }
@@ -153,6 +166,14 @@ impl FillValueMessage {
         } else {
             None
         };
+
+        if let Some(datatype_size) = datatype_size {
+            if size > 0 && size != datatype_size {
+                return Err(Error::InvalidFormat(format!(
+                    "old fill value size {size} does not match datatype size {datatype_size}"
+                )));
+            }
+        }
 
         let message = Self {
             version: 0,

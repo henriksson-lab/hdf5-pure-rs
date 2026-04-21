@@ -223,15 +223,12 @@ other = "H5FA_iterate"
 # format/global_heap.rs — H5HG*.c
 # ---------------------------------------------------------------------------
 # `H5HG__cache_heap_deserialize` does prefix decode + object-table walk
-# in one C function. Rust splits those into `decode_header` + `walk_objects`,
-# so the canonical mapping for the C function lives on the *composer*
-# (`read_at`), which does the same combined work. The two Rust halves
-# are intentionally unmapped — they're the structural split, not the
-# semantic match. (Mapping `decode_header` to the C function would put a
-# 30-line prefix parser side-by-side with libhdf5's full deserializer in
-# the TUI, which is misleading.)
+# in one C function. Rust keeps the structural split as
+# `decode_header` + `walk_objects`, but now also has a dedicated
+# `deserialize_collection` composer whose body is the closest review
+# surface to the C-side cache deserializer.
 [[entries]]
-rust = "read_at"
+rust = "deserialize_collection"
 rust_path = "format/global_heap.rs"
 other = "H5HG__cache_heap_deserialize"
 
@@ -316,7 +313,7 @@ other = "H5G_ent_decode"
 # format/messages/datatype.rs — H5Odtype.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/datatype.rs"
 other = "H5O__dtype_decode"
 
@@ -326,7 +323,7 @@ rust_path = "format/messages/datatype.rs"
 other = "H5O__dtype_size"
 
 [[entries]]
-rust = "compound_fields"
+rust = "decode_compound_fields_impl"
 rust_path = "format/messages/datatype.rs"
 other = "H5O__dtype_decode_helper"
 
@@ -344,7 +341,7 @@ other = "H5O__dtype_decode_helper"
 # format/messages/dataspace.rs — H5Osdspace.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/dataspace.rs"
 other = "H5O__sdspace_decode"
 
@@ -362,22 +359,7 @@ other = "H5O__sdspace_decode"
 # format/messages/data_layout.rs — H5Olayout.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
-rust_path = "format/messages/data_layout.rs"
-other = "H5O__layout_decode"
-
-[[entries]]
-rust = "decode_v1_v2"
-rust_path = "format/messages/data_layout.rs"
-other = "H5O__layout_decode"
-
-[[entries]]
-rust = "decode_v3"
-rust_path = "format/messages/data_layout.rs"
-other = "H5O__layout_decode"
-
-[[entries]]
-rust = "decode_v4"
+rust = "decode_impl"
 rust_path = "format/messages/data_layout.rs"
 other = "H5O__layout_decode"
 
@@ -390,7 +372,7 @@ other = "H5O__layout_decode"
 # format/messages/fill_value.rs — H5Ofill.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/fill_value.rs"
 other = "H5O__fill_new_decode"
 
@@ -405,7 +387,7 @@ rust_path = "format/messages/fill_value.rs"
 other = "H5O__fill_new_decode"
 
 [[entries]]
-rust = "decode_old"
+rust = "decode_old_with_datatype_size"
 rust_path = "format/messages/fill_value.rs"
 other = "H5O__fill_old_decode"
 
@@ -413,7 +395,7 @@ other = "H5O__fill_old_decode"
 # format/messages/filter_pipeline.rs — H5Opline.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/filter_pipeline.rs"
 other = "H5O__pline_decode"
 
@@ -431,7 +413,7 @@ other = "H5O__pline_decode"
 # format/messages/link.rs — H5Olink.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/link.rs"
 other = "H5O__link_decode"
 
@@ -439,7 +421,7 @@ other = "H5O__link_decode"
 # format/messages/link_info.rs — H5Olinfo.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/link_info.rs"
 other = "H5O__linfo_decode"
 
@@ -447,7 +429,7 @@ other = "H5O__linfo_decode"
 # format/messages/attribute.rs — H5Oattr.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode"
+rust = "decode_impl"
 rust_path = "format/messages/attribute.rs"
 other = "H5O__attr_decode"
 
@@ -1763,8 +1745,8 @@ rust_path = "hl/group.rs"
 other = "H5Lget_val"
 
 [[entries]]
-rust = "external_link_target"
-rust_path = "hl/group.rs"
+rust = "unpack_external_link_value"
+rust_path = "format/messages/link.rs"
 other = "H5Lunpack_elink_val"
 
 [[entries]]

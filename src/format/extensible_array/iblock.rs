@@ -75,7 +75,8 @@ pub(super) fn decode_index_block<R: Read + Seek>(
         )));
     }
 
-    let max_index_count = super::usize_from_u64(header.max_index_set, "extensible array max index")?;
+    let max_index_count =
+        super::usize_from_u64(header.max_index_set, "extensible array max index")?;
     let mut elements = Vec::with_capacity(max_index_count);
     for idx in 0..header.index_block_elements {
         let element = read_element(reader, filtered, chunk_size_len)?;

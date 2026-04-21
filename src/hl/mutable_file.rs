@@ -2003,10 +2003,7 @@ impl MutableFile {
     /// Pure encoder for a v2 B-tree leaf node (BTLF magic + records +
     /// checksum). Mirrors the serialize half of libhdf5's
     /// `H5B2__cache_leaf_serialize`.
-    fn encode_btree_v2_leaf(
-        header: &BTreeV2Header,
-        records: &[Vec<u8>],
-    ) -> Result<Vec<u8>> {
+    fn encode_btree_v2_leaf(header: &BTreeV2Header, records: &[Vec<u8>]) -> Result<Vec<u8>> {
         if records.len() > u16::MAX as usize {
             return Err(Error::Unsupported(
                 "v2 B-tree leaf record count exceeds u16".into(),

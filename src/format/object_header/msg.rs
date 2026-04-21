@@ -10,8 +10,8 @@ use crate::io::reader::HdfReader;
 
 use super::chunk::reserve_continuation_range;
 use super::{
-    is_undefined_addr, read_le_uint, RawMessage, MSG_FLAG_SHARED, MSG_HEADER_CONTINUATION,
-    MSG_NIL, MSG_SHARED_MSG_TABLE, SHARED_HEAP_ID_LEN, SHARED_MESSAGE_MAX_INDEXES,
+    is_undefined_addr, read_le_uint, RawMessage, MSG_FLAG_SHARED, MSG_HEADER_CONTINUATION, MSG_NIL,
+    MSG_SHARED_MSG_TABLE, SHARED_HEAP_ID_LEN, SHARED_MESSAGE_MAX_INDEXES,
     SHARED_MESSAGE_TABLE_VERSION, SHARED_REFERENCE_VERSION_1, SHARED_REFERENCE_VERSION_2,
     SHARED_REFERENCE_VERSION_3, SHARED_TYPE_COMMITTED, SHARED_TYPE_SOHM,
 };
@@ -46,13 +46,14 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
         reader.skip(3)?;
 
         // Aligned message size (v1 messages are 8-byte aligned)
-        let aligned_size = msg_size.checked_add(7).map(|n| n & !7).ok_or_else(|| {
-            Error::InvalidFormat("object header message size overflow".into())
-        })?;
+        let aligned_size = msg_size
+            .checked_add(7)
+            .map(|n| n & !7)
+            .ok_or_else(|| Error::InvalidFormat("object header message size overflow".into()))?;
         let data_start = pos + 8;
-        let data_end = data_start.checked_add(aligned_size).ok_or_else(|| {
-            Error::InvalidFormat("object header message range overflow".into())
-        })?;
+        let data_end = data_start
+            .checked_add(aligned_size)
+            .ok_or_else(|| Error::InvalidFormat("object header message range overflow".into()))?;
         if data_end > chunk_end {
             return Err(Error::InvalidFormat(
                 "object header v1 message payload exceeds chunk".into(),
@@ -74,13 +75,7 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
             }
             let cont_offset = reader.read_addr()?;
             let cont_length = reader.read_length()?;
-            reserve_continuation_range(
-                reader,
-                cont_offset,
-                cont_length,
-                8,
-                chunk_ranges,
-            )?;
+            reserve_continuation_range(reader, cont_offset, cont_length, 8, chunk_ranges)?;
             let remaining = aligned_size - used;
             if remaining > 0 {
                 reader.skip(remaining)?;
@@ -177,13 +172,7 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
             }
             let cont_offset = reader.read_addr()?;
             let cont_length = reader.read_length()?;
-            reserve_continuation_range(
-                reader,
-                cont_offset,
-                cont_length,
-                8,
-                chunk_ranges,
-            )?;
+            reserve_continuation_range(reader, cont_offset, cont_length, 8, chunk_ranges)?;
             if msg_size > used {
                 reader.skip(msg_size - used)?;
             }
@@ -260,11 +249,7 @@ fn validate_shared_message_table(data: &[u8], sizeof_addr: u8) -> Result<()> {
     Ok(())
 }
 
-fn validate_shared_message_reference(
-    data: &[u8],
-    sizeof_addr: u8,
-    sizeof_size: u8,
-) -> Result<()> {
+fn validate_shared_message_reference(data: &[u8], sizeof_addr: u8, sizeof_size: u8) -> Result<()> {
     if data.len() < 2 {
         return Err(Error::InvalidFormat(
             "shared object-header message reference is truncated".into(),
@@ -319,10 +304,9 @@ fn validate_shared_message_reference(
                 }
             }
             SHARED_TYPE_COMMITTED => {
-                let expected_len =
-                    2usize.checked_add(sizeof_addr as usize).ok_or_else(|| {
-                        Error::InvalidFormat("shared message reference size overflow".into())
-                    })?;
+                let expected_len = 2usize.checked_add(sizeof_addr as usize).ok_or_else(|| {
+                    Error::InvalidFormat("shared message reference size overflow".into())
+                })?;
                 if data.len() != expected_len {
                     return Err(Error::InvalidFormat(
                         "shared object-header message committed reference has invalid length"

@@ -52,19 +52,14 @@ impl BTreeV2Header {
         let depth = reader.read_u16()?;
         let split_pct = reader.read_u8()?;
         let merge_pct = reader.read_u8()?;
-        if split_pct > 100 {
+        if split_pct == 0 || split_pct > 100 {
             return Err(Error::InvalidFormat(format!(
-                "v2 B-tree split percent {split_pct} exceeds 100"
+                "v2 B-tree split percent {split_pct} must be in 1..=100"
             )));
         }
-        if merge_pct > 100 {
+        if merge_pct == 0 || merge_pct > 100 {
             return Err(Error::InvalidFormat(format!(
-                "v2 B-tree merge percent {merge_pct} exceeds 100"
-            )));
-        }
-        if merge_pct >= split_pct {
-            return Err(Error::InvalidFormat(format!(
-                "v2 B-tree merge percent {merge_pct} must be less than split percent {split_pct}"
+                "v2 B-tree merge percent {merge_pct} must be in 1..=100"
             )));
         }
         let root_addr = reader.read_addr()?;
@@ -288,7 +283,14 @@ fn read_internal_records<R: Read + Seek>(
     let node = decode_internal_node(reader, header, node_info, addr, nrecords, depth)?;
 
     for idx in 0..node.records.len() {
-        read_child_records(reader, header, node_info, node.children[idx], depth - 1, records)?;
+        read_child_records(
+            reader,
+            header,
+            node_info,
+            node.children[idx],
+            depth - 1,
+            records,
+        )?;
         records.push(node.records[idx].clone());
     }
     read_child_records(

@@ -1,3 +1,5 @@
+use hdf5_pure_rust::format::btree_v2::BTreeV2Header;
+use hdf5_pure_rust::format::checksum::checksum_metadata;
 use hdf5_pure_rust::format::fractal_heap::FractalHeapHeader;
 use hdf5_pure_rust::format::global_heap::GlobalHeapCollection;
 use hdf5_pure_rust::format::local_heap::LocalHeap;
@@ -16,8 +18,6 @@ use hdf5_pure_rust::format::messages::link_info::LinkInfoMessage;
 use hdf5_pure_rust::format::object_header::{
     ObjectHeader, MSG_DATATYPE, MSG_HEADER_CONTINUATION, MSG_SHARED_MSG_TABLE,
 };
-use hdf5_pure_rust::format::btree_v2::BTreeV2Header;
-use hdf5_pure_rust::format::checksum::checksum_metadata;
 use hdf5_pure_rust::format::superblock::Superblock;
 use hdf5_pure_rust::format::{extensible_array, fixed_array};
 use hdf5_pure_rust::io::reader::UNDEF_ADDR;
@@ -279,6 +279,29 @@ fn test_link_message_bad_name_length() {
     // Version 1, flags=0 (hard link, 1-byte name len), name_len=255 but only 4 bytes of data
     let data = vec![1, 0x00, 0xFF, 0x41]; // version=1, flags=0, name_len=255, 'A'
     assert!(LinkMessage::decode(&data, 8).is_err());
+}
+
+#[test]
+fn test_external_link_rejects_invalid_header_and_path_encoding() {
+    fn external_link_message(header: u8, payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![1u8, 0x08, 64, 1, b'e'];
+        let info_len = 1 + payload.len();
+        data.extend_from_slice(&(info_len as u16).to_le_bytes());
+        data.push(header);
+        data.extend_from_slice(payload);
+        data
+    }
+
+    for data in [
+        external_link_message(0x10, b"file\0path\0"),
+        external_link_message(0x01, b"file\0path\0"),
+        external_link_message(0x00, b"file\0path"),
+        external_link_message(0x00, b"file\0"),
+    ] {
+        let err =
+            LinkMessage::decode(&data, 8).expect_err("malformed external link buffer should fail");
+        assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
+    }
 }
 
 #[test]
@@ -900,6 +923,119 @@ fn test_fill_value_rejects_truncated_defined_values() {
 }
 
 #[test]
+fn test_layout_rejects_invalid_ranks_flags_and_btree2_percents() {
+    let err = DataLayoutMessage::decode(&[1, 0, 2, 0, 0, 0, 0, 0], 8, 8)
+        .expect_err("v1/v2 zero rank must fail");
+    assert!(format!("{err}").contains("rank"));
+
+    let mut v3_rank1 = vec![3u8, 2, 1];
+    v3_rank1.extend_from_slice(&[0u8; 8]);
+    v3_rank1.extend_from_slice(&4u32.to_le_bytes());
+    let err = DataLayoutMessage::decode(&v3_rank1, 8, 8).expect_err("v3 chunk rank < 2 must fail");
+    assert!(format!("{err}").contains("rank"));
+
+    let mut bad_flags = vec![4u8, 2, 0x01, 1, 4];
+    bad_flags.extend_from_slice(&4u32.to_le_bytes());
+    bad_flags.push(2);
+    bad_flags.extend_from_slice(&0u64.to_le_bytes());
+    let err =
+        DataLayoutMessage::decode(&bad_flags, 8, 8).expect_err("invalid chunk flags must fail");
+    assert!(format!("{err}").contains("flags"));
+
+    let mut bad_split = vec![4u8, 2, 0, 1, 4];
+    bad_split.extend_from_slice(&4u32.to_le_bytes());
+    bad_split.push(5);
+    bad_split.extend_from_slice(&512u32.to_le_bytes());
+    bad_split.push(101);
+    bad_split.push(40);
+    bad_split.extend_from_slice(&0u64.to_le_bytes());
+    let err =
+        DataLayoutMessage::decode(&bad_split, 8, 8).expect_err("split percent > 100 must fail");
+    assert!(format!("{err}").contains("split percent"));
+
+    let mut zero_merge = vec![4u8, 2, 0, 1, 4];
+    zero_merge.extend_from_slice(&4u32.to_le_bytes());
+    zero_merge.push(5);
+    zero_merge.extend_from_slice(&512u32.to_le_bytes());
+    zero_merge.push(60);
+    zero_merge.push(0);
+    zero_merge.extend_from_slice(&0u64.to_le_bytes());
+    let err = DataLayoutMessage::decode(&zero_merge, 8, 8).expect_err("merge percent 0 must fail");
+    assert!(format!("{err}").contains("merge percent"));
+
+    let mut forbidden_v1_index = vec![4u8, 2, 0, 1, 4];
+    forbidden_v1_index.extend_from_slice(&4u32.to_le_bytes());
+    forbidden_v1_index.push(0);
+    let err = DataLayoutMessage::decode(&forbidden_v1_index, 8, 8)
+        .expect_err("v4 B-tree v1 index type must fail");
+    assert!(format!("{err}").contains("B-tree v1"));
+
+    let mut bad_fixed_array = vec![4u8, 2, 0, 1, 4];
+    bad_fixed_array.extend_from_slice(&4u32.to_le_bytes());
+    bad_fixed_array.push(3);
+    bad_fixed_array.push(0);
+    bad_fixed_array.extend_from_slice(&0u64.to_le_bytes());
+    let err = DataLayoutMessage::decode(&bad_fixed_array, 8, 8)
+        .expect_err("fixed-array page bits 0 must fail");
+    assert!(format!("{err}").contains("page bits"));
+
+    let mut bad_extensible_array = vec![4u8, 2, 0, 1, 4];
+    bad_extensible_array.extend_from_slice(&4u32.to_le_bytes());
+    bad_extensible_array.push(4);
+    bad_extensible_array.extend_from_slice(&[1, 0, 1, 1, 1]);
+    bad_extensible_array.extend_from_slice(&0u64.to_le_bytes());
+    let err = DataLayoutMessage::decode(&bad_extensible_array, 8, 8)
+        .expect_err("extensible-array zero creation parameter must fail");
+    assert!(format!("{err}").contains("index block elements"));
+
+    let mut zero_elem_size_v3 = vec![3u8, 2, 2];
+    zero_elem_size_v3.extend_from_slice(&0u64.to_le_bytes());
+    zero_elem_size_v3.extend_from_slice(&4u32.to_le_bytes());
+    zero_elem_size_v3.extend_from_slice(&0u32.to_le_bytes());
+    let err = DataLayoutMessage::decode(&zero_elem_size_v3, 8, 8)
+        .expect_err("v3 zero element size must fail");
+    assert!(format!("{err}").contains("element size"));
+
+    let mut zero_elem_size_v1 = vec![1u8, 2, 2, 0, 0, 0, 0, 0];
+    zero_elem_size_v1.extend_from_slice(&0u64.to_le_bytes());
+    zero_elem_size_v1.extend_from_slice(&4u32.to_le_bytes());
+    zero_elem_size_v1.extend_from_slice(&0u32.to_le_bytes());
+    let err = DataLayoutMessage::decode(&zero_elem_size_v1, 8, 8)
+        .expect_err("v1 zero element size must fail");
+    assert!(format!("{err}").contains("element size"));
+}
+
+#[test]
+fn test_layout_accepts_equal_nonzero_btree2_percents() {
+    let mut equal_percents = vec![4u8, 2, 0, 1, 4];
+    equal_percents.extend_from_slice(&4u32.to_le_bytes());
+    equal_percents.push(5);
+    equal_percents.extend_from_slice(&512u32.to_le_bytes());
+    equal_percents.push(60);
+    equal_percents.push(60);
+    equal_percents.extend_from_slice(&0u64.to_le_bytes());
+    let layout = DataLayoutMessage::decode(&equal_percents, 8, 8)
+        .expect("equal nonzero v4 B-tree2 percents should parse");
+    assert_eq!(
+        layout.chunk_index_type,
+        Some(hdf5_pure_rust::format::messages::data_layout::ChunkIndexType::BTreeV2)
+    );
+}
+
+#[test]
+fn test_layout_rejects_zero_btree2_split_percent() {
+    let mut bad_split = vec![4u8, 2, 0, 1, 4];
+    bad_split.extend_from_slice(&4u32.to_le_bytes());
+    bad_split.push(5);
+    bad_split.extend_from_slice(&512u32.to_le_bytes());
+    bad_split.push(0);
+    bad_split.push(40);
+    bad_split.extend_from_slice(&0u64.to_le_bytes());
+    let err = DataLayoutMessage::decode(&bad_split, 8, 8).expect_err("split percent 0 must fail");
+    assert!(format!("{err}").contains("split percent"));
+}
+
+#[test]
 fn test_unsupported_filters_fail_explicitly() {
     for id in [FILTER_SZIP, 65535] {
         let pipeline = FilterPipelineMessage {
@@ -1302,15 +1438,34 @@ fn test_btree_v2_rejects_merge_percent_over_100() {
 }
 
 #[test]
-fn test_btree_v2_rejects_merge_pct_not_less_than_split_pct() {
-    // 60 <= 60 violates merge < split.
-    let bytes = btree_v2_header_bytes(60, 60);
+fn test_btree_v2_rejects_zero_split_percent() {
+    let bytes = btree_v2_header_bytes(0, 40);
     let mut reader = HdfReader::new(Cursor::new(bytes));
     let err = BTreeV2Header::read_at(&mut reader, 0).unwrap_err();
     assert!(
-        format!("{err}").contains("less than split percent"),
-        "expected merge<split error, got: {err}"
+        format!("{err}").contains("split percent"),
+        "expected split-percent error, got: {err}"
     );
+}
+
+#[test]
+fn test_btree_v2_rejects_zero_merge_percent() {
+    let bytes = btree_v2_header_bytes(100, 0);
+    let mut reader = HdfReader::new(Cursor::new(bytes));
+    let err = BTreeV2Header::read_at(&mut reader, 0).unwrap_err();
+    assert!(
+        format!("{err}").contains("merge percent"),
+        "expected merge-percent error, got: {err}"
+    );
+}
+
+#[test]
+fn test_btree_v2_accepts_equal_nonzero_percents() {
+    let bytes = btree_v2_header_bytes(60, 60);
+    let mut reader = HdfReader::new(Cursor::new(bytes));
+    let hdr = BTreeV2Header::read_at(&mut reader, 0).expect("equal nonzero percents must parse");
+    assert_eq!(hdr.split_pct, 60);
+    assert_eq!(hdr.merge_pct, 60);
 }
 
 #[test]
@@ -1462,10 +1617,7 @@ fn test_float_datatype_rejects_sign_outside_precision() {
     // sign_loc must be < precision.
     let bytes = float_datatype_bytes(4, 32, 0, 32, 23, 8, 0, 23);
     let err = DatatypeMessage::decode(&bytes).unwrap_err();
-    assert!(
-        format!("{err}").contains("sign bit position"),
-        "got: {err}"
-    );
+    assert!(format!("{err}").contains("sign bit position"), "got: {err}");
 }
 
 #[test]
@@ -1558,7 +1710,6 @@ fn test_layout_v3_rejects_zero_chunk_dimension() {
 
 #[test]
 fn test_fractal_heap_id_rejects_unsupported_version() {
-    use hdf5_pure_rust::format::fractal_heap::FractalHeapHeader;
     // We need a heap to call read_managed_object; build a minimal one via
     // the existing fixture with a known fractal-heap-backed dense storage.
     // Easier path: open a real file that has a fractal heap, then craft a
@@ -1599,8 +1750,7 @@ fn test_link_info_accepts_max_creation_index_at_limit() {
     bytes.extend_from_slice(&(u32::MAX as u64).to_le_bytes()); // exactly at the limit
     bytes.extend_from_slice(&[0u8; 8]);
     bytes.extend_from_slice(&[0u8; 8]);
-    let li = LinkInfoMessage::decode(&bytes, 8)
-        .expect("max_creation_index == u32::MAX must parse");
+    let li = LinkInfoMessage::decode(&bytes, 8).expect("max_creation_index == u32::MAX must parse");
     assert_eq!(li.max_creation_index, Some(u32::MAX as u64));
 }
 
@@ -1616,11 +1766,9 @@ fn test_filter_pipeline_v1_rejects_non_multiple_of_eight_name_length() {
     buf.extend_from_slice(&7u16.to_le_bytes()); // name_length = 7 (BAD)
     buf.extend_from_slice(&0u16.to_le_bytes()); // flags
     buf.extend_from_slice(&0u16.to_le_bytes()); // cd_nelmts
-    let err = hdf5_pure_rust::format::messages::filter_pipeline::FilterPipelineMessage::decode(&buf)
-        .unwrap_err();
+    let err =
+        hdf5_pure_rust::format::messages::filter_pipeline::FilterPipelineMessage::decode(&buf)
+            .unwrap_err();
     let msg = format!("{err}");
-    assert!(
-        msg.contains("not a multiple of eight"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("not a multiple of eight"), "got: {msg}");
 }

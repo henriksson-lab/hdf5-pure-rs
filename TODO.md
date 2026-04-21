@@ -383,6 +383,38 @@
   function, or cross-checks against state we don't have at decode time
   (datatype-vs-fill-value-size).
 
+- [ ] Bucket CCC "unsupported subsystem" misses into explicit roadmap
+  items instead of leaving them as raw compare noise. Current
+  `ccc-rs missing` output is still dominated by large libhdf5 surfaces
+  that are intentionally out of scope or not yet translated, especially:
+  - VOL / async / plugin / connector infrastructure (`H5VL*`,
+    `H5ES*`, `H5PL*`)
+  - MPI / parallel I/O / distributed datatype-selection paths
+    (`H5_mpi*`, `H5S__mpio*`, parallel `H5D*`) — out of scope; we will
+    not use MPI/parallel-HDF5. If CPU parallelism is added later, use
+    Rayon and keep it Rust-side rather than chasing libhdf5's MPI stack.
+  - Alternative VFDs and cloud/network drivers (`H5FD__hdfs*`,
+    `H5FD__ros3*`, direct/core/stdio driver parity)
+  - Large write-side object-header / message-management families
+    (`H5O_msg_*`, shared-message machinery, free-space managers)
+  - Remaining unported dataspace selector families (`all`/`none`
+    iterators, projection helpers, full selection iterator parity)
+  Action for a later pass:
+  - classify each family as `won't implement`, `reader-only not needed`,
+    or `planned parity work`
+  - keep the translation rule explicit: when a function is brought over,
+    translate it completely on the first pass where feasible, instead of
+    landing partial/stubbed behavior and planning to fill semantics in
+    later. Use follow-up passes for auditability/refactoring, not for
+    basic missing branches.
+  - record global policy: do parallelization last. Finish
+    single-threaded faithful translation/audit first, then consider
+    Rayon-based acceleration only after behavior is pinned.
+  - mirror that classification in `analysis/unsupported_features.md`
+  - trim obvious false-positive mappings like parser artifacts (`if`,
+    `while`, `FAIL`, `NULL`) from the CCC follow-up workflow so the
+    missing report is decision-relevant.
+
 - [x] `ccc_mapping.toml` extended to **100% coverage** (732/732 Rust
   functions, 691 entries — was 19% / 140 entries before this work).
   Every Rust function in `src/` has a mapping to its closest libhdf5

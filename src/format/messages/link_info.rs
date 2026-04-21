@@ -21,6 +21,10 @@ pub struct LinkInfoMessage {
 
 impl LinkInfoMessage {
     pub fn decode(data: &[u8], sizeof_addr: u8) -> Result<Self> {
+        Self::decode_impl(data, sizeof_addr)
+    }
+
+    fn decode_impl(data: &[u8], sizeof_addr: u8) -> Result<Self> {
         let mut pos = 0;
         let sa = sizeof_addr as usize;
 

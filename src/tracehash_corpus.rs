@@ -153,7 +153,14 @@ fn touch_vlen_strings<R: std::io::Read + std::io::Seek>(
                 object_index: index,
             },
         )?;
-        trace_vlen_read(data.len() as u64, &data);
+        let expected_len = seq_len as usize;
+        if data.len() < expected_len {
+            return Err(Error::InvalidFormat(format!(
+                "variable-length payload too short: expected {expected_len} bytes, got {}",
+                data.len()
+            )));
+        }
+        trace_vlen_read(seq_len, &data[..expected_len]);
     }
 
     Ok(())

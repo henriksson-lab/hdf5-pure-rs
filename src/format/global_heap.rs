@@ -34,10 +34,19 @@ pub struct GlobalHeapCollection {
 impl GlobalHeapCollection {
     /// Read a global heap collection at the given address.
     ///
-    /// Composition mirrors the C cache layer: `decode_header` parses the
-    /// fixed prefix, then `walk_objects` consumes the decoded header to
-    /// iterate the variable-length object table.
+    /// Thin wrapper around the full deserialize path.
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
+        Self::deserialize_collection(reader, addr)
+    }
+
+    /// Full collection deserialize. This is the closest Rust analog to
+    /// libhdf5's `H5HG__cache_heap_deserialize`: parse the fixed prefix,
+    /// then walk the variable-length object table into a materialized
+    /// collection value.
+    pub fn deserialize_collection<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+    ) -> Result<Self> {
         let header = Self::decode_header(reader, addr)?;
         Self::walk_objects(reader, &header)
     }
