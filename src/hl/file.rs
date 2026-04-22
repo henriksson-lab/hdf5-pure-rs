@@ -127,136 +127,181 @@ impl File {
 
         'resolve: loop {
             if path == "/" {
-                return Ok(ResolvedObject {
-                    inner: self.inner.clone(),
-                    path,
-                    addr: self.superblock.root_addr,
-                    object_type: ObjectType::Group,
-                });
+                return Ok(self.root_resolved_object(path));
             }
 
-            let parts: Vec<String> = path
-                .trim_start_matches('/')
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_string)
-                .collect();
-            for part in &parts {
-                if part.len() > Self::MAX_PATH_COMPONENT_LEN {
-                    return Err(Error::InvalidFormat(format!(
-                        "path component exceeds {}-byte limit ({} bytes)",
-                        Self::MAX_PATH_COMPONENT_LEN,
-                        part.len()
-                    )));
-                }
-            }
+            let parts = Self::path_components(&path)?;
             let mut current = self.root_group()?;
             let mut current_path = String::from("/");
 
             for (idx, part) in parts.iter().enumerate() {
                 let is_last = idx + 1 == parts.len();
-                let link = match current.find_link_by_name(part) {
-                    Ok(link) => link,
-                    Err(link_err) => {
-                        if let Some((_, addr)) = current
-                            .members()?
-                            .into_iter()
-                            .find(|(member_name, _)| member_name == part)
-                        {
-                            let object_type = self.object_type_at(addr)?;
-                            let next_path = join_absolute_path(&current_path, part);
-
-                            if is_last {
-                                return Ok(ResolvedObject {
-                                    inner: self.inner.clone(),
-                                    path: next_path,
-                                    addr,
-                                    object_type,
-                                });
-                            }
-
-                            if object_type != ObjectType::Group {
-                                return Err(Error::InvalidFormat(format!(
-                                    "'{next_path}' is not a group (type: {object_type:?})"
-                                )));
-                            }
-                            current = Group::open(self.inner.clone(), &next_path, addr)?;
-                            current_path = next_path;
-                            continue;
-                        }
-                        return Err(link_err);
-                    }
-                };
-                match link.link_type {
-                    LinkType::Hard => {
-                        let addr = link.hard_link_addr.ok_or_else(|| {
-                            Error::InvalidFormat(format!(
-                                "hard link '{}' is missing object address",
-                                link.name
-                            ))
-                        })?;
-                        let object_type = self.object_type_at(addr)?;
-                        let next_path = join_absolute_path(&current_path, part);
-
-                        if is_last {
-                            return Ok(ResolvedObject {
-                                inner: self.inner.clone(),
-                                path: next_path,
-                                addr,
-                                object_type,
-                            });
-                        }
-
-                        if object_type != ObjectType::Group {
-                            return Err(Error::InvalidFormat(format!(
-                                "'{next_path}' is not a group (type: {object_type:?})"
-                            )));
-                        }
-                        current = Group::open(self.inner.clone(), &next_path, addr)?;
+                let link = self.lookup_group_link(&current, part)?;
+                match self.resolve_path_component(
+                    &current,
+                    &current_path,
+                    part,
+                    is_last,
+                    &parts[idx + 1..],
+                    link,
+                    &mut traversals,
+                )? {
+                    PathStep::Resolved(resolved) => return Ok(resolved),
+                    PathStep::Descend(next_group, next_path) => {
+                        current = next_group;
                         current_path = next_path;
                     }
-                    LinkType::Soft => {
-                        traversals += 1;
-                        if traversals > Self::MAX_SOFT_LINK_TRAVERSALS {
-                            return Err(Error::InvalidFormat(
-                                "soft link traversal limit exceeded".into(),
-                            ));
-                        }
-                        let target = link.soft_link_target.ok_or_else(|| {
-                            Error::InvalidFormat(format!(
-                                "soft link '{}' is missing target path",
-                                link.name
-                            ))
-                        })?;
-                        let remaining = parts[idx + 1..].join("/");
-                        path = resolve_soft_target(&current_path, &target, &remaining);
+                    PathStep::Restart(new_path) => {
+                        path = new_path;
                         continue 'resolve;
-                    }
-                    LinkType::External => {
-                        let (filename, object_path) = link.external_link.ok_or_else(|| {
-                            Error::InvalidFormat(format!(
-                                "external link '{}' is missing target path",
-                                link.name
-                            ))
-                        })?;
-                        let remaining = parts[idx + 1..].join("/");
-                        let target_path = if remaining.is_empty() {
-                            canonical_path(&object_path)
-                        } else {
-                            canonical_path(&join_absolute_path(&object_path, &remaining))
-                        };
-                        let file_path = self.resolve_external_file_path(&filename)?;
-                        let external_file = File::open(file_path)?;
-                        return external_file.resolve_path(&target_path);
-                    }
-                    LinkType::UserDefined(kind) => {
-                        return Err(Error::Unsupported(format!(
-                            "user-defined link traversal is not supported for link type {kind}"
-                        )));
                     }
                 }
             }
         }
+    }
+
+    fn root_resolved_object(&self, path: String) -> ResolvedObject {
+        ResolvedObject {
+            inner: self.inner.clone(),
+            path,
+            addr: self.superblock.root_addr,
+            object_type: ObjectType::Group,
+        }
+    }
+
+    fn path_components(path: &str) -> Result<Vec<String>> {
+        let parts: Vec<String> = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect();
+        for part in &parts {
+            if part.len() > Self::MAX_PATH_COMPONENT_LEN {
+                return Err(Error::InvalidFormat(format!(
+                    "path component exceeds {}-byte limit ({} bytes)",
+                    Self::MAX_PATH_COMPONENT_LEN,
+                    part.len()
+                )));
+            }
+        }
+        Ok(parts)
+    }
+
+    fn lookup_group_link(&self, current: &Group, part: &str) -> Result<LinkMessage> {
+        match current.find_link_by_name(part) {
+            Ok(link) => Ok(link),
+            Err(link_err) => {
+                if let Some((_, addr)) = current
+                    .members()?
+                    .into_iter()
+                    .find(|(member_name, _)| member_name == part)
+                {
+                    Ok(LinkMessage {
+                        name: part.to_string(),
+                        link_type: LinkType::Hard,
+                        creation_order: None,
+                        char_encoding: 0,
+                        hard_link_addr: Some(addr),
+                        soft_link_target: None,
+                        external_link: None,
+                    })
+                } else {
+                    Err(link_err)
+                }
+            }
+        }
+    }
+
+    fn resolve_path_component(
+        &self,
+        _current: &Group,
+        current_path: &str,
+        part: &str,
+        is_last: bool,
+        remaining_parts: &[String],
+        link: LinkMessage,
+        traversals: &mut usize,
+    ) -> Result<PathStep> {
+        match link.link_type {
+            LinkType::Hard => {
+                let addr = link.hard_link_addr.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "hard link '{}' is missing object address",
+                        link.name
+                    ))
+                })?;
+                let next_path = join_absolute_path(current_path, part);
+                let object_type = self.object_type_at(addr)?;
+                self.resolve_hard_path_step(next_path, addr, object_type, is_last)
+            }
+            LinkType::Soft => {
+                *traversals += 1;
+                if *traversals > Self::MAX_SOFT_LINK_TRAVERSALS {
+                    return Err(Error::InvalidFormat(
+                        "soft link traversal limit exceeded".into(),
+                    ));
+                }
+                let target = link.soft_link_target.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "soft link '{}' is missing target path",
+                        link.name
+                    ))
+                })?;
+                let remaining = remaining_parts.join("/");
+                Ok(PathStep::Restart(resolve_soft_target(
+                    current_path,
+                    &target,
+                    &remaining,
+                )))
+            }
+            LinkType::External => {
+                let (filename, object_path) = link.external_link.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "external link '{}' is missing target path",
+                        link.name
+                    ))
+                })?;
+                let remaining = remaining_parts.join("/");
+                let target_path = if remaining.is_empty() {
+                    canonical_path(&object_path)
+                } else {
+                    canonical_path(&join_absolute_path(&object_path, &remaining))
+                };
+                let file_path = self.resolve_external_file_path(&filename)?;
+                let external_file = File::open(file_path)?;
+                Ok(PathStep::Resolved(external_file.resolve_path(&target_path)?))
+            }
+            LinkType::UserDefined(kind) => Err(Error::Unsupported(format!(
+                "user-defined link traversal is not supported for link type {kind}"
+            ))),
+        }
+    }
+
+    fn resolve_hard_path_step(
+        &self,
+        next_path: String,
+        addr: u64,
+        object_type: ObjectType,
+        is_last: bool,
+    ) -> Result<PathStep> {
+        if is_last {
+            return Ok(PathStep::Resolved(ResolvedObject {
+                inner: self.inner.clone(),
+                path: next_path,
+                addr,
+                object_type,
+            }));
+        }
+
+        if object_type != ObjectType::Group {
+            return Err(Error::InvalidFormat(format!(
+                "'{next_path}' is not a group (type: {object_type:?})"
+            )));
+        }
+
+        let next_group = Group::open(self.inner.clone(), &next_path, addr)?;
+        Ok(PathStep::Descend(next_group, next_path))
     }
 
     fn object_type_at(&self, addr: u64) -> Result<ObjectType> {
@@ -288,6 +333,12 @@ struct ResolvedObject {
     path: String,
     addr: u64,
     object_type: ObjectType,
+}
+
+enum PathStep {
+    Resolved(ResolvedObject),
+    Descend(Group, String),
+    Restart(String),
 }
 
 fn canonical_path(path: &str) -> String {

@@ -478,9 +478,10 @@ fn test_message_size_arithmetic_overflow_returns_format_error() {
     overflowing_layout.extend_from_slice(&u32::MAX.to_le_bytes());
     overflowing_layout.extend_from_slice(&u32::MAX.to_le_bytes());
     overflowing_layout.extend_from_slice(&u32::MAX.to_le_bytes());
-    let err = DataLayoutMessage::decode(&overflowing_layout, 8, 8)
-        .expect_err("overflowing contiguous v1 layout should fail");
-    assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
+    let layout = DataLayoutMessage::decode(&overflowing_layout, 8, 8)
+        .expect("v1 contiguous layout should parse without inferring a truncated size");
+    assert_eq!(layout.contiguous_addr, Some(64));
+    assert_eq!(layout.contiguous_size, None);
 
     let attribute = AttributeMessage {
         version: 3,
@@ -593,7 +594,7 @@ fn test_compound_field_preserves_member_byte_order() {
     data.extend_from_slice(&[1, 0, 0]); // one member
     data.extend_from_slice(&4u32.to_le_bytes()); // record size
     data.extend_from_slice(b"x\0");
-    data.extend_from_slice(&0u32.to_le_bytes()); // member offset
+    data.push(0); // member offset
     data.push(0x10); // version 1, fixed-point class
     data.extend_from_slice(&[1, 0, 0]); // big-endian member
     data.extend_from_slice(&4u32.to_le_bytes());
@@ -616,7 +617,7 @@ fn test_compound_fields_reject_overlapping_members() {
     data.extend_from_slice(&4u32.to_le_bytes()); // record size
 
     data.extend_from_slice(b"lo\0");
-    data.extend_from_slice(&0u32.to_le_bytes()); // member offset
+    data.push(0); // member offset
     data.push(0x10); // version 1, fixed-point class
     data.extend_from_slice(&[0, 0, 0]);
     data.extend_from_slice(&2u32.to_le_bytes());
@@ -624,7 +625,7 @@ fn test_compound_fields_reject_overlapping_members() {
     data.extend_from_slice(&16u16.to_le_bytes());
 
     data.extend_from_slice(b"word\0");
-    data.extend_from_slice(&0u32.to_le_bytes()); // overlapping offset
+    data.push(0); // overlapping offset
     data.push(0x10); // version 1, fixed-point class
     data.extend_from_slice(&[0, 0, 0]);
     data.extend_from_slice(&4u32.to_le_bytes());
@@ -647,7 +648,7 @@ fn test_compound_fields_reject_truncated_member_metadata() {
         {
             let mut data = vec![0x36, 2, 0, 0, 4, 0, 0, 0];
             data.extend_from_slice(b"x\0");
-            data.extend_from_slice(&0u32.to_le_bytes());
+            data.push(0);
             data.extend_from_slice(&[0x10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 32, 0]);
             data
         },
@@ -676,14 +677,14 @@ fn test_compound_fields_reject_truncated_member_metadata() {
         {
             let mut data = vec![0x36, 1, 0, 0, 4, 0, 0, 0];
             data.extend_from_slice(b"x\0");
-            data.extend_from_slice(&0u32.to_le_bytes());
+            data.push(0);
             data.extend_from_slice(&[0x10, 0, 0]);
             data
         },
         {
             let mut data = vec![0x36, 1, 0, 0, 4, 0, 0, 0];
             data.extend_from_slice(b"x\0");
-            data.extend_from_slice(&0u32.to_le_bytes());
+            data.push(0);
             data.extend_from_slice(&[0x10, 0, 0, 0, 4, 0, 0, 0, 1]);
             data
         },
@@ -1023,6 +1024,50 @@ fn test_layout_accepts_equal_nonzero_btree2_percents() {
 }
 
 #[test]
+fn test_layout_v1_contiguous_does_not_infer_truncated_size() {
+    let mut layout = vec![1u8, 1, 1, 0, 0, 0, 0, 0];
+    layout.extend_from_slice(&0x1122334455667788u64.to_le_bytes());
+    layout.extend_from_slice(&123u32.to_le_bytes());
+
+    let decoded =
+        DataLayoutMessage::decode(&layout, 8, 8).expect("v1 contiguous layout should parse");
+    assert_eq!(decoded.contiguous_addr, Some(0x1122334455667788));
+    assert_eq!(decoded.contiguous_size, None);
+}
+
+#[test]
+fn test_layout_v4_preserves_encoded_chunk_dims() {
+    let mut layout = vec![4u8, 2, 0, 2, 2];
+    layout.extend_from_slice(&3u16.to_le_bytes());
+    layout.extend_from_slice(&5u16.to_le_bytes());
+    layout.push(2);
+    layout.extend_from_slice(&0x8877665544332211u64.to_le_bytes());
+
+    let decoded =
+        DataLayoutMessage::decode(&layout, 8, 8).expect("v4 implicit chunk layout should parse");
+    assert_eq!(decoded.chunk_dims, Some(vec![3, 5]));
+    assert_eq!(decoded.chunk_encoded_dims, Some(vec![3, 5]));
+    assert_eq!(
+        decoded.chunk_index_type,
+        Some(hdf5_pure_rust::format::messages::data_layout::ChunkIndexType::Implicit)
+    );
+    assert_eq!(decoded.chunk_index_addr, Some(0x8877665544332211));
+}
+
+#[test]
+fn test_layout_rejects_unknown_chunk_index_type_as_invalid_format() {
+    let mut layout = vec![4u8, 2, 0, 1, 4];
+    layout.extend_from_slice(&4u32.to_le_bytes());
+    layout.push(99);
+    layout.extend_from_slice(&0u64.to_le_bytes());
+
+    let err = DataLayoutMessage::decode(&layout, 8, 8)
+        .expect_err("unknown v4 chunk index type must fail as invalid format");
+    assert!(matches!(err, hdf5_pure_rust::Error::InvalidFormat(_)));
+    assert!(format!("{err}").contains("invalid chunk index type"));
+}
+
+#[test]
 fn test_layout_rejects_zero_btree2_split_percent() {
     let mut bad_split = vec![4u8, 2, 0, 1, 4];
     bad_split.extend_from_slice(&4u32.to_le_bytes());
@@ -1033,6 +1078,54 @@ fn test_layout_rejects_zero_btree2_split_percent() {
     bad_split.extend_from_slice(&0u64.to_le_bytes());
     let err = DataLayoutMessage::decode(&bad_split, 8, 8).expect_err("split percent 0 must fail");
     assert!(format!("{err}").contains("split percent"));
+}
+
+#[test]
+fn test_compound_distinct_non_utf8_member_names_do_not_false_duplicate() {
+    let mut data = vec![0x36, 2, 0, 0];
+    data.extend_from_slice(&2u32.to_le_bytes());
+
+    data.extend_from_slice(&[0xff, 0]);
+    data.push(0);
+    data.push(0x10);
+    data.extend_from_slice(&[0, 0, 0]);
+    data.extend_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&8u16.to_le_bytes());
+
+    data.extend_from_slice(&[0xfe, 0]);
+    data.push(1);
+    data.push(0x10);
+    data.extend_from_slice(&[0, 0, 0]);
+    data.extend_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&8u16.to_le_bytes());
+
+    let datatype = DatatypeMessage::decode(&data).expect("compound datatype should parse");
+    let fields = datatype
+        .compound_fields()
+        .expect("distinct non-UTF8 names must not be treated as duplicates");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].byte_offset, 0);
+    assert_eq!(fields[1].byte_offset, 1);
+}
+
+#[test]
+fn test_enum_rejects_empty_member_name() {
+    let mut data = vec![0x18, 1, 0, 0];
+    data.extend_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&[0x10, 0, 0, 0]);
+    data.extend_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&8u16.to_le_bytes());
+    data.push(0);
+    data.push(7);
+
+    let datatype = DatatypeMessage::decode(&data).expect("enum datatype should decode");
+    let err = datatype
+        .enum_members()
+        .expect_err("empty enum member names must be rejected");
+    assert!(format!("{err}").contains("must not be empty"));
 }
 
 #[test]
@@ -1072,6 +1165,22 @@ fn test_branchable_error_messages_are_stable() {
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
+
+    let out = hdf5_pure_rust::filters::apply_pipeline_reverse(
+        &[1, 2, 3, 4],
+        &FilterPipelineMessage {
+            version: 2,
+            filters: vec![FilterDesc {
+                id: 65535,
+                name: None,
+                flags: 1,
+                client_data: Vec::new(),
+            }],
+        },
+        4,
+    )
+    .expect("unknown optional filter should be skipped");
+    assert_eq!(out, vec![1, 2, 3, 4]);
 
     let err = hdf5_pure_rust::filters::apply_pipeline_reverse_with_mask(
         &[1, 2, 3, 4],

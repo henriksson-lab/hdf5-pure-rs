@@ -186,6 +186,47 @@ fn test_real_world_netcdf4_like_smoke() {
 }
 
 #[test]
+fn test_real_world_netcdf4_grouped_smoke() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/netcdf4_grouped_ocean.nc") else {
+        return;
+    };
+
+    let lat: Vec<f32> = f.dataset("coordinates/lat").unwrap().read::<f32>().unwrap();
+    let lon: Vec<f32> = f.dataset("coordinates/lon").unwrap().read::<f32>().unwrap();
+    let depth: Vec<f32> = f
+        .dataset("coordinates/depth")
+        .unwrap()
+        .read::<f32>()
+        .unwrap();
+    let time: Vec<i32> = f
+        .dataset("coordinates/time")
+        .unwrap()
+        .read::<i32>()
+        .unwrap();
+    let temperature = f.dataset("ocean/temperature").unwrap();
+    let salinity = f.dataset("ocean/salinity").unwrap();
+    let profile = f.dataset("ocean/profile").unwrap();
+
+    let temperature_values: Vec<f32> = temperature.read::<f32>().unwrap();
+    let salinity_values: Vec<f32> = salinity.read::<f32>().unwrap();
+    let profile_values: Vec<f32> = profile.read::<f32>().unwrap();
+
+    assert_eq!(lat, vec![58.0, 59.5]);
+    assert_eq!(lon, vec![18.0, 19.0, 20.0]);
+    assert_eq!(depth, vec![0.0, 10.0, 25.0]);
+    assert_eq!(time, vec![0, 6]);
+    assert_eq!(temperature.shape().unwrap(), vec![2, 2, 3]);
+    assert_eq!(salinity.shape().unwrap(), vec![2, 2, 3]);
+    assert_eq!(profile.shape().unwrap(), vec![2, 3]);
+    assert!((temperature_values[0] - 280.0).abs() < 1e-4);
+    assert!((salinity_values[0] - 35.0).abs() < 1e-4);
+    assert_eq!(
+        profile_values,
+        vec![280.0, 279.5, 279.0, 281.0, 280.4, 279.8]
+    );
+}
+
+#[test]
 fn test_real_world_matlab_v73_like_smoke() {
     let Some(f) = open_real_world_fixture("tests/data/real_world/matlab_v73_like.mat") else {
         return;
@@ -217,6 +258,51 @@ fn test_real_world_nexus_smoke() {
 }
 
 #[test]
+fn test_real_world_nexus_rich_smoke() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/nexus_rich_scan.nxs") else {
+        return;
+    };
+
+    let entry = f.group("entry").unwrap();
+    let members = entry.member_names().unwrap();
+    assert!(members.contains(&"data".to_string()));
+    assert!(members.contains(&"instrument".to_string()));
+    assert!(members.contains(&"sample".to_string()));
+
+    let counts: Vec<i32> = f
+        .dataset("entry/instrument/detector/counts")
+        .unwrap()
+        .read::<i32>()
+        .unwrap();
+    let linked_counts: Vec<i32> = f
+        .dataset("entry/data/counts")
+        .unwrap()
+        .read::<i32>()
+        .unwrap();
+    let two_theta: Vec<f32> = f
+        .dataset("entry/data/two_theta")
+        .unwrap()
+        .read::<f32>()
+        .unwrap();
+    let frame: Vec<i32> = f
+        .dataset("entry/data/frame")
+        .unwrap()
+        .read::<i32>()
+        .unwrap();
+    let temperature: Vec<f32> = f
+        .dataset("entry/sample/temperature")
+        .unwrap()
+        .read::<f32>()
+        .unwrap();
+
+    assert_eq!(counts, (0..24).collect::<Vec<_>>());
+    assert_eq!(linked_counts, counts);
+    assert_eq!(two_theta, vec![10.0, 16.0, 22.0, 28.0, 34.0, 40.0]);
+    assert_eq!(frame, vec![0, 1, 2, 3]);
+    assert_eq!(temperature, vec![295.0]);
+}
+
+#[test]
 fn test_real_world_pandas_hdfstore_smoke() {
     let Some(f) = open_real_world_fixture("tests/data/real_world/pandas_hdfstore_table.h5") else {
         return;
@@ -227,4 +313,152 @@ fn test_real_world_pandas_hdfstore_smoke() {
     assert!(members.contains(&"table".to_string()));
     let table = f.dataset("observations/table").unwrap();
     assert_eq!(table.shape().unwrap()[0], 4);
+}
+
+#[test]
+fn test_real_world_pandas_hdfstore_fixed_smoke() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/pandas_hdfstore_fixed.h5") else {
+        return;
+    };
+
+    let frame = f.group("fixed_frame").unwrap();
+    let members = frame.member_names().unwrap();
+    for expected in [
+        "axis0",
+        "axis1",
+        "block1_items",
+        "block1_values",
+        "block2_items",
+        "block2_values",
+    ] {
+        assert!(
+            members.contains(&expected.to_string()),
+            "missing {expected}"
+        );
+    }
+
+    let axis0 = f
+        .dataset("fixed_frame/axis0")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let axis1 = f
+        .dataset("fixed_frame/axis1")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let block1_items = f
+        .dataset("fixed_frame/block1_items")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let block1_values: Vec<i64> = f
+        .dataset("fixed_frame/block1_values")
+        .unwrap()
+        .read::<i64>()
+        .unwrap();
+    let block2_items = f
+        .dataset("fixed_frame/block2_items")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let block2_values: Vec<f64> = f
+        .dataset("fixed_frame/block2_values")
+        .unwrap()
+        .read::<f64>()
+        .unwrap();
+
+    assert_eq!(axis0, vec!["sample", "count", "score"]);
+    assert_eq!(axis1, vec!["r0", "r1", "r2", "r3"]);
+    assert_eq!(block1_items, vec!["count"]);
+    assert_eq!(block1_values, vec![1, 3, 5, 7]);
+    assert_eq!(block2_items, vec!["score"]);
+    assert_eq!(block2_values, vec![0.25, 0.5, 1.0, 2.0]);
+}
+
+#[test]
+fn test_real_world_pytables_native_smoke() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/pytables_native_layout.h5") else {
+        return;
+    };
+
+    let image_stack: Vec<u16> = f
+        .dataset("measurements/image_stack")
+        .unwrap()
+        .read::<u16>()
+        .unwrap();
+    let trace: Vec<f32> = f
+        .dataset("measurements/trace")
+        .unwrap()
+        .read::<f32>()
+        .unwrap();
+    let labels = f
+        .dataset("metadata/labels")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let events = f.dataset("measurements/events").unwrap();
+
+    assert_eq!(image_stack, (0u16..24).collect::<Vec<_>>());
+    assert_eq!(trace, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
+    assert_eq!(labels, vec!["alpha", "beta", "gamma"]);
+
+    let fields = events.compound_fields().unwrap();
+    assert_eq!(
+        fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        vec!["sample_id", "value", "quality"]
+    );
+    assert_eq!(
+        events.read_field::<i32>("sample_id").unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        events.read_field::<f64>("value").unwrap(),
+        vec![0.25, 0.5, 0.75]
+    );
+}
+
+#[test]
+fn test_real_world_pytables_nested_smoke() {
+    let Some(f) = open_real_world_fixture("tests/data/real_world/pytables_nested_layout.h5") else {
+        return;
+    };
+
+    let waveform: Vec<f64> = f
+        .dataset("run_001/sensors/waveform")
+        .unwrap()
+        .read::<f64>()
+        .unwrap();
+    let names = f
+        .dataset("run_001/metadata/names")
+        .unwrap()
+        .read_strings()
+        .unwrap();
+    let active: Vec<u8> = f
+        .dataset("run_001/metadata/active")
+        .unwrap()
+        .read::<u8>()
+        .unwrap();
+    let summary = f.dataset("run_001/sensors/summary").unwrap();
+
+    assert_eq!(
+        waveform,
+        vec![0.0, 0.1, 0.2, 0.3, 1.0, 1.1, 1.2, 1.3, 2.0, 2.1, 2.2, 2.3]
+    );
+    assert_eq!(names, vec!["s0", "s1", "s2"]);
+    assert_eq!(active, vec![1, 0, 1]);
+
+    let fields = summary.compound_fields().unwrap();
+    assert_eq!(
+        fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+        vec!["sensor_id", "mean", "status"]
+    );
+    assert_eq!(
+        summary.read_field::<i32>("sensor_id").unwrap(),
+        vec![10, 11, 12]
+    );
+    assert_eq!(
+        summary.read_field::<f32>("mean").unwrap(),
+        vec![1.5, 2.5, 3.5]
+    );
 }

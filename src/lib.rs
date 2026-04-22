@@ -9,7 +9,7 @@ pub mod tracehash_corpus;
 
 pub use error::{Error, Result};
 pub use hl::attribute::Attribute;
-pub use hl::dataset::Dataset;
+pub use hl::dataset::{Dataset, VdsView};
 pub use hl::dataset_builder::DatasetBuilder;
 pub use hl::dataspace::Dataspace;
 pub use hl::datatype::Datatype;

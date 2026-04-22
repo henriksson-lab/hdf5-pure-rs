@@ -11,6 +11,8 @@ import numpy as np
 
 OUT = Path("tests/data/hdf5_ref")
 
+GLOBAL_HEAP_MAGIC = b"GCOL"
+
 
 def write_fixed_array(path: Path) -> None:
     data = np.arange(100, dtype=np.int32)
@@ -994,6 +996,135 @@ def write_virtual_overlap(vds_path: Path, source_a_path: Path, source_b_path: Pa
         h5py.h5d.create(f.id, b"vds_overlap", h5py.h5t.STD_I32LE, dataset_space, dcpl=dcpl)
 
 
+def write_virtual_irregular_hyperslab(vds_path: Path, source_path: Path) -> None:
+    data = np.arange(16, dtype=np.int32).reshape(4, 4)
+    with h5py.File(source_path, "w", libver="latest") as f:
+        f.create_dataset("source", data=data)
+
+    dataset_space = h5py.h5s.create_simple((4, 4))
+    virtual_space = h5py.h5s.create_simple((4, 4))
+    source_space = h5py.h5s.create_simple((4, 4))
+    for space in (virtual_space, source_space):
+        space.select_hyperslab((0, 1), (1, 1), block=(1, 2), op=h5py.h5s.SELECT_SET)
+        space.select_hyperslab((2, 0), (1, 1), block=(1, 2), op=h5py.h5s.SELECT_OR)
+
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_fill_value(np.array(-2, dtype=np.int32))
+    dcpl.set_virtual(
+        virtual_space,
+        source_path.name.encode("utf-8"),
+        b"/source",
+        source_space,
+    )
+
+    with h5py.File(vds_path, "w", libver="latest") as f:
+        h5py.h5d.create(
+            f.id,
+            b"vds_irregular_hyperslab",
+            h5py.h5t.STD_I32LE,
+            dataset_space,
+            dcpl=dcpl,
+        )
+
+
+def point_selection_bytes(rank: int, points: list[tuple[int, ...]]) -> bytes:
+    if rank <= 0:
+        raise ValueError("point selection rank must be positive")
+    if not points:
+        raise ValueError("point selection fixture requires at least one point")
+    if any(len(point) != rank for point in points):
+        raise ValueError("point coordinates must match selection rank")
+
+    max_value = max(max(point) for point in points)
+    max_value = max(max_value, len(points))
+    if max_value <= 0xFFFF:
+        enc_size = 2
+    elif max_value <= 0xFFFFFFFF:
+        enc_size = 4
+    else:
+        enc_size = 8
+
+    out = bytearray()
+    out.extend((1).to_bytes(4, "little"))  # H5S_SEL_POINTS
+    out.extend((2).to_bytes(4, "little"))  # point-selection version 2
+    out.append(enc_size)
+    out.extend(rank.to_bytes(4, "little"))
+    out.extend(len(points).to_bytes(enc_size, "little"))
+    for point in points:
+        for coord in point:
+            out.extend(coord.to_bytes(enc_size, "little"))
+    return bytes(out)
+
+
+def rewrite_single_global_heap_object(path: Path, object_data: bytes) -> None:
+    raw = bytearray(path.read_bytes())
+    heap_addr = raw.find(GLOBAL_HEAP_MAGIC)
+    if heap_addr < 0:
+        raise ValueError(f"global heap collection not found in {path}")
+
+    object_header = heap_addr + 16
+    object_index = int.from_bytes(raw[object_header:object_header + 2], "little")
+    if object_index != 1:
+        raise ValueError(f"expected global heap object index 1, got {object_index}")
+
+    original_size = int.from_bytes(raw[object_header + 8:object_header + 16], "little")
+    padded_size = (original_size + 7) & ~7
+    if len(object_data) > padded_size:
+        raise ValueError(
+            f"patched global heap object ({len(object_data)} bytes) exceeds padded slot {padded_size}"
+        )
+
+    raw[object_header + 8:object_header + 16] = len(object_data).to_bytes(8, "little")
+    data_start = object_header + 16
+    data_end = data_start + padded_size
+    raw[data_start:data_start + len(object_data)] = object_data
+    raw[data_start + len(object_data):data_end] = b"\x00" * (data_end - (data_start + len(object_data)))
+    path.write_bytes(raw)
+
+
+def write_virtual_point_selection(vds_path: Path, source_path: Path) -> None:
+    data = np.arange(16, dtype=np.int32).reshape(4, 4)
+    with h5py.File(source_path, "w", libver="latest") as f:
+        f.create_dataset("source", data=data)
+
+    dataset_space = h5py.h5s.create_simple((4, 4))
+    virtual_space = h5py.h5s.create_simple((4, 4))
+    source_space = h5py.h5s.create_simple((4, 4))
+    for space in (virtual_space, source_space):
+        space.select_hyperslab((0, 1), (1, 1), block=(1, 2), op=h5py.h5s.SELECT_SET)
+        space.select_hyperslab((2, 0), (1, 1), block=(1, 2), op=h5py.h5s.SELECT_OR)
+
+    dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+    dcpl.set_fill_value(np.array(-2, dtype=np.int32))
+    dcpl.set_virtual(
+        virtual_space,
+        source_path.name.encode("utf-8"),
+        b"/source",
+        source_space,
+    )
+
+    with h5py.File(vds_path, "w", libver="latest") as f:
+        h5py.h5d.create(
+            f.id,
+            b"vds_point_selection",
+            h5py.h5t.STD_I32LE,
+            dataset_space,
+            dcpl=dcpl,
+        )
+
+    source_points = point_selection_bytes(2, [(2, 1)])
+    virtual_points = point_selection_bytes(2, [(0, 3)])
+    heap_object = (
+        bytes([0]) +
+        (1).to_bytes(8, "little") +
+        source_path.name.encode("utf-8") + b"\x00" +
+        b"/source\x00" +
+        source_points +
+        virtual_points
+    )
+    rewrite_single_global_heap_object(vds_path, heap_object)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"h5py version: {h5py.__version__}")
@@ -1096,6 +1227,14 @@ def main() -> None:
         record(OUT / "vds_overlap.h5"),
         record(OUT / "vds_overlap_source_a.h5"),
         record(OUT / "vds_overlap_source_b.h5"),
+    )
+    write_virtual_irregular_hyperslab(
+        record(OUT / "vds_irregular_hyperslab.h5"),
+        record(OUT / "vds_irregular_hyperslab_source.h5"),
+    )
+    write_virtual_point_selection(
+        record(OUT / "vds_point_selection.h5"),
+        record(OUT / "vds_point_selection_source.h5"),
     )
 
     print("Regenerated local fixtures:")

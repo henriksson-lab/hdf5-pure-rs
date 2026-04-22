@@ -359,7 +359,7 @@ other = "H5O__sdspace_decode"
 # format/messages/data_layout.rs — H5Olayout.c
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "decode_impl"
+rust = "decode_v3_v4"
 rust_path = "format/messages/data_layout.rs"
 other = "H5O__layout_decode"
 
@@ -653,9 +653,14 @@ rust_path = "hl/dataset.rs"
 other = "H5D__btree_idx_iterate"
 
 [[entries]]
-rust = "decode_virtual_selection"
+rust = "decode_virtual_hyperslab_selection"
 rust_path = "hl/dataset.rs"
 other = "H5S__hyper_deserialize"
+
+[[entries]]
+rust = "decode_virtual_point_selection"
+rust_path = "hl/dataset.rs"
+other = "H5S__point_deserialize"
 
 [[entries]]
 rust = "decode_virtual_mappings"
@@ -706,7 +711,7 @@ other = "H5D__none_idx_iterate"
 # hl/mutable_file.rs — write paths
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "write_chunk"
+rust = "rewrite_chunk_index"
 rust_path = "hl/mutable_file.rs"
 other = "H5D__chunk_write"
 
@@ -807,11 +812,6 @@ other = "H5D__create"
 rust = "build_v2_object_header"
 rust_path = "engine/writer.rs"
 other = "H5O_create"
-
-[[entries]]
-rust = "extract_chunk"
-rust_path = "engine/writer.rs"
-other = "H5D__chunk_lock"
 
 # ---------------------------------------------------------------------------
 # hl/conversion.rs — H5T type conversions

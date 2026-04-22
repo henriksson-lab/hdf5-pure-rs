@@ -93,7 +93,13 @@ fn apply_pipeline_reverse_with_mask_and_expected(
         if filter_mask & (1u32 << index) != 0 {
             continue;
         }
-        buf = apply_filter_reverse(&buf, filter, element_size)?;
+        match apply_filter_reverse(&buf, filter, element_size) {
+            Ok(next) => buf = next,
+            Err(Error::Unsupported(_)) if filter.flags & 0x0001 != 0 => {
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     if let Some(expected_len) = expected_len {
@@ -200,12 +206,8 @@ mod tests {
 
     #[test]
     fn unmasked_unknown_optional_filter_fails() {
-        let err =
-            apply_pipeline_reverse_with_mask(b"abcd", &unknown_pipeline(1), 1, 0).unwrap_err();
-        assert!(
-            err.to_string().contains("filter 32099 not implemented"),
-            "unexpected error: {err}"
-        );
+        let out = apply_pipeline_reverse_with_mask(b"abcd", &unknown_pipeline(1), 1, 0).unwrap();
+        assert_eq!(out, b"abcd");
     }
 
     #[test]

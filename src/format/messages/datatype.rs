@@ -309,12 +309,18 @@ impl DatatypeMessage {
             .compound_nmembers()
             .ok_or_else(|| Error::InvalidFormat("not a compound datatype".into()))?
             as usize;
+        if nmembers == 0 {
+            return Err(Error::InvalidFormat(
+                "invalid number of compound datatype members: 0".into(),
+            ));
+        }
         if nmembers > MAX_DATATYPE_MEMBERS {
             return Err(Error::InvalidFormat(format!(
                 "compound datatype member count {nmembers} exceeds supported maximum {MAX_DATATYPE_MEMBERS}"
             )));
         }
         let mut fields: Vec<CompoundField> = Vec::with_capacity(nmembers);
+        let mut field_name_bytes: Vec<Vec<u8>> = Vec::with_capacity(nmembers);
         let data = &self.properties;
         let mut p = 0;
 
@@ -324,134 +330,158 @@ impl DatatypeMessage {
                     "compound datatype truncated before member".into(),
                 ));
             }
-
-            // Name (null-terminated, padded to 8-byte boundary in v1/v2)
-            let name_start = p;
-            let name_end = data[p..].iter().position(|&b| b == 0).ok_or_else(|| {
-                Error::InvalidFormat("compound datatype member name is not terminated".into())
-            })?;
-            let name = String::from_utf8_lossy(&data[p..p + name_end]).to_string();
-            if self.version < 3 {
-                let name_with_null = name_end + 1;
-                let padded = (name_with_null + 7) & !7;
-                p = name_start + padded;
-            } else {
-                p += name_end + 1;
-            }
-
-            // Byte offset. Version 4 stores this using the minimum number of
-            // bytes needed for offsets in the parent compound datatype.
-            let offset_size = compound_member_offset_size(self.version, self.size as usize);
-            if p + offset_size > data.len() {
-                return Err(Error::InvalidFormat(
-                    "compound datatype member offset is truncated".into(),
-                ));
-            }
-            let byte_offset = read_le_var_usize(&data[p..p + offset_size]);
-            p += offset_size;
-
-            let member_dt = if self.version == 1 {
-                // Version 1 compound members may carry inline arrayness that
-                // newer encodings represent as a dedicated array datatype.
-                if p + 28 > data.len() {
-                    return Err(Error::InvalidFormat(
-                        "compound datatype member dimension block is truncated".into(),
-                    ));
-                }
-
-                let ndims = data[p] as usize;
-                if ndims > 4 {
-                    return Err(Error::InvalidFormat(
-                        "compound datatype inline array rank exceeds supported maximum 4".into(),
-                    ));
-                }
-                let dims_start = p + 12;
-                let mut dims = Vec::with_capacity(ndims);
-                for idx in 0..4 {
-                    let base = dims_start + idx * 4;
-                    let dim = u32::from_le_bytes([
-                        data[base],
-                        data[base + 1],
-                        data[base + 2],
-                        data[base + 3],
-                    ]) as u64;
-                    if idx < ndims {
-                        if dim == 0 {
-                            return Err(Error::InvalidFormat(
-                                "compound datatype inline array dimension must be positive".into(),
-                            ));
-                        }
-                        dims.push(dim);
-                    }
-                }
-                p += 28;
-
-                if p + 8 > data.len() {
-                    return Err(Error::InvalidFormat(
-                        "compound datatype member datatype is truncated".into(),
-                    ));
-                }
-                let encoded_len = datatype_encoded_len(&data[p..])?;
-                let base_dt = DatatypeMessage::decode(&data[p..p + encoded_len])?;
-                p += encoded_len;
-
-                if dims.is_empty() {
-                    base_dt
-                } else {
-                    create_legacy_compound_array_member(base_dt, dims)?
-                }
-            } else {
-                if self.version < 3 {
-                    if p + 28 > data.len() {
-                        return Err(Error::InvalidFormat(
-                            "compound datatype member dimension block is truncated".into(),
-                        ));
-                    }
-                    p += 28;
-                }
-
-                if p + 8 > data.len() {
-                    return Err(Error::InvalidFormat(
-                        "compound datatype member datatype is truncated".into(),
-                    ));
-                }
-                let encoded_len = datatype_encoded_len(&data[p..])?;
-                let member_dt = DatatypeMessage::decode(&data[p..p + encoded_len])?;
-                p += encoded_len;
-                member_dt
-            };
-            let member_type_size = member_dt.size as usize;
-            let member_class = member_dt.class;
-            let byte_order = member_dt.byte_order();
-
-            let member_end = byte_offset.checked_add(member_type_size).ok_or_else(|| {
-                Error::InvalidFormat("compound datatype member offset overflow".into())
-            })?;
-            if member_end > self.size as usize {
-                return Err(Error::InvalidFormat(format!(
-                    "compound datatype member '{name}' exceeds record bounds"
-                )));
-            }
-            if fields.iter().any(|field| {
-                let field_end = field.byte_offset + field.size;
-                byte_offset < field_end && field.byte_offset < member_end
-            }) {
-                return Err(Error::InvalidFormat(format!(
-                    "compound datatype member '{name}' overlaps another member"
-                )));
-            }
-
-            fields.push(CompoundField {
-                name,
-                byte_offset,
-                size: member_type_size,
-                class: member_class,
-                byte_order,
-                datatype: Box::new(member_dt),
-            });
+            let (raw_name, name) =
+                self.decode_compound_member_name(data, &mut p, &field_name_bytes)?;
+            let byte_offset = self.decode_compound_member_offset(data, &mut p)?;
+            let member_dt = self.decode_compound_member_datatype(data, &mut p)?;
+            let field =
+                self.validate_compound_member_layout(name, byte_offset, member_dt, &fields)?;
+            fields.push(field);
+            field_name_bytes.push(raw_name);
         }
 
         Ok(fields)
+    }
+
+    fn decode_compound_member_name(
+        &self,
+        data: &[u8],
+        pos: &mut usize,
+        prior_names: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, String)> {
+        let name_start = *pos;
+        let name_end = data[*pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+            Error::InvalidFormat("compound datatype member name is not terminated".into())
+        })?;
+        let raw_name = data[*pos..*pos + name_end].to_vec();
+        let name = String::from_utf8_lossy(&raw_name).to_string();
+        if prior_names
+            .iter()
+            .any(|prior| prior.as_slice() == raw_name.as_slice())
+        {
+            return Err(Error::InvalidFormat(format!(
+                "duplicated compound field name '{name}'"
+            )));
+        }
+
+        if self.version < 3 {
+            let name_with_null = name_end + 1;
+            let padded = (name_with_null + 7) & !7;
+            *pos = name_start + padded;
+        } else {
+            *pos += name_end + 1;
+        }
+
+        Ok((raw_name, name))
+    }
+
+    fn decode_compound_member_offset(&self, data: &[u8], pos: &mut usize) -> Result<usize> {
+        let offset_size = compound_member_offset_size(self.version, self.size as usize);
+        if *pos + offset_size > data.len() {
+            return Err(Error::InvalidFormat(
+                "compound datatype member offset is truncated".into(),
+            ));
+        }
+        let byte_offset = read_le_var_usize(&data[*pos..*pos + offset_size]);
+        *pos += offset_size;
+        Ok(byte_offset)
+    }
+
+    fn decode_compound_member_datatype(
+        &self,
+        data: &[u8],
+        pos: &mut usize,
+    ) -> Result<DatatypeMessage> {
+        let legacy_array_dims = if self.version == 1 {
+            Some(Self::decode_legacy_compound_array_dims(data, pos)?)
+        } else {
+            None
+        };
+
+        if *pos + 8 > data.len() {
+            return Err(Error::InvalidFormat(
+                "compound datatype member datatype is truncated".into(),
+            ));
+        }
+        let encoded_len = datatype_encoded_len(&data[*pos..])?;
+        let base_dt = DatatypeMessage::decode(&data[*pos..*pos + encoded_len])?;
+        *pos += encoded_len;
+
+        match legacy_array_dims {
+            Some(dims) if !dims.is_empty() => create_legacy_compound_array_member(base_dt, dims),
+            _ => Ok(base_dt),
+        }
+    }
+
+    fn decode_legacy_compound_array_dims(data: &[u8], pos: &mut usize) -> Result<Vec<u64>> {
+        if *pos + 28 > data.len() {
+            return Err(Error::InvalidFormat(
+                "compound datatype member dimension block is truncated".into(),
+            ));
+        }
+
+        let ndims = data[*pos] as usize;
+        if ndims > 4 {
+            return Err(Error::InvalidFormat(
+                "compound datatype inline array rank exceeds supported maximum 4".into(),
+            ));
+        }
+        let dims_start = *pos + 12;
+        let mut dims = Vec::with_capacity(ndims);
+        for idx in 0..4 {
+            let base = dims_start + idx * 4;
+            let dim = u32::from_le_bytes([
+                data[base],
+                data[base + 1],
+                data[base + 2],
+                data[base + 3],
+            ]) as u64;
+            if idx < ndims {
+                if dim == 0 {
+                    return Err(Error::InvalidFormat(
+                        "compound datatype inline array dimension must be positive".into(),
+                    ));
+                }
+                dims.push(dim);
+            }
+        }
+        *pos += 28;
+        Ok(dims)
+    }
+
+    fn validate_compound_member_layout(
+        &self,
+        name: String,
+        byte_offset: usize,
+        member_dt: DatatypeMessage,
+        fields: &[CompoundField],
+    ) -> Result<CompoundField> {
+        let member_type_size = member_dt.size as usize;
+        let member_end = byte_offset.checked_add(member_type_size).ok_or_else(|| {
+            Error::InvalidFormat("compound datatype member offset overflow".into())
+        })?;
+        if member_end > self.size as usize {
+            return Err(Error::InvalidFormat(format!(
+                "compound datatype member '{name}' exceeds record bounds"
+            )));
+        }
+        if fields.iter().any(|field| {
+            let field_end = field.byte_offset + field.size;
+            byte_offset < field_end && field.byte_offset < member_end
+        }) {
+            return Err(Error::InvalidFormat(format!(
+                "compound datatype member '{name}' overlaps another member"
+            )));
+        }
+
+        Ok(CompoundField {
+            name,
+            byte_offset,
+            size: member_type_size,
+            class: member_dt.class,
+            byte_order: member_dt.byte_order(),
+            datatype: Box::new(member_dt),
+        })
     }
 
     /// Get the number of enum members.
@@ -513,6 +543,11 @@ impl DatatypeMessage {
             let name_end = data[p..].iter().position(|&b| b == 0).ok_or_else(|| {
                 Error::InvalidFormat("enum datatype member name is not terminated".into())
             })?;
+            if name_end == 0 {
+                return Err(Error::InvalidFormat(
+                    "enum datatype member name must not be empty".into(),
+                ));
+            }
             let name = String::from_utf8_lossy(&data[p..p + name_end]).to_string();
             if self.version < 3 {
                 let padded = (name_end + 1 + 7) & !7;
@@ -723,6 +758,11 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
                 let name_len = data[p..].iter().position(|&b| b == 0).ok_or_else(|| {
                     Error::InvalidFormat("enum datatype member name is not terminated".into())
                 })? + 1;
+                if name_len == 1 {
+                    return Err(Error::InvalidFormat(
+                        "enum datatype member name must not be empty".into(),
+                    ));
+                }
                 p += if version < 3 {
                     (name_len + 7) & !7
                 } else {
@@ -753,6 +793,11 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
                 .compound_nmembers()
                 .ok_or_else(|| Error::InvalidFormat("not a compound datatype".into()))?
                 as usize;
+            if nmembers == 0 {
+                return Err(Error::InvalidFormat(
+                    "invalid number of compound datatype members: 0".into(),
+                ));
+            }
             let mut p = 8;
 
             for _ in 0..nmembers {
@@ -775,7 +820,7 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
                     .ok_or_else(|| {
                         Error::InvalidFormat("compound datatype size overflow".into())
                     })?;
-                if version < 3 {
+                if version == 1 {
                     p = p.checked_add(28).ok_or_else(|| {
                         Error::InvalidFormat("compound datatype size overflow".into())
                     })?;
@@ -864,7 +909,7 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
 }
 
 fn compound_member_offset_size(version: u8, compound_size: usize) -> usize {
-    if version < 4 {
+    if version < 3 {
         return 4;
     }
 
@@ -964,4 +1009,111 @@ fn encode_embedded_datatype_message(message: &DatatypeMessage) -> Result<Vec<u8>
     buf.extend_from_slice(&message.size.to_le_bytes());
     buf.extend_from_slice(&message.properties);
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v1_fixed_point(size: u32, precision: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x10);
+        buf.extend_from_slice(&[0, 0, 0]);
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&precision.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn compound_v2_member_does_not_require_legacy_dimension_block() {
+        let member = v1_fixed_point(4, 32);
+        let mut data = Vec::new();
+        data.push(0x26);
+        data.extend_from_slice(&[1, 0, 0]);
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(b"x\0");
+        data.extend_from_slice(&[0; 6]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&member);
+
+        let dtype = DatatypeMessage::decode(&data).expect("compound v2 datatype should decode");
+        let fields = dtype
+            .compound_fields()
+            .expect("compound v2 member should decode without legacy array metadata");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "x");
+        assert_eq!(fields[0].byte_offset, 0);
+        assert_eq!(fields[0].size, 4);
+    }
+
+    #[test]
+    fn compound_v3_uses_variable_width_member_offsets() {
+        let member = v1_fixed_point(1, 8);
+        let mut data = Vec::new();
+        data.push(0x36);
+        data.extend_from_slice(&[1, 0, 0]);
+        data.extend_from_slice(&0x1234u32.to_le_bytes());
+        data.extend_from_slice(b"x\0");
+        data.extend_from_slice(&0x1233u16.to_le_bytes());
+        data.extend_from_slice(&member);
+
+        let dtype = DatatypeMessage::decode(&data).expect("compound v3 datatype should decode");
+        let fields = dtype
+            .compound_fields()
+            .expect("compound v3 member should use variable-width offsets");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].byte_offset, 0x1233);
+        assert_eq!(fields[0].size, 1);
+    }
+
+    #[test]
+    fn compound_duplicate_member_names_are_rejected() {
+        let member = v1_fixed_point(1, 8);
+        let mut data = Vec::new();
+        data.push(0x26);
+        data.extend_from_slice(&[2, 0, 0]);
+        data.extend_from_slice(&2u32.to_le_bytes());
+
+        for offset in 0u32..2 {
+            data.extend_from_slice(b"a\0");
+            data.extend_from_slice(&[0; 6]);
+            data.extend_from_slice(&offset.to_le_bytes());
+            data.extend_from_slice(&member);
+        }
+
+        let dtype = DatatypeMessage::decode(&data).expect("compound datatype should decode");
+        let err = dtype
+            .compound_fields()
+            .expect_err("duplicate compound member names should be rejected");
+        assert!(
+            err.to_string().contains("duplicated compound field name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compound_duplicate_raw_member_names_are_rejected_even_if_utf8_is_lossy() {
+        let member = v1_fixed_point(1, 8);
+        let mut data = Vec::new();
+        data.push(0x26);
+        data.extend_from_slice(&[2, 0, 0]);
+        data.extend_from_slice(&2u32.to_le_bytes());
+
+        for offset in 0u32..2 {
+            data.extend_from_slice(&[0xff, 0x00]);
+            data.extend_from_slice(&[0; 6]);
+            data.extend_from_slice(&offset.to_le_bytes());
+            data.extend_from_slice(&member);
+        }
+
+        let dtype = DatatypeMessage::decode(&data).expect("compound datatype should decode");
+        let err = dtype
+            .compound_fields()
+            .expect_err("duplicate raw compound member names should be rejected");
+        assert!(
+            err.to_string().contains("duplicated compound field name"),
+            "unexpected error: {err}"
+        );
+    }
 }
