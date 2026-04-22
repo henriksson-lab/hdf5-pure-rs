@@ -22,6 +22,11 @@ pub enum ChunkIndexType {
     BTreeV2,         // 5
 }
 
+struct DecodedV4ChunkPrelude {
+    flags: u8,
+    dims: Vec<u64>,
+}
+
 /// Parsed Data Layout message (type 0x0008).
 #[derive(Debug, Clone)]
 pub struct DataLayoutMessage {
@@ -175,83 +180,136 @@ impl DataLayoutMessage {
 
         match layout_class {
             LayoutClass::Compact => {
-                let context = if version == 3 {
-                    "data layout v3 compact size"
-                } else {
-                    "data layout v4 compact size"
-                };
-                let size = read_u16_le(data, &mut pos, context)? as usize;
-                let context = if version == 3 {
-                    "data layout v3 compact data"
-                } else {
-                    "data layout v4 compact data"
-                };
-                ensure_available(data, pos, size, context)?;
-                result.compact_data = Some(data[pos..pos + size].to_vec());
+                Self::decode_v3_v4_compact_layout(data, &mut pos, version, &mut result)?
             }
-            LayoutClass::Contiguous => {
-                let addr = read_le_u64(
-                    data,
-                    &mut pos,
-                    sizeof_addr,
-                    if version == 3 {
-                        "data layout v3 contiguous address"
-                    } else {
-                        "data layout v4 contiguous address"
-                    },
-                )?;
-                let size = read_le_u64(
-                    data,
-                    &mut pos,
-                    sizeof_size,
-                    if version == 3 {
-                        "data layout v3 contiguous size"
-                    } else {
-                        "data layout v4 contiguous size"
-                    },
-                )?;
-                result.contiguous_addr = Some(addr);
-                result.contiguous_size = Some(size);
-                result.data_addr = Some(addr);
-            }
-            LayoutClass::Chunked if version == 3 => {
-                Self::decode_v3_chunked_layout(data, &mut pos, sizeof_addr, &mut result)?
-            }
-            LayoutClass::Chunked => {
-                Self::decode_v4_chunked_layout(
-                    data,
-                    &mut pos,
-                    sizeof_addr,
-                    sizeof_size,
-                    &mut result,
-                )?
-            }
-            LayoutClass::Virtual => {
-                let addr = read_le_u64(
-                    data,
-                    &mut pos,
-                    sizeof_addr,
-                    if version == 3 {
-                        "data layout v3 virtual heap address"
-                    } else {
-                        "data layout v4 virtual heap address"
-                    },
-                )?;
-                let index = read_u32_le(
-                    data,
-                    &mut pos,
-                    if version == 3 {
-                        "data layout v3 virtual heap index"
-                    } else {
-                        "data layout v4 virtual heap index"
-                    },
-                )?;
-                result.virtual_heap_addr = Some(addr);
-                result.virtual_heap_index = Some(index);
-            }
+            LayoutClass::Contiguous => Self::decode_v3_v4_contiguous_layout(
+                data,
+                &mut pos,
+                version,
+                sizeof_addr,
+                sizeof_size,
+                &mut result,
+            )?,
+            LayoutClass::Chunked => Self::decode_v3_v4_chunked_layout(
+                data,
+                &mut pos,
+                version,
+                sizeof_addr,
+                sizeof_size,
+                &mut result,
+            )?,
+            LayoutClass::Virtual => Self::decode_v3_v4_virtual_layout(
+                data,
+                &mut pos,
+                version,
+                sizeof_addr,
+                &mut result,
+            )?,
         }
 
         Ok(result)
+    }
+
+    fn decode_v3_v4_compact_layout(
+        data: &[u8],
+        pos: &mut usize,
+        version: u8,
+        result: &mut Self,
+    ) -> Result<()> {
+        let context = if version == 3 {
+            "data layout v3 compact size"
+        } else {
+            "data layout v4 compact size"
+        };
+        let size = read_u16_le(data, pos, context)? as usize;
+        let context = if version == 3 {
+            "data layout v3 compact data"
+        } else {
+            "data layout v4 compact data"
+        };
+        ensure_available(data, *pos, size, context)?;
+        result.compact_data = Some(data[*pos..*pos + size].to_vec());
+        Ok(())
+    }
+
+    fn decode_v3_v4_contiguous_layout(
+        data: &[u8],
+        pos: &mut usize,
+        version: u8,
+        sizeof_addr: usize,
+        sizeof_size: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        let addr = read_le_u64(
+            data,
+            pos,
+            sizeof_addr,
+            if version == 3 {
+                "data layout v3 contiguous address"
+            } else {
+                "data layout v4 contiguous address"
+            },
+        )?;
+        let size = read_le_u64(
+            data,
+            pos,
+            sizeof_size,
+            if version == 3 {
+                "data layout v3 contiguous size"
+            } else {
+                "data layout v4 contiguous size"
+            },
+        )?;
+        result.contiguous_addr = Some(addr);
+        result.contiguous_size = Some(size);
+        result.data_addr = Some(addr);
+        Ok(())
+    }
+
+    fn decode_v3_v4_chunked_layout(
+        data: &[u8],
+        pos: &mut usize,
+        version: u8,
+        sizeof_addr: usize,
+        sizeof_size: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        if version == 3 {
+            Self::decode_v3_chunked_layout(data, pos, sizeof_addr, result)
+        } else {
+            Self::decode_v4_chunked_layout(data, pos, sizeof_addr, sizeof_size, result)
+        }
+    }
+
+    fn decode_v3_v4_virtual_layout(
+        data: &[u8],
+        pos: &mut usize,
+        version: u8,
+        sizeof_addr: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        let addr = read_le_u64(
+            data,
+            pos,
+            sizeof_addr,
+            if version == 3 {
+                "data layout v3 virtual heap address"
+            } else {
+                "data layout v4 virtual heap address"
+            },
+        )?;
+        let index = read_u32_le(
+            data,
+            pos,
+            if version == 3 {
+                "data layout v3 virtual heap index"
+            } else {
+                "data layout v4 virtual heap index"
+            },
+        )?;
+        result.virtual_heap_addr = Some(addr);
+        result.virtual_heap_index = Some(index);
+        Ok(())
     }
 
     fn decode_v3_chunked_layout(
@@ -300,6 +358,49 @@ impl DataLayoutMessage {
         sizeof_size: usize,
         result: &mut Self,
     ) -> Result<()> {
+        let prelude = Self::decode_v4_chunked_prelude(data, pos)?;
+        let flags = prelude.flags;
+        let dims = prelude.dims;
+        validate_chunk_dims_positive(&dims, "data layout v4")?;
+        result.chunk_encoded_dims = Some(dims.clone());
+        result.chunk_dims = Some(dims);
+        result.chunk_flags = Some(flags);
+
+        let idx_type = Self::decode_v4_chunk_index_type(data, pos)?;
+        result.chunk_index_type = Some(idx_type);
+
+        match idx_type {
+            ChunkIndexType::SingleChunk => Self::decode_v4_single_chunk_layout(
+                data,
+                pos,
+                sizeof_addr,
+                sizeof_size,
+                flags,
+                result,
+            )?,
+            ChunkIndexType::Implicit => {
+                Self::decode_v4_implicit_chunk_layout(data, pos, sizeof_addr, result)?
+            }
+            ChunkIndexType::FixedArray => {
+                Self::decode_v4_fixed_array_chunk_layout(data, pos, sizeof_addr, result)?
+            }
+            ChunkIndexType::ExtensibleArray => {
+                Self::decode_v4_extensible_array_chunk_layout(data, pos, sizeof_addr, result)?
+            }
+            ChunkIndexType::BTreeV2 => {
+                Self::decode_v4_btree2_chunk_layout(data, pos, sizeof_addr, result)?
+            }
+            ChunkIndexType::BTreeV1 => {
+                return Err(Error::InvalidFormat(
+                    "data layout v4 must not use B-tree v1 chunk indexing".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn decode_v4_chunked_prelude(data: &[u8], pos: &mut usize) -> Result<DecodedV4ChunkPrelude> {
         let flags = read_u8(data, pos, "data layout v4 chunk flags")?;
         if flags != 0 && flags != 0x02 {
             return Err(Error::InvalidFormat(format!(
@@ -334,103 +435,133 @@ impl DataLayoutMessage {
                 "data layout v4 chunk dimensions",
             )?);
         }
-        validate_chunk_dims_positive(&dims, "data layout v4")?;
-        result.chunk_encoded_dims = Some(dims.clone());
-        result.chunk_dims = Some(dims);
-        result.chunk_flags = Some(flags);
+        Ok(DecodedV4ChunkPrelude { flags, dims })
+    }
 
-        let idx_type = match read_u8(data, pos, "data layout v4 chunk index type")? {
-            0 => ChunkIndexType::BTreeV1,
-            1 => ChunkIndexType::SingleChunk,
-            2 => ChunkIndexType::Implicit,
-            3 => ChunkIndexType::FixedArray,
-            4 => ChunkIndexType::ExtensibleArray,
-            5 => ChunkIndexType::BTreeV2,
-            idx_type_val => {
-                return Err(Error::InvalidFormat(format!(
-                    "invalid chunk index type {idx_type_val}"
-                )))
-            }
-        };
-        result.chunk_index_type = Some(idx_type);
+    fn decode_v4_chunk_index_type(data: &[u8], pos: &mut usize) -> Result<ChunkIndexType> {
+        match read_u8(data, pos, "data layout v4 chunk index type")? {
+            0 => Ok(ChunkIndexType::BTreeV1),
+            1 => Ok(ChunkIndexType::SingleChunk),
+            2 => Ok(ChunkIndexType::Implicit),
+            3 => Ok(ChunkIndexType::FixedArray),
+            4 => Ok(ChunkIndexType::ExtensibleArray),
+            5 => Ok(ChunkIndexType::BTreeV2),
+            idx_type_val => Err(Error::InvalidFormat(format!(
+                "invalid chunk index type {idx_type_val}"
+            ))),
+        }
+    }
 
-        match idx_type {
-            ChunkIndexType::SingleChunk => {
-                if flags & 0x02 != 0 {
-                    let filtered_size = read_le_u64(
-                        data,
-                        pos,
-                        sizeof_size,
-                        "data layout v4 single chunk filtered size",
-                    )?;
-                    let filter_mask = read_u32_le(data, pos, "data layout v4 single chunk mask")?;
-                    result.single_chunk_filtered_size = Some(filtered_size);
-                    result.single_chunk_filter_mask = Some(filter_mask);
-                }
-                let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 single chunk address")?;
-                result.chunk_index_addr = Some(addr);
-                result.data_addr = Some(addr);
-            }
-            ChunkIndexType::Implicit => {
-                let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 implicit address")?;
-                result.chunk_index_addr = Some(addr);
-                result.data_addr = Some(addr);
-            }
-            ChunkIndexType::FixedArray => {
-                let page_bits = read_u8(data, pos, "data layout v4 fixed array page bits")?;
-                if page_bits == 0 {
-                    return Err(Error::InvalidFormat(
-                        "data layout v4 fixed array page bits must be positive".into(),
-                    ));
-                }
-                let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 fixed array address")?;
-                result.chunk_index_addr = Some(addr);
-                result.data_addr = Some(addr);
-            }
-            ChunkIndexType::ExtensibleArray => {
-                for context in [
-                    "data layout v4 extensible array max elements bits",
-                    "data layout v4 extensible array index block elements",
-                    "data layout v4 extensible array super block min data pointers",
-                    "data layout v4 extensible array data block min elements",
-                    "data layout v4 extensible array max data block page elements bits",
-                ] {
-                    if read_u8(data, pos, context)? == 0 {
-                        return Err(Error::InvalidFormat(format!(
-                            "{context} must be positive"
-                        )));
-                    }
-                }
-                let addr =
-                    read_le_u64(data, pos, sizeof_addr, "data layout v4 extensible array address")?;
-                result.chunk_index_addr = Some(addr);
-                result.data_addr = Some(addr);
-            }
-            ChunkIndexType::BTreeV2 => {
-                let _node_size = read_u32_le(data, pos, "data layout v4 btree2 node size")?;
-                let split_percent = read_u8(data, pos, "data layout v4 btree2 split percent")?;
-                let merge_percent = read_u8(data, pos, "data layout v4 btree2 merge percent")?;
-                if split_percent == 0 || split_percent > 100 {
-                    return Err(Error::InvalidFormat(format!(
-                        "data layout v4 btree2 split percent {split_percent} must be in 1..=100"
-                    )));
-                }
-                if merge_percent == 0 || merge_percent > 100 {
-                    return Err(Error::InvalidFormat(format!(
-                        "data layout v4 btree2 merge percent {merge_percent} must be in 1..=100"
-                    )));
-                }
-                let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 btree2 address")?;
-                result.chunk_index_addr = Some(addr);
-                result.data_addr = Some(addr);
-            }
-            ChunkIndexType::BTreeV1 => {
-                return Err(Error::InvalidFormat(
-                    "data layout v4 must not use B-tree v1 chunk indexing".into(),
-                ));
+    fn decode_v4_single_chunk_layout(
+        data: &[u8],
+        pos: &mut usize,
+        sizeof_addr: usize,
+        sizeof_size: usize,
+        flags: u8,
+        result: &mut Self,
+    ) -> Result<()> {
+        if flags & 0x02 != 0 {
+            let filtered_size = read_le_u64(
+                data,
+                pos,
+                sizeof_size,
+                "data layout v4 single chunk filtered size",
+            )?;
+            let filter_mask = read_u32_le(data, pos, "data layout v4 single chunk mask")?;
+            result.single_chunk_filtered_size = Some(filtered_size);
+            result.single_chunk_filter_mask = Some(filter_mask);
+        }
+        let addr = read_le_u64(
+            data,
+            pos,
+            sizeof_addr,
+            "data layout v4 single chunk address",
+        )?;
+        result.chunk_index_addr = Some(addr);
+        result.data_addr = Some(addr);
+        Ok(())
+    }
+
+    fn decode_v4_implicit_chunk_layout(
+        data: &[u8],
+        pos: &mut usize,
+        sizeof_addr: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 implicit address")?;
+        result.chunk_index_addr = Some(addr);
+        result.data_addr = Some(addr);
+        Ok(())
+    }
+
+    fn decode_v4_fixed_array_chunk_layout(
+        data: &[u8],
+        pos: &mut usize,
+        sizeof_addr: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        let page_bits = read_u8(data, pos, "data layout v4 fixed array page bits")?;
+        if page_bits == 0 {
+            return Err(Error::InvalidFormat(
+                "data layout v4 fixed array page bits must be positive".into(),
+            ));
+        }
+        let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 fixed array address")?;
+        result.chunk_index_addr = Some(addr);
+        result.data_addr = Some(addr);
+        Ok(())
+    }
+
+    fn decode_v4_extensible_array_chunk_layout(
+        data: &[u8],
+        pos: &mut usize,
+        sizeof_addr: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        for context in [
+            "data layout v4 extensible array max elements bits",
+            "data layout v4 extensible array index block elements",
+            "data layout v4 extensible array super block min data pointers",
+            "data layout v4 extensible array data block min elements",
+            "data layout v4 extensible array max data block page elements bits",
+        ] {
+            if read_u8(data, pos, context)? == 0 {
+                return Err(Error::InvalidFormat(format!("{context} must be positive")));
             }
         }
+        let addr = read_le_u64(
+            data,
+            pos,
+            sizeof_addr,
+            "data layout v4 extensible array address",
+        )?;
+        result.chunk_index_addr = Some(addr);
+        result.data_addr = Some(addr);
+        Ok(())
+    }
 
+    fn decode_v4_btree2_chunk_layout(
+        data: &[u8],
+        pos: &mut usize,
+        sizeof_addr: usize,
+        result: &mut Self,
+    ) -> Result<()> {
+        let _node_size = read_u32_le(data, pos, "data layout v4 btree2 node size")?;
+        let split_percent = read_u8(data, pos, "data layout v4 btree2 split percent")?;
+        let merge_percent = read_u8(data, pos, "data layout v4 btree2 merge percent")?;
+        if split_percent == 0 || split_percent > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "data layout v4 btree2 split percent {split_percent} must be in 1..=100"
+            )));
+        }
+        if merge_percent == 0 || merge_percent > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "data layout v4 btree2 merge percent {merge_percent} must be in 1..=100"
+            )));
+        }
+        let addr = read_le_u64(data, pos, sizeof_addr, "data layout v4 btree2 address")?;
+        result.chunk_index_addr = Some(addr);
+        result.data_addr = Some(addr);
         Ok(())
     }
 

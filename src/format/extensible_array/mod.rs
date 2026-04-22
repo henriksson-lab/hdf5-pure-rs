@@ -7,7 +7,7 @@
 //! separate cache entry).
 
 mod dblock;
-mod hdr;
+pub(crate) mod hdr;
 mod iblock;
 mod sblock;
 

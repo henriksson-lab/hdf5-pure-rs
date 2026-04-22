@@ -77,7 +77,8 @@ fn walk_object(inner: Inner, name: &str, addr: u64) -> Result<()> {
                 let reader_inner = inner.clone();
                 let dataset = Dataset::new(inner, name, addr);
                 if info.datatype.is_variable_string() {
-                    if let Ok(raw) = dataset.read_raw_with_info(info, crate::VdsView::LastAvailable) {
+                    if let Ok(raw) = dataset.read_raw_with_info(info, crate::VdsView::LastAvailable)
+                    {
                         let mut guard = reader_inner.lock();
                         let _ = touch_vlen_strings(&mut guard.reader, &raw, sizeof_addr);
                     }

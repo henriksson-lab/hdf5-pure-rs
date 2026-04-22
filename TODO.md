@@ -396,7 +396,8 @@
     not use MPI/parallel-HDF5. If CPU parallelism is added later, use
     Rayon and keep it Rust-side rather than chasing libhdf5's MPI stack.
   - Alternative VFDs and cloud/network drivers (`H5FD__hdfs*`,
-    `H5FD__ros3*`, direct/core/stdio driver parity)
+    `H5FD__ros3*`, direct/core/stdio driver parity, and broad `H5FD_*`
+    runtime entry points like alloc/read/write/open/free)
   - Large write-side object-header / message-management families
     (`H5O_msg_*`, shared-message machinery, free-space managers)
   - Remaining unported dataspace selector families (`all`/`none`
@@ -419,14 +420,63 @@
   Completed 2026-04-22 in `analysis/ccc_missing_roadmap.md`, with the
   same classification mirrored in `analysis/unsupported_features.md`.
 
-- [x] `ccc_mapping.toml` extended to **100% coverage** (732/732 Rust
-  functions, 691 entries — was 19% / 140 entries before this work).
-  Every Rust function in `src/` has a mapping to its closest libhdf5
-  counterpart. Categories covered, with the C target each maps to:
+- [x] `ccc_mapping.toml` was expanded enough to audit the whole tree,
+  then tightened back down to a strict 1:1 mapping set.
+  Current policy is no longer "every Rust function gets some closest C
+  counterpart"; current policy is "only keep explicit mappings when the
+  Rust function is a defensible owner of that C body under a faithful
+  translation audit." Categories covered during that audit, with the C
+  target families involved:
   - High-level public API (`hl/file.rs`, `hl/group.rs`, `hl/dataset.rs`,
     `hl/attribute.rs`, `hl/datatype.rs`, `hl/dataspace.rs`,
     `hl/writable_file.rs`, `hl/mutable_file.rs`, `hl/dataset_builder.rs`,
     `hl/types.rs`, `hl/selection.rs`, `hl/conversion.rs`,
+
+## Remaining Original-Feature Parity
+
+Unchecked items in this section are features or feature families present in the
+original libhdf5 codebase that are not yet fully mirrored here. This is the
+forward-looking backlog for "add all features of the original" within this
+crate's intended scope.
+
+### Planned Parity Work
+- [ ] Add fuller dataspace selector parity beyond the current decode and
+  selected materialization paths:
+  `H5S_select_*`, `H5S__none_*`, bounds/shape helpers, iterator families,
+  projection helpers, and remaining regularity/contiguity helpers.
+- [ ] Add fuller soft-link traversal parity:
+  `H5G__traverse_slink*`, tighter cycle detection, bounded traversal, and
+  libhdf5-closer path resolution behavior.
+- [ ] Add virtual-dataset dataset-access property-list parity:
+  `H5Pset_virtual_view`, `H5Pset_virtual_prefix`, and the remaining
+  missing-file policy APIs.
+- [ ] Add broader writer-side chunk-index parity if writer scope expands:
+  creation/growth paths for fixed-array, extensible-array, and deeper v2
+  B-tree chunk indexes beyond the currently supported subset.
+- [ ] Add broader filter parity where practical:
+  pure-Rust SZip support if it becomes available, plus fuller NBit and
+  ScaleOffset parameter-space parity.
+- [ ] Add broader datatype-conversion parity if user-facing conversion scope
+  expands beyond the current exact-size / limited-recursive model:
+  more of the `H5T__conv_*` engine families, packing helpers, and
+  conversion-path selection behavior.
+- [ ] Add broader attribute mutation/iteration parity if the public writer/API
+  surface expands:
+  more of `H5A__dense_*` and broader `H5A*` mutation/iteration families.
+
+### Explicitly Out Of Scope
+- [x] Do not chase MPI / parallel-HDF5 / distributed selection paths
+  (`H5_mpi*`, `H5S__mpio*`, parallel `H5D*`). If parallelism is added
+  later, do it last with Rayon in Rust code.
+- [x] Do not chase VOL / async / plugin / connector infrastructure
+  (`H5VL*`, `H5ES*`, `H5PL*`) in this crate.
+- [x] Do not chase alternative VFD / cloud / network driver parity
+  (`H5FD__hdfs*`, `H5FD__ros3*`, `H5FD__direct*`, broad core/stdio-only
+  driver parity, and the broad `H5FD_*` runtime API surface).
+- [x] Do not chase Map API parity (`H5M*`) in this crate.
+- [x] Do not chase broad package-init / free-list / thread-runtime
+  machinery (`H5FL*`, broad `H5TS*`) unless this crate grows a direct need
+  for those surfaces.
     `hl/plist/*`) → `H5{F,G,D,A,T,S,L,P,R,I,Z}*` API + `H5*__cache_*`.
   - Format-layer decoders / encoders / lookups (`format/*`,
     `format/messages/*`) → `H5O__*_decode/encode/size`,

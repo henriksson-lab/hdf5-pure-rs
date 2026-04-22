@@ -270,7 +270,9 @@ impl File {
                 };
                 let file_path = self.resolve_external_file_path(&filename)?;
                 let external_file = File::open(file_path)?;
-                Ok(PathStep::Resolved(external_file.resolve_path(&target_path)?))
+                Ok(PathStep::Resolved(
+                    external_file.resolve_path(&target_path)?,
+                ))
             }
             LinkType::UserDefined(kind) => Err(Error::Unsupported(format!(
                 "user-defined link traversal is not supported for link type {kind}"

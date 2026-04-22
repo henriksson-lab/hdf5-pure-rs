@@ -31,15 +31,10 @@ other = "H5_checksum_metadata"
 # format/superblock.rs — H5Fsuper_cache.c
 # Single dispatching C deserializer for all superblock versions.
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "read_v0_v1"
-rust_path = "format/superblock.rs"
-other = "H5F__cache_superblock_deserialize"
-
-[[entries]]
-rust = "read_v2_v3"
-rust_path = "format/superblock.rs"
-other = "H5F__cache_superblock_deserialize"
+# `H5F__cache_superblock_deserialize` is intentionally unmapped under strict
+# 1:1 matching. The Rust reader keeps the version-dispatch split across
+# `read_v0_v1` and `read_v2_v3`, while the C cache deserializer remains a
+# single multi-version body.
 
 [[entries]]
 rust = "validate_sizes"
@@ -94,22 +89,22 @@ other = "H5B2_iterate"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_huge"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/huge.rs"
 other = "H5HF__huge_op_real"
 
 [[entries]]
 rust = "decode_huge_record"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/huge.rs"
 other = "H5HF__huge_get_obj_off"
 
 [[entries]]
 rust = "read_managed"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/man.rs"
 other = "H5HF__man_op_real"
 
 [[entries]]
 rust = "read_managed_object"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5HF__man_op"
 
 # --- Pure deserialize halves (the cleanest 1:1 mappings post-refactor) ---
@@ -117,7 +112,7 @@ other = "H5HF__man_op"
 # the FHIB prefix and the child-pointer table, no traversal.
 [[entries]]
 rust = "decode_indirect_block"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/iblock.rs"
 other = "H5HF__cache_iblock_deserialize"
 
 # NB: `decode_filtered_indirect_block` semantically corresponds to the
@@ -142,7 +137,7 @@ other = "H5HF__cache_iblock_deserialize"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_header"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/hdr.rs"
 other = "H5EA__cache_hdr_deserialize"
 
 # Pure deserialize halves get the canonical C-side targets. Wrappers
@@ -152,85 +147,79 @@ other = "H5EA__cache_hdr_deserialize"
 # of the parsing logic.
 [[entries]]
 rust = "decode_super_block"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/sblock.rs"
 other = "H5EA__cache_sblock_deserialize"
 
 [[entries]]
 rust = "decode_index_block"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/iblock.rs"
 other = "H5EA__cache_iblock_deserialize"
 
 [[entries]]
 rust = "decode_data_block_prefix"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/dblock.rs"
 other = "H5EA__cache_dblock_deserialize"
 
 [[entries]]
 rust = "read_spillover_blocks"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/iblock.rs"
 other = "H5EA__cache_dblk_page_deserialize"
 
 [[entries]]
 rust = "read_extensible_array_chunks"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/mod.rs"
 other = "H5EA_iterate"
 
-# NB: this is on the *read* path (it appends decoded elements to the
-# output vec) — do not bind it to the serialize side. Left unmapped;
-# fingerprint matching will pair it.
+# NB: `append_data_block_elements` is on the *read* path too, but strict
+# 1:1 ownership for `H5EA_iterate` stays on `read_extensible_array_chunks`.
+# The lower-level append helper remains intentionally unmapped.
 
 # ---------------------------------------------------------------------------
 # format/fixed_array.rs — H5FA*.c
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_header"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/hdr.rs"
 other = "H5FA__cache_hdr_deserialize"
 
 # `read_data_block` is now a compose-only wrapper; the canonical 1:1
 # mapping lives on `decode_data_block_prefix`.
 [[entries]]
 rust = "decode_data_block_prefix"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/dblock.rs"
 other = "H5FA__cache_dblock_deserialize"
 
 [[entries]]
 rust = "collect_data_block_elements"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/dblock.rs"
 other = "H5FA_iterate"
 
 [[entries]]
 rust = "read_element"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/dblock.rs"
 other = "H5FA_get"
 
 [[entries]]
 rust = "locate_fixed_array_element"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/mod.rs"
 other = "H5FA__lookup_elmt"
 
 [[entries]]
 rust = "verify_checksum"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/hdr.rs"
 other = "H5FA__cache_dblock_verify_chksum"
 
 [[entries]]
 rust = "read_fixed_array_chunks"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/mod.rs"
 other = "H5FA_iterate"
 
 # ---------------------------------------------------------------------------
 # format/global_heap.rs — H5HG*.c
 # ---------------------------------------------------------------------------
-# `H5HG__cache_heap_deserialize` does prefix decode + object-table walk
-# in one C function. Rust keeps the structural split as
-# `decode_header` + `walk_objects`, but now also has a dedicated
-# `deserialize_collection` composer whose body is the closest review
-# surface to the C-side cache deserializer.
-[[entries]]
-rust = "deserialize_collection"
-rust_path = "format/global_heap.rs"
-other = "H5HG__cache_heap_deserialize"
+# `H5HG__cache_heap_deserialize` is intentionally unmapped under strict 1:1
+# matching. The Rust global-heap path keeps header decode, collection walk, and
+# object access split across helpers instead of one large C body.
 
 [[entries]]
 rust = "read_global_heap_object"
@@ -268,33 +257,21 @@ other = "H5HL_offset_into"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_at"
-rust_path = "format/object_header.rs"
+rust_path = "format/object_header/mod.rs"
 other = "H5O_protect"
 
 [[entries]]
 rust = "read_v2"
-rust_path = "format/object_header.rs"
+rust_path = "format/object_header/cache.rs"
 other = "H5O__cache_deserialize"
 
-[[entries]]
-rust = "read_v1_messages"
-rust_path = "format/object_header.rs"
-other = "H5O__chunk_protect"
-
-[[entries]]
-rust = "read_v2_messages"
-rust_path = "format/object_header.rs"
-other = "H5O__chunk_protect"
-
-[[entries]]
-rust = "validate_shared_message_table"
-rust_path = "format/object_header.rs"
-other = "H5SM_get_info"
-
-[[entries]]
-rust = "validate_shared_message_reference"
-rust_path = "format/object_header.rs"
-other = "H5SM_get_info"
+# `read_v1_messages` / `read_v2_messages` are higher-level chunk walkers;
+# strict 1:1 ownership for `H5O__chunk_protect` stays on
+# `reserve_continuation_range`, which is the closer chunk-access analog.
+#
+# `validate_shared_message_table` and `validate_shared_message_reference`
+# are intentionally unmapped helper checks, not canonical owners of
+# `H5SM_get_info`.
 
 # ---------------------------------------------------------------------------
 # format/symbol_table.rs — H5G symbol table entries
@@ -322,69 +299,31 @@ rust = "datatype_encoded_len"
 rust_path = "format/messages/datatype.rs"
 other = "H5O__dtype_size"
 
-[[entries]]
-rust = "decode_compound_fields_impl"
-rust_path = "format/messages/datatype.rs"
-other = "H5O__dtype_decode_helper"
-
-[[entries]]
-rust = "enum_members"
-rust_path = "format/messages/datatype.rs"
-other = "H5O__dtype_decode_helper"
-
-[[entries]]
-rust = "array_dims_base"
-rust_path = "format/messages/datatype.rs"
-other = "H5O__dtype_decode_helper"
+# `H5O__dtype_decode_helper` is a large shared C helper spanning compound, enum,
+# array, and other per-class decode branches. The Rust translation keeps those
+# branches split across multiple helpers, so a strict 1:1 mapping should leave
+# this helper unmapped instead of pinning several Rust functions to one C body.
 
 # ---------------------------------------------------------------------------
 # format/messages/dataspace.rs — H5Osdspace.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "decode_impl"
-rust_path = "format/messages/dataspace.rs"
-other = "H5O__sdspace_decode"
-
-[[entries]]
-rust = "decode_v1"
-rust_path = "format/messages/dataspace.rs"
-other = "H5O__sdspace_decode"
-
-[[entries]]
-rust = "decode_v2"
-rust_path = "format/messages/dataspace.rs"
-other = "H5O__sdspace_decode"
+# `H5O__sdspace_decode` is intentionally unmapped under strict 1:1 matching.
+# The Rust dataspace reader keeps top-level dispatch, v1/v2 layout decode, and
+# trace emission split across smaller helpers rather than one monolithic C body.
 
 # ---------------------------------------------------------------------------
 # format/messages/data_layout.rs — H5Olayout.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "decode_v3_v4"
-rust_path = "format/messages/data_layout.rs"
-other = "H5O__layout_decode"
-
-[[entries]]
-rust = "validate_chunk_dims_positive"
-rust_path = "format/messages/data_layout.rs"
-other = "H5O__layout_decode"
+# `H5O__layout_decode` spans compact, contiguous, chunked, and virtual layout
+# decoding in one large C body. The Rust translation keeps those paths split
+# across multiple helpers, so there is no honest strict 1:1 owner here.
 
 # ---------------------------------------------------------------------------
 # format/messages/fill_value.rs — H5Ofill.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "decode_impl"
-rust_path = "format/messages/fill_value.rs"
-other = "H5O__fill_new_decode"
-
-[[entries]]
-rust = "decode_v2"
-rust_path = "format/messages/fill_value.rs"
-other = "H5O__fill_new_decode"
-
-[[entries]]
-rust = "decode_v3"
-rust_path = "format/messages/fill_value.rs"
-other = "H5O__fill_new_decode"
+# `H5O__fill_new_decode` is intentionally unmapped under strict 1:1 matching.
+# The Rust fill-value decoder keeps top-level version dispatch and the v2/v3
+# wire layouts split across smaller helpers rather than one monolithic C body.
 
 [[entries]]
 rust = "decode_old_with_datatype_size"
@@ -394,20 +333,9 @@ other = "H5O__fill_old_decode"
 # ---------------------------------------------------------------------------
 # format/messages/filter_pipeline.rs — H5Opline.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "decode_impl"
-rust_path = "format/messages/filter_pipeline.rs"
-other = "H5O__pline_decode"
-
-[[entries]]
-rust = "decode_v1"
-rust_path = "format/messages/filter_pipeline.rs"
-other = "H5O__pline_decode"
-
-[[entries]]
-rust = "decode_v2"
-rust_path = "format/messages/filter_pipeline.rs"
-other = "H5O__pline_decode"
+# `H5O__pline_decode` is intentionally unmapped under strict 1:1 matching.
+# The Rust filter-pipeline reader keeps top-level dispatch and the v1/v2 decode
+# paths split across separate helpers rather than one monolithic C body.
 
 # ---------------------------------------------------------------------------
 # format/messages/link.rs — H5Olink.c
@@ -428,30 +356,9 @@ other = "H5O__linfo_decode"
 # ---------------------------------------------------------------------------
 # format/messages/attribute.rs — H5Oattr.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "decode_impl"
-rust_path = "format/messages/attribute.rs"
-other = "H5O__attr_decode"
-
-[[entries]]
-rust = "decode_v1"
-rust_path = "format/messages/attribute.rs"
-other = "H5O__attr_decode"
-
-[[entries]]
-rust = "decode_v2"
-rust_path = "format/messages/attribute.rs"
-other = "H5O__attr_decode"
-
-[[entries]]
-rust = "decode_v3"
-rust_path = "format/messages/attribute.rs"
-other = "H5O__attr_decode"
-
-[[entries]]
-rust = "num_elements"
-rust_path = "format/messages/attribute.rs"
-other = "H5O__attr_decode"
+# `H5O__attr_decode` is intentionally unmapped under strict 1:1 matching. The
+# Rust attribute decoder keeps top-level version dispatch and the v1/v2/v3
+# layouts split across separate helpers instead of one monolithic C body.
 
 # ---------------------------------------------------------------------------
 # format/messages/attribute_info.rs — H5Oainfo.c
@@ -472,28 +379,16 @@ other = "H5O__stab_decode"
 # ---------------------------------------------------------------------------
 # filters/deflate.rs — H5Zdeflate.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "decompress"
-rust_path = "filters/deflate.rs"
-other = "H5Z__filter_deflate"
-
-[[entries]]
-rust = "compress"
-rust_path = "filters/deflate.rs"
-other = "H5Z__filter_deflate"
+# `H5Z__filter_deflate` is intentionally unmapped under strict 1:1 matching.
+# The Rust code keeps compression and decompression as separate functions,
+# while the C filter entry point handles both directions in one body.
 
 # ---------------------------------------------------------------------------
 # filters/shuffle.rs — H5Zshuffle.c (single C function does both directions)
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "shuffle"
-rust_path = "filters/shuffle.rs"
-other = "H5Z__filter_shuffle"
-
-[[entries]]
-rust = "unshuffle"
-rust_path = "filters/shuffle.rs"
-other = "H5Z__filter_shuffle"
+# `H5Z__filter_shuffle` is intentionally unmapped under strict 1:1 matching.
+# The Rust code keeps shuffle and unshuffle as separate directional helpers,
+# while the C filter entry point handles both directions in one body.
 
 # ---------------------------------------------------------------------------
 # filters/fletcher32.rs — H5Zfletcher32.c + H5checksum.c
@@ -576,10 +471,9 @@ other = "H5Z__can_apply_szip"
 # ---------------------------------------------------------------------------
 # hl/file.rs — high-level file & path resolution
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "resolve_path"
-rust_path = "hl/file.rs"
-other = "H5G__traverse_real"
+# `resolve_path` is intentionally unmapped under strict 1:1 matching. The
+# Rust path traversal is split across root resolution, per-component dispatch,
+# link lookup, and external-link handling helpers instead of one large C body.
 
 [[entries]]
 rust = "object_type_from_messages"
@@ -632,45 +526,44 @@ other = "H5G__dense_lookup"
 # ---------------------------------------------------------------------------
 # hl/dataset.rs — read paths
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "read_chunked"
-rust_path = "hl/dataset.rs"
-other = "H5D__chunk_read"
+# `read_chunked` is intentionally unmapped under strict 1:1 matching. The Rust
+# chunk-read path dispatches across separate single-chunk, v1-B-tree, implicit,
+# fixed-array, extensible-array, and v2-B-tree readers instead of one monolithic
+# `H5D__chunk_read` body.
 
-[[entries]]
-rust = "read_slice"
-rust_path = "hl/dataset.rs"
-other = "H5D__virtual_read"
+# `read_slice` is intentionally unmapped, and `read_virtual_dataset` is also
+# left unmapped under strict 1:1 matching. `H5D__virtual_read` is a large C-side
+# engine, while the Rust code keeps that behavior split across layout decode,
+# source-open, selection materialization, and copy helpers.
 
-[[entries]]
-rust = "decode_value"
-rust_path = "hl/dataset.rs"
-other = "H5T__conv_struct"
+# `decode_value` is intentionally unmapped under strict 1:1 matching. The Rust
+# dataset value decoder is a recursive HDF5-object reader spanning scalar,
+# compound, array, vlen, and reference cases, not a direct analog of libhdf5's
+# struct-conversion engine.
 
 [[entries]]
 rust = "collect_btree_v1_chunks"
 rust_path = "hl/dataset.rs"
 other = "H5D__btree_idx_iterate"
 
-[[entries]]
-rust = "decode_virtual_hyperslab_selection"
-rust_path = "hl/dataset.rs"
-other = "H5S__hyper_deserialize"
+# `decode_virtual_hyperslab_selection` is intentionally unmapped under strict
+# 1:1 matching. The Rust path keeps hyperslab header, regular selection, and
+# irregular selection decoding split across helpers instead of mirroring the
+# large monolithic C deserializer.
 
-[[entries]]
-rust = "decode_virtual_point_selection"
-rust_path = "hl/dataset.rs"
-other = "H5S__point_deserialize"
+# `H5S__point_deserialize` is intentionally unmapped under strict 1:1 matching.
+# The Rust point-selection decode path is split across version, encoding-size,
+# rank, and coordinate materialization helpers instead of one monolithic C body.
 
-[[entries]]
-rust = "decode_virtual_mappings"
-rust_path = "hl/dataset.rs"
-other = "H5D__virtual_load_layout"
+# `decode_virtual_mappings` is intentionally unmapped under strict 1:1
+# matching. The Rust VDS layout load path is split across heap-record decode,
+# shared-name resolution, and selection decode helpers, instead of one large C
+# function body.
 
-[[entries]]
-rust = "copy_chunk_nd"
-rust_path = "hl/dataset.rs"
-other = "H5D__chunk_copy"
+# `copy_chunk_nd` is intentionally unmapped under strict 1:1 matching. The
+# Rust implementation is only the N-D in-memory scatter helper, while the C
+# `H5D__chunk_copy` routine is a larger chunk-engine copy path with broader
+# orchestration responsibilities.
 
 # Per-chunk-index-type readers — each maps to libhdf5's iterate path on
 # the matching chunk index module. `rust_class` pins the methods to the
@@ -710,10 +603,10 @@ other = "H5D__none_idx_iterate"
 # ---------------------------------------------------------------------------
 # hl/mutable_file.rs — write paths
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "rewrite_chunk_index"
-rust_path = "hl/mutable_file.rs"
-other = "H5D__chunk_write"
+# `rewrite_chunk_index` is intentionally unmapped under strict 1:1 matching.
+# The Rust write path dispatches into separate fixed-array, extensible-array,
+# v2-B-tree, and v1-B-tree helpers instead of mirroring the monolithic
+# `H5D__chunk_write` engine body.
 
 [[entries]]
 rust = "create_extensible_array_data_block"
@@ -727,10 +620,10 @@ rust = "encode_extensible_array_data_block_prefix"
 rust_path = "hl/mutable_file.rs"
 other = "H5EA__cache_dblock_serialize"
 
-[[entries]]
-rust = "read_extensible_array_header"
-rust_path = "hl/mutable_file.rs"
-other = "H5EA__cache_hdr_deserialize"
+# `read_extensible_array_header` is intentionally unmapped. The canonical
+# `H5EA__cache_hdr_deserialize` ownership stays on
+# `format/extensible_array/hdr.rs::read_header`; this mutable-file helper
+# adds writer-side validation logic on top.
 
 # Pure encoder half — `write_extensible_array_page` is now compose-only
 # and intentionally unmapped (falls through to fingerprint).
@@ -764,16 +657,16 @@ rust = "encode_extensible_array_super_block"
 rust_path = "hl/mutable_file.rs"
 other = "H5EA__cache_sblock_serialize"
 
-[[entries]]
-rust = "rewrite_leaf_chunk_btree"
-rust_path = "hl/mutable_file.rs"
-other = "H5B2__internal_serialize"
-
 # NB: `rewrite_extensible_array_super_block` and
 # `append_extensible_array_super_block_elements` semantically also touch
 # the sblock serialize path, but the canonical 1:1 mapping for
 # `H5EA__cache_sblock_serialize` lives on `encode_extensible_array_super_block`
 # (the pure encode half). Wrappers fall through to fingerprint matching.
+#
+# `rewrite_leaf_chunk_btree` is also intentionally unmapped: it is a v1
+# chunk-index update orchestrator, not a direct analog of libhdf5's v2
+# `H5B2__internal_serialize` path. Forcing that explicit pair reduces
+# 1:1 match quality more than it helps.
 
 [[entries]]
 rust = "append_btree_v2_depth1_internal_node"
@@ -785,15 +678,14 @@ rust = "rebuild_btree_v2_chunk_tree"
 rust_path = "hl/mutable_file.rs"
 other = "H5D__bt2_idx_create"
 
-[[entries]]
-rust = "encode_global_heap_collection"
-rust_path = "hl/mutable_file.rs"
-other = "H5HG__cache_heap_serialize"
+# `encode_global_heap_collection` ownership stays on `engine/writer.rs`. The
+# stale mutable-file-side entry is intentionally removed under strict 1:1
+# matching; mutable-file does not define a separate canonical owner here.
 
-[[entries]]
-rust = "write_dense_name_btree"
-rust_path = "hl/mutable_file.rs"
-other = "H5G__dense_create"
+# `write_dense_name_btree` is intentionally unmapped under strict 1:1
+# matching. It is a shared Rust helper that emits dense name-index B-trees for
+# both links and attributes, not a direct analog of libhdf5's broader dense
+# storage creation path.
 
 [[entries]]
 rust = "write_managed_fractal_heap"
@@ -803,10 +695,9 @@ other = "H5HF__man_dblock_create"
 # ---------------------------------------------------------------------------
 # engine/writer.rs — H5O / H5D create paths
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "create_vlen_utf8_string_dataset"
-rust_path = "engine/writer.rs"
-other = "H5D__create"
+# `create_vlen_utf8_string_dataset` is intentionally unmapped under strict
+# 1:1 matching. It prepares heap-backed payload data and then delegates to
+# the generic contiguous dataset create flow.
 
 [[entries]]
 rust = "build_v2_object_header"
@@ -852,20 +743,9 @@ other = "H5A__attr_iterate_table"
 # ---------------------------------------------------------------------------
 # tracehash_corpus.rs — corpus walker
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "walk_object"
-rust_path = "tracehash_corpus.rs"
-other = "H5O_msg_iterate"
-
-[[entries]]
-rust = "read_dense_attrs"
-rust_path = "tracehash_corpus.rs"
-other = "H5A__dense_iterate"
-
-[[entries]]
-rust = "read_dense_links"
-rust_path = "tracehash_corpus.rs"
-other = "H5G__dense_iterate"
+# `tracehash_corpus.rs` helpers are intentionally unmapped under strict 1:1
+# matching. They are audit/instrumentation walkers over already-decoded Rust
+# structures, not canonical production owners of libhdf5 traversal engines.
 
 [[entries]]
 rust = "group_members_from_messages"
@@ -883,11 +763,9 @@ other = "H5G__node_iterate"
 # ---------------------------------------------------------------------------
 # io/reader.rs — H5Fio.c / HDFIO macros (UINT8DECODE/UINT16DECODE/...)
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "new"
-rust_path = "io/reader.rs"
-rust_class = "HdfReader<R>"
-other = "H5FD_open"
+# `HdfReader::new` is intentionally unmapped under strict 1:1 matching. It is
+# a tiny Rust wrapper constructor, not a direct analog of libhdf5's driver open
+# path.
 
 [[entries]]
 rust = "set_sizeof_addr"
@@ -929,15 +807,13 @@ rust = "seek_relative"
 rust_path = "io/reader.rs"
 other = "H5FD_seek"
 
-[[entries]]
-rust = "read_bytes"
-rust_path = "io/reader.rs"
-other = "H5FD_read"
+# `read_bytes` is intentionally unmapped under strict 1:1 matching. It is a
+# small Rust buffered-read helper, not a canonical owner of libhdf5's broader
+# file-driver read path.
 
-[[entries]]
-rust = "read_exact"
-rust_path = "io/reader.rs"
-other = "H5FD_read"
+# `read_exact` is intentionally unmapped under strict 1:1 matching. It is a
+# tiny buffered-reader forwarding helper, not a canonical owner of libhdf5's
+# broader file-driver read path.
 
 [[entries]]
 rust = "read_u8"
@@ -1008,10 +884,9 @@ rust_path = "io/writer.rs"
 rust_class = "HdfWriter<W>"
 other = "H5FD_create"
 
-[[entries]]
-rust = "write_bytes"
-rust_path = "io/writer.rs"
-other = "H5FD_write"
+# `write_bytes` is intentionally unmapped under strict 1:1 matching. It is a
+# small Rust buffered-write helper, not a canonical owner of libhdf5's broader
+# file-driver write path.
 
 [[entries]]
 rust = "write_u8"
@@ -1119,10 +994,9 @@ other = "H5I_init_interface"
 # ---------------------------------------------------------------------------
 # engine/allocator.rs — H5MF*.c (file-space management)
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "allocate"
-rust_path = "engine/allocator.rs"
-other = "H5MF_alloc"
+# `allocate` is intentionally unmapped under strict 1:1 matching. It is a
+# narrow monotonic allocator helper in the writer, not a direct translation
+# owner of libhdf5's full file-space allocation engine.
 
 [[entries]]
 rust = "eof"
@@ -1132,11 +1006,9 @@ other = "H5FD_get_eof"
 # ---------------------------------------------------------------------------
 # engine/writer.rs — bulk: file finalize + per-message encoders
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "finalize"
-rust_path = "engine/writer.rs"
-rust_class = "HdfFileWriter<W>"
-other = "H5F__close"
+# `finalize` is intentionally unmapped under strict 1:1 matching. The Rust
+# writer finalization path only seals the synthetic file being emitted, while
+# libhdf5's `H5F__close` coordinates a much larger close/shutdown sequence.
 
 [[entries]]
 rust = "encode_dataspace"
@@ -1148,23 +1020,14 @@ rust = "encode_dataspace_v2"
 rust_path = "engine/writer.rs"
 other = "H5O__sdspace_encode"
 
-[[entries]]
-rust = "encode"
-rust_path = "engine/writer.rs"
-rust_class = "DtypeSpec"
-other = "H5O__dtype_encode"
+# `DtypeSpec::encode` is intentionally unmapped under strict 1:1 matching. It
+# is a tiny wrapper over the deeper class-specific datatype encoding helpers,
+# which are the meaningful audit surface.
 
-[[entries]]
-rust = "encode_embedded"
-rust_path = "engine/writer.rs"
-rust_class = "DtypeSpec"
-other = "H5O__dtype_encode_helper"
-
-[[entries]]
-rust = "encode_with_padding"
-rust_path = "engine/writer.rs"
-rust_class = "DtypeSpec"
-other = "H5O__dtype_encode"
+# `encode_with_padding` and `encode_embedded` are intentionally unmapped under
+# strict 1:1 matching. The Rust writer keeps class-specific datatype encoding
+# split across multiple helpers instead of one giant `H5O__dtype_encode_helper`
+# body.
 
 [[entries]]
 rust = "encode_link_message"
@@ -1201,15 +1064,9 @@ rust = "encode_attribute_message"
 rust_path = "engine/writer.rs"
 other = "H5O__attr_encode"
 
-[[entries]]
-rust = "encode_contiguous_layout"
-rust_path = "engine/writer.rs"
-other = "H5O__layout_encode"
-
-[[entries]]
-rust = "encode_chunked_layout_v3"
-rust_path = "engine/writer.rs"
-other = "H5O__layout_encode"
+# `H5O__layout_encode` is intentionally unmapped under strict 1:1 matching.
+# The Rust writer keeps contiguous and chunked layout encoders as separate
+# helpers instead of one broad message encoder.
 
 [[entries]]
 rust = "encode_filter_pipeline"
@@ -1236,20 +1093,9 @@ rust = "write_dense_attribute_storage"
 rust_path = "engine/writer.rs"
 other = "H5A__dense_create"
 
-[[entries]]
-rust = "create_chunked_dataset_with_fill"
-rust_path = "engine/writer.rs"
-other = "H5D__create"
-
-[[entries]]
-rust = "create_contiguous_dataset"
-rust_path = "engine/writer.rs"
-other = "H5D__create"
-
-[[entries]]
-rust = "create_compact_dataset"
-rust_path = "engine/writer.rs"
-other = "H5D__create"
+# `create_chunked_dataset_with_fill`, `create_contiguous_dataset`, and
+# `create_compact_dataset` are intentionally unmapped so a single explicit
+# Rust owner retains `H5D__create_named`.
 
 [[entries]]
 rust = "size"
@@ -1323,27 +1169,27 @@ other = "H5B2__cache_hdr_verify_chksum"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_index_block"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/iblock.rs"
 other = "H5EA__iblock_protect"
 
 [[entries]]
 rust = "read_super_block"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/sblock.rs"
 other = "H5EA__sblock_protect"
 
 [[entries]]
 rust = "read_element"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/dblock.rs"
 other = "H5EA_get"
 
 [[entries]]
 rust = "verify_checksum"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/hdr.rs"
 other = "H5EA__cache_hdr_verify_chksum"
 
 [[entries]]
 rust = "build_super_block_info"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/hdr.rs"
 other = "H5EA__sblock_create"
 
 # ---------------------------------------------------------------------------
@@ -1351,7 +1197,7 @@ other = "H5EA__sblock_create"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_data_block"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/dblock.rs"
 other = "H5FA__dblock_protect"
 
 # ---------------------------------------------------------------------------
@@ -1359,71 +1205,60 @@ other = "H5FA__dblock_protect"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "read_at"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/hdr.rs"
 other = "H5HF__cache_hdr_deserialize"
 
 [[entries]]
 rust = "read_from_direct_block"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/dblock.rs"
 other = "H5HF__cache_dblock_deserialize"
 
-[[entries]]
-rust = "read_from_indirect_block"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__man_op"
+# `read_from_indirect_block` is intentionally unmapped. The canonical
+# `H5HF__man_op` ownership stays on `read_managed_object`.
 
 [[entries]]
 rust = "read_tiny"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/tiny.rs"
 other = "H5HF__tiny_op_real"
 
 [[entries]]
 rust = "max_direct_rows"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/dtable.rs"
 other = "H5HF__hdr_compute_free_space"
 
 [[entries]]
 rust = "child_indirect_rows"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/dtable.rs"
 other = "H5HF_dtable_size_to_rows"
 
 [[entries]]
 rust = "indirect_data_span"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/dtable.rs"
 other = "H5HF__man_iblock_size"
 
 [[entries]]
 rust = "row_block_size"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/dtable.rs"
 other = "H5HF_dtable_span_size"
 
 # ---------------------------------------------------------------------------
 # format/object_header.rs — bulk
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "read_v1"
-rust_path = "format/object_header.rs"
-other = "H5O__cache_deserialize"
+# `read_v1` is intentionally unmapped. The canonical explicit owner for
+# `H5O__cache_deserialize` stays on `read_v2`; both Rust functions are
+# version-specific splits of one broader libhdf5 routine.
 
-[[entries]]
-rust = "read_v1_continuation"
-rust_path = "format/object_header.rs"
-other = "H5O__cache_chk_deserialize"
-
-[[entries]]
-rust = "read_v2_continuation"
-rust_path = "format/object_header.rs"
-other = "H5O__cache_chk_deserialize"
+# `read_v1_continuation` and `read_v2_continuation` are intentionally
+# unmapped under strict 1:1 matching. libhdf5 uses one chunk-deserialize
+# routine for both cases, while the Rust port split them by header version.
 
 [[entries]]
 rust = "reserve_continuation_range"
-rust_path = "format/object_header.rs"
+rust_path = "format/object_header/chunk.rs"
 other = "H5O__chunk_protect"
 
-[[entries]]
-rust = "validate_message_payload"
-rust_path = "format/object_header.rs"
-other = "H5O_msg_decode"
+# `validate_message_payload` is intentionally unmapped. It is a guard/helper
+# inside message parsing, not the canonical owner of `H5O_msg_decode`.
 
 # ---------------------------------------------------------------------------
 # format/messages — accessor methods on DatatypeMessage
@@ -1675,10 +1510,9 @@ rust = "superblock"
 rust_path = "hl/file.rs"
 other = "H5F__super_read"
 
-[[entries]]
-rust = "root_group"
-rust_path = "hl/file.rs"
-other = "H5G_rootof"
+# `root_group` is intentionally unmapped under strict 1:1 matching. It is a
+# tiny high-level Rust accessor that returns the already-known root group
+# wrapper, not a meaningful owner of the broader C root-group lookup path.
 
 [[entries]]
 rust = "member_names"
@@ -1712,17 +1546,9 @@ rust = "member_names"
 rust_path = "hl/group.rs"
 other = "H5Literate"
 
-[[entries]]
-rust = "len"
-rust_path = "hl/group.rs"
-rust_class = "Group"
-other = "H5Gget_num_objs"
-
-[[entries]]
-rust = "is_empty"
-rust_path = "hl/group.rs"
-rust_class = "Group"
-other = "H5Gget_num_objs"
+# `len` and `is_empty` are intentionally unmapped under strict 1:1 matching.
+# They are tiny high-level accessors over the decoded member list, not
+# canonical owners of libhdf5's legacy group-size APIs.
 
 [[entries]]
 rust = "member_type"
@@ -1782,11 +1608,9 @@ rust_path = "hl/writable_file.rs"
 rust_class = "WritableFile"
 other = "H5Lcreate_soft"
 
-[[entries]]
-rust = "link_external"
-rust_path = "hl/writable_file.rs"
-rust_class = "WritableFile"
-other = "H5Lcreate_external"
+# `link_external` is intentionally unmapped under strict 1:1 matching. It is a
+# thin high-level convenience wrapper around the writer-side link machinery, not
+# the canonical owner of libhdf5's external-link creation path.
 
 [[entries]]
 rust = "close"
@@ -1817,15 +1641,9 @@ rust_path = "hl/dataset_builder.rs"
 rust_class = "DatasetBuilder<'a>"
 other = "H5Pset_chunk"
 
-[[entries]]
-rust = "deflate"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Pset_deflate"
-
-[[entries]]
-rust = "shuffle"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Pset_shuffle"
+# `deflate` and `shuffle` are intentionally unmapped under strict 1:1 matching.
+# They are tiny fluent builder setters, not meaningful translation owners of
+# the corresponding libhdf5 property-list mutation routines.
 
 [[entries]]
 rust = "resizable"
@@ -1837,59 +1655,26 @@ rust = "compact"
 rust_path = "hl/dataset_builder.rs"
 other = "H5Pset_layout"
 
-[[entries]]
-rust = "fill_value"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Pset_fill_value"
-
-[[entries]]
-rust = "fill_properties"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Pset_fill_value"
+# `fill_value` and `fill_properties` are intentionally unmapped under strict
+# 1:1 matching. They are high-level builder setters/staging helpers rather than
+# canonical owners of libhdf5's fill-value property mutation path.
 
 [[entries]]
 rust = "fill_spec"
 rust_path = "hl/dataset_builder.rs"
 other = "H5Pget_fill_value"
 
-[[entries]]
-rust = "write"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Dwrite"
-
-[[entries]]
-rust = "write_scalar"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Dwrite"
-
-[[entries]]
-rust = "write_fixed_strings"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Dwrite"
-
-[[entries]]
-rust = "write_fixed_ascii_strings"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Dwrite"
-
-[[entries]]
-rust = "write_fixed_utf8_strings"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Dwrite"
-
-[[entries]]
-rust = "write_vlen_utf8_strings"
-rust_path = "hl/dataset_builder.rs"
-other = "H5Dwrite"
+# `DatasetBuilder::write*` methods are intentionally unmapped under strict 1:1
+# matching. They are high-level Rust convenience wrappers over the narrower
+# writer-create paths and should not compete for ownership of libhdf5's broad
+# dataset-write API.
 
 # ---------------------------------------------------------------------------
 # hl/attribute.rs — H5A*.c
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "name"
-rust_path = "hl/attribute.rs"
-rust_class = "Attribute"
-other = "H5Aget_name"
+# `Attribute::name` is intentionally unmapped under strict 1:1 matching. It is
+# a trivial Rust accessor over an already-decoded message field, not a
+# translation owner of libhdf5's attribute-name query API.
 
 [[entries]]
 rust = "shape"
@@ -1897,11 +1682,9 @@ rust_path = "hl/attribute.rs"
 rust_class = "Attribute"
 other = "H5Aget_space"
 
-[[entries]]
-rust = "element_size"
-rust_path = "hl/attribute.rs"
-rust_class = "Attribute"
-other = "H5Aget_storage_size"
+# `Attribute::element_size` is intentionally unmapped under strict 1:1
+# matching. It is a trivial accessor over the decoded datatype size and not a
+# translation owner of libhdf5's attribute-storage-size query API.
 
 [[entries]]
 rust = "raw_data"
@@ -1954,10 +1737,9 @@ rust = "info"
 rust_path = "hl/dataset.rs"
 other = "H5Dget_create_plist"
 
-[[entries]]
-rust = "parse_info"
-rust_path = "hl/dataset.rs"
-other = "H5O__cache_deserialize"
+# `parse_info` is intentionally unmapped. It is a dataset-specific wrapper
+# around object-header decoding and should not compete with the canonical
+# object-header cache-deserialize owner.
 
 [[entries]]
 rust = "shape"
@@ -2078,10 +1860,9 @@ rust = "write_native_uint"
 rust_path = "hl/conversion.rs"
 other = "H5T__bit_set_d"
 
-[[entries]]
-rust = "write_native_float"
-rust_path = "hl/conversion.rs"
-other = "H5T__bit_copy"
+# `write_native_float` is intentionally unmapped under strict 1:1 matching. It
+# only writes native-endian 4/8-byte float payloads and is not a canonical
+# owner of libhdf5's broader bit-copy engine.
 
 [[entries]]
 rust = "read_float"
@@ -2106,10 +1887,9 @@ rust = "open_rw"
 rust_path = "hl/mutable_file.rs"
 other = "H5Fopen"
 
-[[entries]]
-rust = "root_group"
-rust_path = "hl/mutable_file.rs"
-other = "H5G_rootof"
+# `MutableFile::root_group` is intentionally unmapped under strict 1:1
+# matching. It is a tiny convenience accessor over the already-known root
+# address, not a direct analog of libhdf5's root-group lookup path.
 
 [[entries]]
 rust = "member_names"
@@ -2132,10 +1912,9 @@ rust = "find_message_in_oh"
 rust_path = "hl/mutable_file.rs"
 other = "H5O_msg_iterate"
 
-[[entries]]
-rust = "rewrite_oh_checksum"
-rust_path = "hl/mutable_file.rs"
-other = "H5O__cache_serialize"
+# `rewrite_oh_checksum` is intentionally unmapped under strict 1:1 matching.
+# It only recomputes the trailing checksum after in-place mutation and is not a
+# canonical owner of libhdf5's full object-header cache serializer.
 
 [[entries]]
 rust = "rewrite_extensible_array_chunk"
@@ -2217,15 +1996,9 @@ rust = "extensible_array_page_index"
 rust_path = "hl/mutable_file.rs"
 other = "H5EA__dblock_sblk_idx"
 
-[[entries]]
-rust = "locate_extensible_array_element"
-rust_path = "hl/mutable_file.rs"
-other = "H5EA__lookup_elmt"
-
-[[entries]]
-rust = "locate_extensible_array_data_block_element"
-rust_path = "hl/mutable_file.rs"
-other = "H5EA__lookup_elmt"
+# `H5EA__lookup_elmt` is intentionally unmapped under strict 1:1 matching on
+# the mutable writer side. The Rust path splits overall lookup, direct data-
+# block lookup, and surrounding writer/update orchestration across helpers.
 
 [[entries]]
 rust = "btree_v2_leaf_capacity"
@@ -2289,10 +2062,9 @@ rust = "read_fresh_bytes"
 rust_path = "hl/mutable_file.rs"
 other = "H5FD_read"
 
-[[entries]]
-rust = "append_aligned_zeros"
-rust_path = "hl/mutable_file.rs"
-other = "H5MF_alloc"
+# `append_aligned_zeros` is intentionally unmapped under strict 1:1 matching.
+# It is a small writer-side convenience wrapper around monotonic allocation plus
+# zero-fill, not a direct translation owner of libhdf5's file-space allocator.
 
 [[entries]]
 rust = "reopen_reader"
@@ -2340,7 +2112,7 @@ other = "H5Z_filter_in_pline"
 [[entries]]
 rust = "deflate_pipeline"
 rust_path = "filters/mod.rs"
-other = "H5Z__filter_deflate"
+other = "H5Pset_deflate"
 
 [[entries]]
 rust = "unknown_pipeline"
@@ -2427,55 +2199,32 @@ rust_path = "engine/writer.rs"
 other = "H5L_create_external"
 
 [[entries]]
-rust = "create_dataset"
-rust_path = "engine/writer.rs"
-other = "H5D__create_named"
-
-[[entries]]
 rust = "create_dataset_with_fill"
 rust_path = "engine/writer.rs"
 other = "H5D__create_named"
 
-[[entries]]
-rust = "create_dataset_with_attrs"
-rust_path = "engine/writer.rs"
-other = "H5D__create_named"
+# `create_dataset`, `create_dataset_with_attrs`, `create_chunked_dataset`,
+# and `create_compact_dataset_with_fill` are intentionally left unmapped so
+# CCC retains a single explicit Rust owner for `H5D__create_named`.
 
-[[entries]]
-rust = "create_chunked_dataset"
-rust_path = "engine/writer.rs"
-other = "H5D__create_named"
+# `set_root_attrs` is intentionally unmapped under strict 1:1 matching. It is
+# only a staging helper for pending root attributes, not a direct analog of the
+# C attribute-creation common path.
 
-[[entries]]
-rust = "create_compact_dataset_with_fill"
-rust_path = "engine/writer.rs"
-other = "H5D__create_named"
-
-[[entries]]
-rust = "set_root_attrs"
-rust_path = "engine/writer.rs"
-other = "H5A__create_common"
-
-[[entries]]
-rust = "add_root_attr"
-rust_path = "engine/writer.rs"
-other = "H5A__create"
-
-[[entries]]
-rust = "write_group_object_header"
-rust_path = "engine/writer.rs"
-other = "H5O__cache_serialize"
+# `write_group_object_header` is intentionally unmapped under strict 1:1
+# matching. It is a small Rust wrapper around `build_v2_object_header` plus
+# allocator/write orchestration, not the canonical owner of libhdf5's object-
+# header cache serializer.
 
 [[entries]]
 rust = "write_chunk_btree_v1"
 rust_path = "engine/writer.rs"
 other = "H5D__btree_idx_create"
 
-[[entries]]
-rust = "write_dense_name_btree"
-rust_path = "engine/writer.rs"
-rust_class = "HdfFileWriter<W>"
-other = "H5G__dense_create"
+# `write_dense_name_btree` is intentionally unmapped under strict 1:1
+# matching. It is a shared Rust helper that emits dense name-index B-trees for
+# both links and attributes, not a direct analog of libhdf5's broader dense
+# storage creation path.
 
 [[entries]]
 rust = "write_managed_fractal_heap"
@@ -2524,19 +2273,16 @@ rust = "undefined"
 rust_path = "engine/writer.rs"
 other = "H5P_DEFAULT"
 
-[[entries]]
-rust = "as_attr_spec"
-rust_path = "engine/writer.rs"
-other = "H5A__create"
+# `add_root_attr` and `as_attr_spec` are intentionally unmapped under strict
+# 1:1 matching. They are Rust-side staging helpers, not canonical owners of the
+# C attribute-creation engine.
 
 # ---------------------------------------------------------------------------
 # hl/dataset.rs — long tail (read paths + selection materialization)
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "name"
-rust_path = "hl/dataset.rs"
-rust_class = "Dataset"
-other = "H5Iget_name"
+# `Dataset::name` is intentionally unmapped under strict 1:1 matching. It is a
+# trivial accessor over the stored path/name and not a translation owner of
+# libhdf5's object-name query API.
 
 [[entries]]
 rust = "addr"
@@ -2629,10 +2375,9 @@ rust = "read_raw"
 rust_path = "hl/dataset.rs"
 other = "H5Dread"
 
-[[entries]]
-rust = "filled_data"
-rust_path = "hl/dataset.rs"
-other = "H5D__fill"
+# `filled_data` is intentionally unmapped under strict 1:1 matching. It is a
+# small Rust fill-materialization helper, not the full C-side `H5D__fill`
+# engine.
 
 [[entries]]
 rust = "read_scalar"
@@ -2661,11 +2406,6 @@ rust_path = "hl/dataset.rs"
 other = "H5Dread"
 
 [[entries]]
-rust = "read_virtual_dataset"
-rust_path = "hl/dataset.rs"
-other = "H5D__virtual_read"
-
-[[entries]]
 rust = "virtual_output_dims"
 rust_path = "hl/dataset.rs"
 other = "H5D__virtual_get_extent"
@@ -2676,11 +2416,6 @@ rust_path = "hl/dataset.rs"
 other = "H5D__virtual_open_source_dset"
 
 [[entries]]
-rust = "materialize_virtual_selection_points"
-rust_path = "hl/dataset.rs"
-other = "H5D__virtual_pre_io_process_mapping"
-
-[[entries]]
 rust = "materialize_regular_hyperslab_points"
 rust_path = "hl/dataset.rs"
 other = "H5S__hyper_get_regular_hyperslab"
@@ -2689,6 +2424,11 @@ other = "H5S__hyper_get_regular_hyperslab"
 rust = "virtual_selection_start"
 rust_path = "hl/dataset.rs"
 other = "H5S__hyper_get_seq_list_gen"
+
+# `materialize_virtual_selection_points` is intentionally unmapped. It is
+# a Rust-side helper that expands one decoded selection into explicit point
+# coordinates; libhdf5's `H5D__virtual_pre_io_process_mapping` is a much
+# broader pre-I/O orchestration path and is not a good 1:1 explicit pair.
 
 [[entries]]
 rust = "virtual_selection_span"
@@ -2742,10 +2482,10 @@ rust = "implicit_chunk_coords"
 rust_path = "hl/dataset.rs"
 other = "H5D__none_idx_get_addr"
 
-[[entries]]
-rust = "copy_chunk_to_output"
-rust_path = "hl/dataset.rs"
-other = "H5D__chunk_copy"
+# `copy_chunk_to_output` is intentionally unmapped under strict 1:1 matching.
+# It is the Rust-side dispatcher around the fast-path copies and the lower-level
+# `copy_chunk_nd` scatter helper, not a canonical owner of the larger C
+# `H5D__chunk_copy` engine.
 
 [[entries]]
 rust = "decode_fixed_string"
@@ -2808,10 +2548,9 @@ rust_path = "hl/mutable_file.rs"
 rust_class = "MutableFile"
 other = "H5EA__cache_sblock_serialize"
 
-[[entries]]
-rust = "append_btree_v2_leaf"
-rust_path = "hl/mutable_file.rs"
-other = "H5B2__create_leaf"
+# `append_btree_v2_leaf` is intentionally unmapped under strict 1:1 matching.
+# It is a Rust writer-side leaf construction helper and not the broader C v2
+# B-tree leaf creation path.
 
 [[entries]]
 rust = "append_btree_v2_depth1_internal"
@@ -2884,10 +2623,9 @@ rust = "count"
 rust_path = "hl/selection.rs"
 other = "H5S__hyper_iter_nelmts"
 
-[[entries]]
-rust = "into_selection"
-rust_path = "hl/selection.rs"
-other = "H5Sselect_hyperslab"
+# `into_selection` is intentionally unmapped under strict 1:1 matching. It is
+# a tiny Rust API conversion helper, not a canonical owner of libhdf5's
+# hyperslab selection mutation routine.
 
 [[entries]]
 rust = "output_shape"
@@ -2940,11 +2678,9 @@ other = "H5Fget_create_plist"
 # ---------------------------------------------------------------------------
 # hl/file.rs / hl/group.rs / hl/datatype.rs — accessors
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "name"
-rust_path = "hl/group.rs"
-rust_class = "Group"
-other = "H5Iget_name"
+# `Group::name` is intentionally unmapped under strict 1:1 matching. It is a
+# trivial accessor over the stored path/name and not a translation owner of
+# libhdf5's object-name query API.
 
 [[entries]]
 rust = "addr"
@@ -2981,20 +2717,18 @@ rust_path = "hl/file.rs"
 rust_class = "File"
 other = "H5Aopen"
 
-[[entries]]
-rust = "resolve_external_file_path"
-rust_path = "hl/file.rs"
-other = "H5L__extern_traverse"
+# `resolve_external_file_path` is intentionally unmapped under strict 1:1
+# matching. It is only the relative-path join helper inside Rust's external
+# link traversal, not the broader C traversal engine.
 
 [[entries]]
 rust = "resolve_soft_target"
 rust_path = "hl/file.rs"
 other = "H5G_traverse_special"
 
-[[entries]]
-rust = "join_absolute_path"
-rust_path = "hl/file.rs"
-other = "H5G_normalize"
+# `join_absolute_path` is intentionally unmapped under strict 1:1 matching. It
+# is a small Rust path helper and not a direct analog of libhdf5's broader path
+# normalization routine.
 
 [[entries]]
 rust = "from_message"
@@ -3049,14 +2783,9 @@ other = "H5I_nmembers"
 # ---------------------------------------------------------------------------
 # Final stragglers — Location trait dispatches and one-offs.
 # ---------------------------------------------------------------------------
-# `hl/location.rs` defines the `Location` trait and three blanket impls
-# (`File`, `Group`, `Dataset`); each forwarder calls into the underlying
-# concrete impl's `name`/`attr_names`/`attr`. The four `name` arms below
-# (one trait declaration plus three impls) all map to `H5Iget_name`.
-[[entries]]
-rust = "name"
-rust_path = "hl/location.rs"
-other = "H5Iget_name"
+# `hl/location.rs` name forwarders are intentionally unmapped under strict 1:1
+# matching. They are pure trait-level forwarding shims over concrete object
+# accessors, not canonical owners of libhdf5's name-query API.
 
 [[entries]]
 rust = "link_exists"
@@ -3070,7 +2799,7 @@ other = "H5T__init_native"
 
 [[entries]]
 rust = "heap_object_len"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5HF_get_obj_len"
 
 # ===========================================================================
@@ -3194,12 +2923,12 @@ other = "H5F_DECODE_LENGTH"
 
 [[entries]]
 rust = "read_le_uint"
-rust_path = "format/object_header.rs"
+rust_path = "format/object_header/mod.rs"
 other = "H5F_DECODE_LENGTH"
 
 [[entries]]
 rust = "read_le_uint"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5F_DECODE_LENGTH"
 
 [[entries]]
@@ -3272,37 +3001,37 @@ other = "H5F_addr_decode"
 # ---------------------------------------------------------------------------
 [[entries]]
 rust = "bit_is_set"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/mod.rs"
 other = "H5VM_bit_get"
 
 [[entries]]
 rust = "bit_is_set"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/mod.rs"
 other = "H5VM_bit_get"
 
 [[entries]]
 rust = "log2_power2"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/mod.rs"
 other = "H5VM_log2_of2"
 
 [[entries]]
 rust = "log2_power2"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5VM_log2_of2"
 
 [[entries]]
 rust = "log2_floor"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5VM_log2_gen"
 
 [[entries]]
 rust = "usize_from_u64"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/mod.rs"
 other = "H5_ASSIGN_OVERFLOW"
 
 [[entries]]
 rust = "usize_from_u64"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/mod.rs"
 other = "H5_ASSIGN_OVERFLOW"
 
 [[entries]]
@@ -3327,13 +3056,8 @@ other = "H5VM_log2_gen"
 
 [[entries]]
 rust = "data_block_pages"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/mod.rs"
 other = "H5EA__dblock_npages"
-
-[[entries]]
-rust = "compound_member_offset_size"
-rust_path = "format/messages/datatype.rs"
-other = "H5O__dtype_decode_helper"
 
 [[entries]]
 rust = "data_size"
@@ -3352,7 +3076,7 @@ other = "H5G__is_dense"
 
 [[entries]]
 rust = "is_undefined_addr"
-rust_path = "format/object_header.rs"
+rust_path = "format/object_header/mod.rs"
 other = "H5F_addr_defined"
 
 [[entries]]
@@ -3361,44 +3085,19 @@ rust_path = "format/local_heap.rs"
 other = "H5_ASSIGN_OVERFLOW"
 
 # ---------------------------------------------------------------------------
-# Already-split halves for fractal_heap (lookup_in_*, etc.) and global_heap
-# read_at — they still aren't bound because of N→1 limits. Map them anyway
-# so the audit trail records intent, even though only one of each pair
-# wins at compare time.
+# Already-split fractal-heap helpers stay intentionally unmapped here.
+# Their semantics are subsets of the canonical `read_managed` /
+# `read_managed_object` ownership, and forcing them to compete for the same
+# C targets weakens strict 1:1 matching.
 # ---------------------------------------------------------------------------
 [[entries]]
-rust = "lookup_in_indirect_block"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__man_op_real"
-
-[[entries]]
-rust = "lookup_in_filtered_indirect_block"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__man_op_real"
-
-[[entries]]
-rust = "decode_filtered_indirect_block"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__cache_iblock_deserialize"
-
-[[entries]]
-rust = "read_from_indirect_block_rows"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__man_op"
-
-[[entries]]
-rust = "read_from_filtered_indirect_block"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__man_op"
-
-[[entries]]
 rust = "verify_metadata_checksum"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5_checksum_metadata"
 
 [[entries]]
 rust = "verify_direct_block_checksum"
-rust_path = "format/fractal_heap.rs"
+rust_path = "format/fractal_heap/mod.rs"
 other = "H5HF__cache_dblock_verify_chksum"
 
 # `read_at` for global_heap is mapped earlier (composer of decode_header
@@ -3415,18 +3114,13 @@ rust_path = "format/local_heap.rs"
 other = "H5HL__cache_prefix_deserialize"
 
 [[entries]]
-rust = "append_data_block_elements"
-rust_path = "format/extensible_array.rs"
-other = "H5EA_iterate"
-
-[[entries]]
 rust = "append_fill_elements"
-rust_path = "format/extensible_array.rs"
+rust_path = "format/extensible_array/mod.rs"
 other = "H5EA__cache_dblock_get_initial_load_size"
 
 [[entries]]
 rust = "append_fill_elements"
-rust_path = "format/fixed_array.rs"
+rust_path = "format/fixed_array/mod.rs"
 other = "H5FA__cache_dblock_get_initial_load_size"
 
 [[entries]]
@@ -3435,44 +3129,21 @@ rust_path = "format/btree_v2.rs"
 other = "H5F_DECODE_LENGTH"
 
 # ---------------------------------------------------------------------------
-# tracehash probes — both `#[cfg(feature = "tracehash")]` arms present in
-# the AST need entries (one body for the enabled cfg, one no-op for the
-# disabled cfg). Map both arms to the same conceptual "trace" target.
+# tracehash probes stay intentionally unmapped for strict 1:1 matching.
+# They are instrumentation mirrors of the managed/huge/tiny read paths,
+# not canonical Rust owners of those libhdf5 routines.
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "trace_managed_object"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__man_op_real"
-
-[[entries]]
-rust = "trace_huge_object"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__huge_op_real"
-
-[[entries]]
-rust = "trace_tiny_object"
-rust_path = "format/fractal_heap.rs"
-other = "H5HF__tiny_op_real"
-
 [[entries]]
 rust = "trace_global_heap_deref"
 rust_path = "format/global_heap.rs"
 other = "H5HG_read"
 
-[[entries]]
-rust = "trace_dataspace_extent"
-rust_path = "format/messages/dataspace.rs"
-other = "H5O__sdspace_decode"
+# `trace_fill_value` is intentionally unmapped. It is trace-only
+# instrumentation around fill-value decode, not the canonical decoder body.
 
-[[entries]]
-rust = "trace_fill_value"
-rust_path = "format/messages/fill_value.rs"
-other = "H5O__fill_new_decode"
-
-[[entries]]
-rust = "trace_external_link_resolve"
-rust_path = "format/messages/link.rs"
-other = "H5L__extern_traverse"
+# `trace_external_link_resolve` is intentionally unmapped. It is trace-only
+# instrumentation around external-link decode, not the canonical traversal
+# implementation.
 
 [[entries]]
 rust = "trace_internal_child"
@@ -3498,11 +3169,6 @@ other = "H5D__bt2_idx_get_addr"
 rust = "trace_btree2_record_decode"
 rust_path = "hl/dataset.rs"
 other = "H5D__bt2_idx_decode"
-
-[[entries]]
-rust = "trace_selection_deserialize"
-rust_path = "hl/dataset.rs"
-other = "H5S__hyper_deserialize"
 
 [[entries]]
 rust = "trace_vlen_read"
@@ -3540,21 +3206,15 @@ other = "H5E_push"
 
 [[entries]]
 rust = "default"
-rust_path = "format/superblock.rs"
-other = "H5F__super_init"
-
-[[entries]]
-rust = "default"
 rust_path = "engine/handle.rs"
 other = "H5I_init_interface"
 
 # ---------------------------------------------------------------------------
 # Constructor `new` methods → corresponding C `_create` / `_init` paths.
 # ---------------------------------------------------------------------------
-[[entries]]
-rust = "new"
-rust_path = "engine/allocator.rs"
-other = "H5MF_init"
+# `Allocator::new` is intentionally unmapped under strict 1:1 matching. It is
+# a tiny Rust constructor, not a meaningful owner of libhdf5's allocator init
+# path.
 
 [[entries]]
 rust = "new"
@@ -3574,19 +3234,12 @@ other = "H5Z__scaleoffset_set_local"
 
 [[entries]]
 rust = "new"
-rust_path = "hl/dataset.rs"
-rust_class = "Dataset"
-other = "H5D__open_oid"
-
-[[entries]]
-rust = "new"
 rust_path = "hl/dataset_builder.rs"
 other = "H5Pcreate"
 
-[[entries]]
-rust = "new"
-rust_path = "hl/selection.rs"
-other = "H5Sselect_hyperslab"
+# `Selection::new` is intentionally unmapped under strict 1:1 matching. It is
+# a small Rust struct constructor, not a canonical owner of libhdf5's
+# hyperslab-selection mutation path.
 
 # ---------------------------------------------------------------------------
 # inner/inner_mut accessors and writer position/seek mirrors.
@@ -3732,15 +3385,8 @@ rust = "test_lzf_rejects_output_size_mismatch"
 rust_path = "filters/lzf.rs"
 other = "H5Z__filter_lzf"
 
-[[entries]]
-rust = "test_shuffle_roundtrip"
-rust_path = "filters/shuffle.rs"
-other = "H5Z__filter_shuffle"
-
-[[entries]]
-rust = "test_shuffle_roundtrip_preserves_trailing_bytes"
-rust_path = "filters/shuffle.rs"
-other = "H5Z__filter_shuffle"
+# Shuffle tests are intentionally unmapped; only production functions should
+# own explicit libhdf5 counterparts in strict 1:1 mode.
 
 [[entries]]
 rust = "blosc_feature_decompresses_blosc2_frame"
@@ -3827,25 +3473,16 @@ rust = "test_longer_than_12"
 rust_path = "format/checksum.rs"
 other = "H5_checksum_lookup3"
 
-[[entries]]
-rust = "test_parse_v0_root_object_header"
-rust_path = "format/object_header.rs"
-other = "H5O__cache_deserialize"
-
-[[entries]]
-rust = "test_parse_v3_root_object_header"
-rust_path = "format/object_header.rs"
-other = "H5O__cache_deserialize"
+# Object-header parser tests are intentionally unmapped; only production
+# functions should own explicit libhdf5 counterparts in strict 1:1 mode.
 
 [[entries]]
 rust = "test_v2_superblock_roundtrip"
 rust_path = "format/superblock.rs"
 other = "H5F__cache_superblock_serialize"
 
-[[entries]]
-rust = "test_invalid_signature"
-rust_path = "format/superblock.rs"
-other = "H5F__cache_superblock_deserialize"
+# Superblock parser tests are intentionally unmapped; only production
+# functions should own explicit libhdf5 counterparts in strict 1:1 mode.
 
 [[entries]]
 rust = "test_superblock_size_v2"
@@ -3881,16 +3518,6 @@ other = "H5F_addr_encode"
 rust = "test_roundtrip_var_uint"
 rust_path = "io/writer.rs"
 other = "H5F_encode_length"
-
-[[entries]]
-rust = "virtual_point_selection_is_explicitly_unsupported"
-rust_path = "hl/dataset.rs"
-other = "H5S__point_deserialize"
-
-[[entries]]
-rust = "virtual_irregular_hyperslab_selection_is_explicitly_unsupported"
-rust_path = "hl/dataset.rs"
-other = "H5S__hyper_deserialize"
 
 [[entries]]
 rust = "virtual_source_resolution_requires_base_path_for_relative_and_same_file_sources"

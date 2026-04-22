@@ -166,149 +166,21 @@ impl DtypeSpec {
     }
 
     fn encode_with_padding(&self, pad_top_level: bool) -> Vec<u8> {
-        let mut buf = Vec::new();
-
-        match self {
-            DtypeSpec::F32 | DtypeSpec::F64 => {
-                let size = self.size();
-                // class_and_version: version=1, class=1 (floating-point)
-                let class_and_version = 0x11u8;
-                // class bit fields:
-                // bf0: bit0=byte order(0=LE), bits1-2=low pad, bits3-4=high pad, bits5-6=internal pad(2=mantissa norm implied 1)
-                // bf1: sign bit location
-                // bf2: reserved
-                if size == 4 {
-                    buf.push(class_and_version);
-                    buf.extend_from_slice(&[0x20, 31, 0x00]); // bf0=0x20(norm=2,LE), bf1=31(sign bit), bf2=0
-                    buf.extend_from_slice(&size.to_le_bytes());
-                    // Properties: bit_offset(2) + bit_precision(2) + epos(1) + esize(1) + mpos(1) + msize(1) + ebias(4)
-                    buf.extend_from_slice(&0u16.to_le_bytes()); // bit offset
-                    buf.extend_from_slice(&32u16.to_le_bytes()); // bit precision
-                    buf.push(23); // exponent position
-                    buf.push(8); // exponent size
-                    buf.push(0); // mantissa position
-                    buf.push(23); // mantissa size
-                    buf.extend_from_slice(&127u32.to_le_bytes()); // exponent bias
-                } else {
-                    buf.push(class_and_version);
-                    buf.extend_from_slice(&[0x20, 63, 0x00]); // bf0=0x20(norm=2,LE), bf1=63(sign bit), bf2=0
-                    buf.extend_from_slice(&size.to_le_bytes());
-                    buf.extend_from_slice(&0u16.to_le_bytes()); // bit offset
-                    buf.extend_from_slice(&64u16.to_le_bytes()); // bit precision
-                    buf.push(52); // exponent position
-                    buf.push(11); // exponent size
-                    buf.push(0); // mantissa position
-                    buf.push(52); // mantissa size
-                    buf.extend_from_slice(&1023u32.to_le_bytes()); // exponent bias
-                }
-            }
+        let mut buf = match self {
+            DtypeSpec::F32 | DtypeSpec::F64 => self.encode_floating_point(),
             DtypeSpec::FixedAsciiString { len, padding } => {
-                buf.push(0x13); // version 1, class = string
-                buf.push(padding & 0x0f);
-                buf.extend_from_slice(&[0x00, 0x00]);
-                buf.extend_from_slice(&len.to_le_bytes());
+                Self::encode_fixed_string(*len, *padding, false)
             }
             DtypeSpec::FixedUtf8String { len, padding } => {
-                buf.push(0x13); // version 1, class = string
-                buf.push((padding & 0x0f) | 0x10);
-                buf.extend_from_slice(&[0x00, 0x00]);
-                buf.extend_from_slice(&len.to_le_bytes());
+                Self::encode_fixed_string(*len, *padding, true)
             }
-            DtypeSpec::VarLenUtf8String => {
-                buf.push(0x19); // version 1, class = variable-length
-                buf.extend_from_slice(&[0x01, 0x01, 0x00]); // string, UTF-8, null-terminated
-                buf.extend_from_slice(&16u32.to_le_bytes());
-                buf.extend_from_slice(&[
-                    0x10, 0x00, 0x00, 0x00, // C_S1 base, one byte, null-terminated
-                    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ]);
-            }
-            DtypeSpec::Compound { size, fields } => {
-                buf.push(0x16); // version 1, class = compound
-                buf.push((fields.len() & 0xff) as u8);
-                buf.push(((fields.len() >> 8) & 0xff) as u8);
-                buf.push(0);
-                buf.extend_from_slice(&size.to_le_bytes());
-                for field in fields {
-                    let name_start = buf.len();
-                    buf.extend_from_slice(field.name.as_bytes());
-                    buf.push(0);
-                    let padded_name_len = (buf.len() - name_start + 7) & !7;
-                    while buf.len() < name_start + padded_name_len {
-                        buf.push(0);
-                    }
-                    buf.extend_from_slice(&field.offset.to_le_bytes());
-                    buf.extend_from_slice(&[0; 28]);
-                    buf.extend_from_slice(&field.dtype.encode_embedded());
-                }
-            }
-            DtypeSpec::Enum { base, members } => {
-                let base_bytes = base.encode_embedded();
-                let base_size = base.size();
-                buf.push(0x18); // version 1, class = enum
-                buf.push((members.len() & 0xff) as u8);
-                buf.push(((members.len() >> 8) & 0xff) as u8);
-                buf.push(0);
-                buf.extend_from_slice(&base_size.to_le_bytes());
-                buf.extend_from_slice(&base_bytes);
-                for (name, _) in members {
-                    let name_start = buf.len();
-                    buf.extend_from_slice(name.as_bytes());
-                    buf.push(0);
-                    let padded_name_len = (buf.len() - name_start + 7) & !7;
-                    while buf.len() < name_start + padded_name_len {
-                        buf.push(0);
-                    }
-                }
-                let value_size = base_size as usize;
-                for (_, value) in members {
-                    let encoded = value.to_le_bytes();
-                    buf.extend_from_slice(&encoded[..value_size.min(encoded.len())]);
-                    if value_size > encoded.len() {
-                        buf.resize(buf.len() + (value_size - encoded.len()), 0);
-                    }
-                }
-            }
-            DtypeSpec::Opaque { size, tag } => {
-                buf.push(0x15); // version 1, class = opaque
-                let padded_tag_len = ((tag.len() + 1 + 7) & !7).min(255) as u8;
-                buf.extend_from_slice(&[padded_tag_len, 0x00, 0x00]);
-                buf.extend_from_slice(&size.to_le_bytes());
-                buf.extend_from_slice(tag.as_bytes());
-                buf.push(0);
-                while buf.len() % 8 != 0 {
-                    buf.push(0);
-                }
-            }
-            DtypeSpec::Array { dims, base } => {
-                buf.push(0x4a); // version 4, class = array
-                buf.extend_from_slice(&[0x00, 0x00, 0x00]);
-                buf.extend_from_slice(&self.size().to_le_bytes());
-                buf.push(dims.len() as u8);
-                for dim in dims {
-                    buf.extend_from_slice(&dim.to_le_bytes());
-                }
-                buf.extend_from_slice(&base.encode_embedded());
-            }
-            _ => {
-                let size = self.size();
-                let is_signed = matches!(
-                    self,
-                    DtypeSpec::I8 | DtypeSpec::I16 | DtypeSpec::I32 | DtypeSpec::I64
-                );
-                // class_and_version: version=1, class=0 (fixed-point)
-                let class_and_version = 0x10u8; // version 1, class 0
-                                                // class bit fields: byte order = LE (bit 0 = 0), sign = signed (bit 3)
-                let bf0 = if is_signed { 0x08u8 } else { 0x00u8 };
-                buf.push(class_and_version);
-                buf.extend_from_slice(&[bf0, 0x00, 0x00]);
-                buf.extend_from_slice(&size.to_le_bytes());
-
-                // Properties: bit offset(2) + bit precision(2)
-                buf.extend_from_slice(&0u16.to_le_bytes()); // bit offset
-                buf.extend_from_slice(&(size as u16 * 8).to_le_bytes()); // bit precision
-            }
-        }
+            DtypeSpec::VarLenUtf8String => Self::encode_vlen_utf8_string(),
+            DtypeSpec::Compound { size, fields } => Self::encode_compound(*size, fields),
+            DtypeSpec::Enum { base, members } => Self::encode_enum(base, members),
+            DtypeSpec::Opaque { size, tag } => Self::encode_opaque(*size, tag),
+            DtypeSpec::Array { dims, base } => Self::encode_array(self.size(), dims, base),
+            _ => self.encode_fixed_point(),
+        };
 
         if pad_top_level
             && matches!(
@@ -326,6 +198,186 @@ impl DtypeSpec {
         }
 
         buf
+    }
+
+    fn encode_floating_point(&self) -> Vec<u8> {
+        let size = self.size();
+        let mut buf = Vec::new();
+        let class_and_version = 0x11u8;
+        buf.push(class_and_version);
+        if size == 4 {
+            buf.extend_from_slice(&[0x20, 31, 0x00]);
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&32u16.to_le_bytes());
+            buf.push(23);
+            buf.push(8);
+            buf.push(0);
+            buf.push(23);
+            buf.extend_from_slice(&127u32.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&[0x20, 63, 0x00]);
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&64u16.to_le_bytes());
+            buf.push(52);
+            buf.push(11);
+            buf.push(0);
+            buf.push(52);
+            buf.extend_from_slice(&1023u32.to_le_bytes());
+        }
+        buf
+    }
+
+    fn encode_fixed_string(len: u32, padding: u8, utf8: bool) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x13);
+        buf.push((padding & 0x0f) | if utf8 { 0x10 } else { 0x00 });
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf
+    }
+
+    fn encode_vlen_utf8_string() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x19);
+        buf.extend_from_slice(&[0x01, 0x01, 0x00]);
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&[
+            0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        buf
+    }
+
+    fn encode_compound(size: u32, fields: &[CompoundFieldSpec]) -> Vec<u8> {
+        let mut buf = Self::encode_compound_header(size, fields.len());
+        for field in fields {
+            Self::encode_compound_field(&mut buf, field);
+        }
+        buf
+    }
+
+    fn encode_compound_header(size: u32, field_count: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x16);
+        buf.push((field_count & 0xff) as u8);
+        buf.push(((field_count >> 8) & 0xff) as u8);
+        buf.push(0);
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf
+    }
+
+    fn encode_compound_field(buf: &mut Vec<u8>, field: &CompoundFieldSpec) {
+        let name_start = buf.len();
+        buf.extend_from_slice(field.name.as_bytes());
+        buf.push(0);
+        let padded_name_len = (buf.len() - name_start + 7) & !7;
+        while buf.len() < name_start + padded_name_len {
+            buf.push(0);
+        }
+        buf.extend_from_slice(&field.offset.to_le_bytes());
+        buf.extend_from_slice(&[0; 28]);
+        buf.extend_from_slice(&field.dtype.encode_embedded());
+    }
+
+    fn encode_enum(base: &DtypeSpec, members: &[(String, u64)]) -> Vec<u8> {
+        let base_bytes = base.encode_embedded();
+        let base_size = base.size();
+        let mut buf = Self::encode_enum_header(base_size, members.len(), &base_bytes);
+        Self::encode_enum_names(&mut buf, members);
+        Self::encode_enum_values(&mut buf, base_size as usize, members);
+        buf
+    }
+
+    fn encode_enum_header(base_size: u32, member_count: usize, base_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x18);
+        buf.push((member_count & 0xff) as u8);
+        buf.push(((member_count >> 8) & 0xff) as u8);
+        buf.push(0);
+        buf.extend_from_slice(&base_size.to_le_bytes());
+        buf.extend_from_slice(base_bytes);
+        buf
+    }
+
+    fn encode_enum_names(buf: &mut Vec<u8>, members: &[(String, u64)]) {
+        for (name, _) in members {
+            Self::encode_padded_name(buf, name);
+        }
+    }
+
+    fn encode_enum_values(buf: &mut Vec<u8>, value_size: usize, members: &[(String, u64)]) {
+        for (_, value) in members {
+            let encoded = value.to_le_bytes();
+            buf.extend_from_slice(&encoded[..value_size.min(encoded.len())]);
+            if value_size > encoded.len() {
+                buf.resize(buf.len() + (value_size - encoded.len()), 0);
+            }
+        }
+    }
+
+    fn encode_opaque(size: u32, tag: &str) -> Vec<u8> {
+        let mut buf = Self::encode_opaque_header(size, tag);
+        buf.extend_from_slice(tag.as_bytes());
+        buf.push(0);
+        while buf.len() % 8 != 0 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    fn encode_opaque_header(size: u32, tag: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x15);
+        let padded_tag_len = ((tag.len() + 1 + 7) & !7).min(255) as u8;
+        buf.extend_from_slice(&[padded_tag_len, 0x00, 0x00]);
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf
+    }
+
+    fn encode_array(size: u32, dims: &[u32], base: &DtypeSpec) -> Vec<u8> {
+        let mut buf = Self::encode_array_header(size, dims);
+        buf.extend_from_slice(&base.encode_embedded());
+        buf
+    }
+
+    fn encode_array_header(size: u32, dims: &[u32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x4a);
+        buf.extend_from_slice(&[0x00, 0x00, 0x00]);
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.push(dims.len() as u8);
+        for dim in dims {
+            buf.extend_from_slice(&dim.to_le_bytes());
+        }
+        buf
+    }
+
+    fn encode_fixed_point(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let size = self.size();
+        let is_signed = matches!(
+            self,
+            DtypeSpec::I8 | DtypeSpec::I16 | DtypeSpec::I32 | DtypeSpec::I64
+        );
+        let bf0 = if is_signed { 0x08u8 } else { 0x00u8 };
+        buf.push(0x10u8);
+        buf.extend_from_slice(&[bf0, 0x00, 0x00]);
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(size as u16 * 8).to_le_bytes());
+        buf
+    }
+
+    fn encode_padded_name(buf: &mut Vec<u8>, name: &str) {
+        let name_start = buf.len();
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        let padded_name_len = (buf.len() - name_start + 7) & !7;
+        while buf.len() < name_start + padded_name_len {
+            buf.push(0);
+        }
     }
 }
 

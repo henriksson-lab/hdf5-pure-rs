@@ -10,6 +10,36 @@ use crate::io::reader::HdfReader;
 const MAX_EXTENSIBLE_ARRAY_ELEMENTS: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
+pub(crate) struct ParsedExtensibleArrayHeader {
+    pub(crate) class_id: u8,
+    pub(crate) raw_element_size: usize,
+    pub(crate) index_block_elements: u8,
+    pub(crate) data_block_min_elements: usize,
+    pub(crate) super_block_min_data_ptrs: usize,
+    pub(crate) super_block_count: u64,
+    pub(crate) super_block_size: u64,
+    pub(crate) data_block_count: u64,
+    pub(crate) data_block_size: u64,
+    pub(crate) max_index_set: u64,
+    pub(crate) realized_elements: u64,
+    pub(crate) index_block_addr: u64,
+    pub(crate) array_offset_size: u8,
+    pub(crate) data_block_page_elements: usize,
+    pub(crate) index_block_super_blocks: usize,
+    pub(crate) index_block_data_block_addrs: usize,
+    pub(crate) index_block_super_block_addrs: usize,
+    pub(crate) derived_super_block_count: usize,
+    pub(crate) super_block_info: Vec<SuperBlockInfo>,
+    pub(crate) checksum_pos: u64,
+    pub(crate) super_block_count_pos: u64,
+    pub(crate) super_block_size_pos: u64,
+    pub(crate) data_block_count_pos: u64,
+    pub(crate) data_block_size_pos: u64,
+    pub(crate) max_index_set_pos: u64,
+    pub(crate) realized_elements_pos: u64,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ExtensibleArrayHeader {
     pub(super) class_id: u8,
     pub(super) raw_element_size: usize,
@@ -25,7 +55,7 @@ pub(super) struct ExtensibleArrayHeader {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SuperBlockInfo {
+pub(crate) struct SuperBlockInfo {
     pub(super) data_blocks: usize,
     pub(super) data_block_elements: usize,
     pub(super) start_data_block: u64,
@@ -35,6 +65,27 @@ pub(super) fn read_header<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
 ) -> Result<ExtensibleArrayHeader> {
+    let parsed = read_header_core(reader, addr)?;
+
+    Ok(ExtensibleArrayHeader {
+        class_id: parsed.class_id,
+        raw_element_size: parsed.raw_element_size,
+        index_block_elements: parsed.index_block_elements,
+        max_index_set: parsed.max_index_set,
+        index_block_addr: parsed.index_block_addr,
+        array_offset_size: parsed.array_offset_size,
+        data_block_page_elements: parsed.data_block_page_elements,
+        index_block_super_blocks: parsed.index_block_super_blocks,
+        index_block_data_block_addrs: parsed.index_block_data_block_addrs,
+        index_block_super_block_addrs: parsed.index_block_super_block_addrs,
+        super_block_info: parsed.super_block_info,
+    })
+}
+
+pub(crate) fn read_header_core<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    addr: u64,
+) -> Result<ParsedExtensibleArrayHeader> {
     reader.seek(addr)?;
     let magic = reader.read_bytes(4)?;
     if magic != b"EAHD" {
@@ -58,10 +109,15 @@ pub(super) fn read_header<R: Read + Seek>(
     let super_block_min_data_ptrs = reader.read_u8()?;
     let max_data_block_page_elements_bits = reader.read_u8()?;
 
-    let _super_block_count = reader.read_length()?;
-    let _super_block_size = reader.read_length()?;
-    let _data_block_count = reader.read_length()?;
-    let _data_block_size = reader.read_length()?;
+    let super_block_count_pos = reader.position()?;
+    let stored_super_block_count = reader.read_length()?;
+    let super_block_size_pos = reader.position()?;
+    let super_block_size = reader.read_length()?;
+    let data_block_count_pos = reader.position()?;
+    let data_block_count = reader.read_length()?;
+    let data_block_size_pos = reader.position()?;
+    let data_block_size = reader.read_length()?;
+    let max_index_set_pos = reader.position()?;
     let max_index_set = reader.read_length()?;
     let max_index_count = super::usize_from_u64(max_index_set, "extensible array max index")?;
     if max_index_count > MAX_EXTENSIBLE_ARRAY_ELEMENTS {
@@ -69,9 +125,21 @@ pub(super) fn read_header<R: Read + Seek>(
             "extensible array max index {max_index_count} exceeds supported maximum {MAX_EXTENSIBLE_ARRAY_ELEMENTS}"
         )));
     }
-    let _realized_elements = reader.read_length()?;
+    let realized_elements_pos = reader.position()?;
+    let realized_elements = reader.read_length()?;
     let index_block_addr = reader.read_addr()?;
+    let checksum_pos = reader.position()?;
     verify_checksum(reader, addr, "extensible array header")?;
+
+    if index_block_elements == 0
+        || data_block_min_elements == 0
+        || !data_block_min_elements.is_power_of_two()
+        || !super_block_min_data_ptrs.is_power_of_two()
+    {
+        return Err(Error::InvalidFormat(
+            "invalid extensible array block parameters".into(),
+        ));
+    }
 
     let array_offset_size = max_elements_bits.div_ceil(8);
     let data_block_page_elements = 1usize
@@ -79,7 +147,7 @@ pub(super) fn read_header<R: Read + Seek>(
         .ok_or_else(|| {
             Error::InvalidFormat("extensible array page element count overflow".into())
         })?;
-    let super_block_count = 1usize
+    let derived_super_block_count = 1usize
         + (max_elements_bits as usize)
             .checked_sub(super::log2_power2(data_block_min_elements as u64)?)
             .ok_or_else(|| {
@@ -87,26 +155,41 @@ pub(super) fn read_header<R: Read + Seek>(
             })?;
     let index_block_super_blocks = 2 * super::log2_power2(super_block_min_data_ptrs as u64)?;
     let index_block_data_block_addrs = 2 * (super_block_min_data_ptrs as usize - 1);
-    let index_block_super_block_addrs = super_block_count
+    let index_block_super_block_addrs = derived_super_block_count
         .checked_sub(index_block_super_blocks)
         .ok_or_else(|| {
             Error::InvalidFormat("invalid extensible array super block layout".into())
         })?;
     let super_block_info =
-        build_super_block_info(super_block_count, data_block_min_elements as usize)?;
+        build_super_block_info(derived_super_block_count, data_block_min_elements as usize)?;
 
-    Ok(ExtensibleArrayHeader {
+    Ok(ParsedExtensibleArrayHeader {
         class_id,
         raw_element_size,
         index_block_elements,
+        data_block_min_elements: data_block_min_elements as usize,
+        super_block_min_data_ptrs: super_block_min_data_ptrs as usize,
+        super_block_count: stored_super_block_count,
+        super_block_size,
+        data_block_count,
+        data_block_size,
         max_index_set,
+        realized_elements,
         index_block_addr,
         array_offset_size,
         data_block_page_elements,
         index_block_super_blocks,
         index_block_data_block_addrs,
         index_block_super_block_addrs,
+        derived_super_block_count,
         super_block_info,
+        checksum_pos,
+        super_block_count_pos,
+        super_block_size_pos,
+        data_block_count_pos,
+        data_block_size_pos,
+        max_index_set_pos,
+        realized_elements_pos,
     })
 }
 

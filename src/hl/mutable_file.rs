@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use crate::error::{Error, Result};
 use crate::format::btree_v2::BTreeV2Header;
 use crate::format::checksum::checksum_metadata;
+use crate::format::extensible_array::hdr::read_header_core as read_extensible_array_header_core;
 use crate::format::messages::data_layout::{ChunkIndexType, LayoutClass};
 use crate::format::messages::filter_pipeline::{FILTER_DEFLATE, FILTER_SHUFFLE};
 use crate::format::object_header::{
@@ -26,6 +27,8 @@ struct ChunkBTreeEntry {
     filter_mask: u32,
     child_addr: u64,
 }
+
+const CHUNK_BTREE_MAX_LEAF_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone)]
 struct MutableExtensibleArrayHeader {
@@ -62,6 +65,21 @@ struct MutableExtensibleArraySuperBlockInfo {
     data_block_elements: usize,
     start_index: u64,
     start_data_block: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritableChunkIndexKind {
+    BTreeV1,
+    FixedArray,
+    ExtensibleArray,
+    BTreeV2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExtensibleArrayChunkWrite {
+    element_index: usize,
+    filtered: bool,
+    chunk_size_len: usize,
 }
 
 /// A mutable HDF5 file opened for read-write access.
@@ -480,49 +498,50 @@ impl MutableFile {
         expected_len: usize,
         element_size: usize,
     ) -> Result<()> {
+        match Self::writable_chunk_index_kind(info) {
+            WritableChunkIndexKind::FixedArray => self.rewrite_fixed_array_chunk(
+                index_addr,
+                &info,
+                chunk_coords,
+                chunk_data_dims,
+                filtered_len,
+                chunk_addr,
+                expected_len,
+            ),
+            WritableChunkIndexKind::ExtensibleArray => self.rewrite_extensible_array_chunk(
+                index_addr,
+                &info,
+                chunk_coords,
+                chunk_data_dims,
+                filtered_len,
+                chunk_addr,
+                expected_len,
+            ),
+            WritableChunkIndexKind::BTreeV2 => self.rewrite_btree_v2_chunk(
+                index_addr,
+                &info,
+                chunk_coords,
+                chunk_data_dims,
+                filtered_len,
+                chunk_addr,
+                expected_len,
+            ),
+            WritableChunkIndexKind::BTreeV1 => self.rewrite_leaf_chunk_btree(
+                index_addr,
+                chunk_coords,
+                filtered_len as u32,
+                chunk_addr,
+                element_size as u32,
+            ),
+        }
+    }
+
+    fn writable_chunk_index_kind(info: &crate::hl::dataset::DatasetInfo) -> WritableChunkIndexKind {
         match info.layout.chunk_index_type {
-            Some(ChunkIndexType::FixedArray) => {
-                self.rewrite_fixed_array_chunk(
-                    index_addr,
-                    &info,
-                    chunk_coords,
-                    chunk_data_dims,
-                    filtered_len,
-                    chunk_addr,
-                    expected_len,
-                )
-            }
-            Some(ChunkIndexType::ExtensibleArray) => {
-                self.rewrite_extensible_array_chunk(
-                    index_addr,
-                    &info,
-                    chunk_coords,
-                    chunk_data_dims,
-                    filtered_len,
-                    chunk_addr,
-                    expected_len,
-                )
-            }
-            Some(ChunkIndexType::BTreeV2) => {
-                self.rewrite_btree_v2_chunk(
-                    index_addr,
-                    &info,
-                    chunk_coords,
-                    chunk_data_dims,
-                    filtered_len,
-                    chunk_addr,
-                    expected_len,
-                )
-            }
-            _ => {
-                self.rewrite_leaf_chunk_btree(
-                    index_addr,
-                    chunk_coords,
-                    filtered_len as u32,
-                    chunk_addr,
-                    element_size as u32,
-                )
-            }
+            Some(ChunkIndexType::FixedArray) => WritableChunkIndexKind::FixedArray,
+            Some(ChunkIndexType::ExtensibleArray) => WritableChunkIndexKind::ExtensibleArray,
+            Some(ChunkIndexType::BTreeV2) => WritableChunkIndexKind::BTreeV2,
+            _ => WritableChunkIndexKind::BTreeV1,
         }
     }
 
@@ -536,6 +555,84 @@ impl MutableFile {
         chunk_addr: u64,
         unfiltered_chunk_bytes: usize,
     ) -> Result<()> {
+        let write = self.plan_extensible_array_chunk_write(
+            info,
+            chunk_coords,
+            chunk_dims,
+            unfiltered_chunk_bytes,
+        )?;
+
+        let mut guard = self.inner.lock();
+        let header = Self::read_extensible_array_header(
+            &mut guard.reader,
+            index_addr,
+            write.filtered,
+            write.chunk_size_len,
+        )?;
+        let element_count = usize::try_from(header.max_index_set).map_err(|_| {
+            Error::InvalidFormat("extensible array element count does not fit usize".into())
+        })?;
+        let direct_count = header.index_block_elements as usize;
+        if write.element_index < element_count {
+            let element_pos = Self::locate_extensible_array_element(
+                &mut guard.reader,
+                index_addr,
+                &header,
+                write.element_index,
+            )?;
+            drop(guard);
+            self.rewrite_existing_extensible_array_element(
+                element_pos,
+                chunk_addr,
+                chunk_size,
+                write.filtered,
+                write.chunk_size_len,
+            )?;
+            return Ok(());
+        }
+        if write.element_index != element_count {
+            return Err(Error::Unsupported(
+                "write_chunk can append only the next extensible-array chunk index".into(),
+            ));
+        }
+        if write.element_index < direct_count {
+            let element_pos = Self::locate_extensible_array_element(
+                &mut guard.reader,
+                index_addr,
+                &header,
+                write.element_index,
+            )?;
+            drop(guard);
+            self.append_direct_extensible_array_element(
+                index_addr,
+                &header,
+                element_pos,
+                chunk_addr,
+                chunk_size,
+                write.filtered,
+                write.chunk_size_len,
+            )
+        } else {
+            drop(guard);
+            self.append_extensible_array_spillover_element(
+                index_addr,
+                &header,
+                write.element_index,
+                chunk_addr,
+                chunk_size,
+                write.filtered,
+                write.chunk_size_len,
+            )
+        }
+    }
+
+    fn plan_extensible_array_chunk_write(
+        &self,
+        info: &crate::hl::dataset::DatasetInfo,
+        chunk_coords: &[u64],
+        chunk_dims: &[u64],
+        unfiltered_chunk_bytes: usize,
+    ) -> Result<ExtensibleArrayChunkWrite> {
         let element_index =
             Self::linear_chunk_index(chunk_coords, &info.dataspace.dims, chunk_dims)?;
         let filtered = info
@@ -552,74 +649,54 @@ impl MutableFile {
         } else {
             0
         };
-
-        let mut guard = self.inner.lock();
-        let header = Self::read_extensible_array_header(
-            &mut guard.reader,
-            index_addr,
+        Ok(ExtensibleArrayChunkWrite {
+            element_index,
             filtered,
             chunk_size_len,
-        )?;
-        let element_count = usize::try_from(header.max_index_set).map_err(|_| {
-            Error::InvalidFormat("extensible array element count does not fit usize".into())
-        })?;
-        let direct_count = header.index_block_elements as usize;
-        if element_index < element_count {
-            let element_pos = Self::locate_extensible_array_element(
-                &mut guard.reader,
-                index_addr,
-                &header,
-                element_index,
-            )?;
-            drop(guard);
-            self.write_extensible_array_element(
-                element_pos,
-                chunk_addr,
-                chunk_size,
-                filtered,
-                chunk_size_len,
-            )?;
-            return Ok(());
-        }
-        if element_index != element_count {
-            return Err(Error::Unsupported(
-                "write_chunk can append only the next extensible-array chunk index".into(),
-            ));
-        }
-        if element_index < direct_count {
-            let element_pos = Self::locate_extensible_array_element(
-                &mut guard.reader,
-                index_addr,
-                &header,
-                element_index,
-            )?;
-            drop(guard);
-            self.write_extensible_array_element(
-                element_pos,
-                chunk_addr,
-                chunk_size,
-                filtered,
-                chunk_size_len,
-            )?;
-            self.rewrite_extensible_array_header_counts(
-                index_addr,
-                &header,
-                header.max_index_set + 1,
-                header.realized_elements.max(header.max_index_set + 1),
-                None,
-                None,
-            )?;
-            return Ok(());
-        }
-        drop(guard);
-        self.append_extensible_array_spillover_element(
-            index_addr,
-            &header,
-            element_index,
+        })
+    }
+
+    fn rewrite_existing_extensible_array_element(
+        &mut self,
+        element_pos: u64,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+    ) -> Result<()> {
+        self.write_extensible_array_element(
+            element_pos,
             chunk_addr,
             chunk_size,
             filtered,
             chunk_size_len,
+        )
+    }
+
+    fn append_direct_extensible_array_element(
+        &mut self,
+        header_addr: u64,
+        header: &MutableExtensibleArrayHeader,
+        element_pos: u64,
+        chunk_addr: u64,
+        chunk_size: u64,
+        filtered: bool,
+        chunk_size_len: usize,
+    ) -> Result<()> {
+        self.write_extensible_array_element(
+            element_pos,
+            chunk_addr,
+            chunk_size,
+            filtered,
+            chunk_size_len,
+        )?;
+        self.rewrite_extensible_array_header_counts(
+            header_addr,
+            header,
+            header.max_index_set + 1,
+            header.realized_elements.max(header.max_index_set + 1),
+            None,
+            None,
         )
     }
 
@@ -629,26 +706,15 @@ impl MutableFile {
         filtered: bool,
         chunk_size_len: usize,
     ) -> Result<MutableExtensibleArrayHeader> {
-        reader.seek(addr)?;
-        if reader.read_bytes(4)? != b"EAHD" {
-            return Err(Error::InvalidFormat(
-                "invalid extensible array header magic".into(),
-            ));
-        }
-        let version = reader.read_u8()?;
-        if version != 0 {
-            return Err(Error::Unsupported(format!(
-                "extensible array header version {version}"
-            )));
-        }
-        let class_id = reader.read_u8()?;
+        let parsed = read_extensible_array_header_core(reader, addr)?;
+        let class_id = parsed.class_id;
         let expected_class = if filtered { 1 } else { 0 };
         if class_id != expected_class {
             return Err(Error::InvalidFormat(format!(
                 "extensible array class {class_id} does not match filtered={filtered}"
             )));
         }
-        let raw_element_size = reader.read_u8()? as usize;
+        let raw_element_size = parsed.raw_element_size;
         let expected_element_size = if filtered {
             reader.sizeof_addr() as usize + chunk_size_len + 4
         } else {
@@ -659,102 +725,37 @@ impl MutableFile {
                 "extensible array raw element size {raw_element_size} does not match expected {expected_element_size}"
             )));
         }
-
-        let max_elements_bits = reader.read_u8()?;
-        let index_block_elements = reader.read_u8()?;
-        let data_block_min_elements = reader.read_u8()? as usize;
-        let super_block_min_data_ptrs = reader.read_u8()? as usize;
-        let max_data_block_page_elements_bits = reader.read_u8()?;
-
-        let super_block_count_pos = reader.position()?;
-        let stored_super_block_count = reader.read_length()?;
-        let super_block_size_pos = reader.position()?;
-        let stored_super_block_size = reader.read_length()?;
-        let data_block_count_pos = reader.position()?;
-        let data_block_count = reader.read_length()?;
-        let data_block_size_pos = reader.position()?;
-        let data_block_size = reader.read_length()?;
-        let max_index_set_pos = reader.position()?;
-        let max_index_set = reader.read_length()?;
-        let realized_elements_pos = reader.position()?;
-        let realized_elements = reader.read_length()?;
-        let index_block_addr = reader.read_addr()?;
-        let checksum_pos = reader.position()?;
-        let stored_checksum = reader.read_u32()?;
-
-        let check_len = usize::try_from(checksum_pos - addr).map_err(|_| {
-            Error::InvalidFormat("extensible array header checksum span is too large".into())
-        })?;
-        reader.seek(addr)?;
-        let check_data = reader.read_bytes(check_len)?;
-        let computed = checksum_metadata(&check_data);
-        if stored_checksum != computed {
-            return Err(Error::InvalidFormat(format!(
-                "extensible array header checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
-            )));
-        }
-        reader.seek(checksum_pos + 4)?;
-
-        if index_block_elements == 0
-            || data_block_min_elements == 0
-            || !data_block_min_elements.is_power_of_two()
-            || !super_block_min_data_ptrs.is_power_of_two()
-        {
-            return Err(Error::InvalidFormat(
-                "invalid extensible array block parameters".into(),
-            ));
-        }
-        let array_offset_size = max_elements_bits.div_ceil(8);
-        let log_data_min = data_block_min_elements.trailing_zeros() as usize;
-        let super_block_count = 1usize
-            + (max_elements_bits as usize)
-                .checked_sub(log_data_min)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("invalid extensible array block parameters".into())
-                })?;
-        let index_block_super_blocks = 2 * (super_block_min_data_ptrs.trailing_zeros() as usize);
-        let index_block_data_block_addrs = 2 * (super_block_min_data_ptrs - 1);
-        let index_block_super_block_addrs = super_block_count
-            .checked_sub(index_block_super_blocks)
-            .ok_or_else(|| {
-                Error::InvalidFormat("invalid extensible array super block layout".into())
-            })?;
         let super_block_info = Self::build_mutable_extensible_array_super_block_info(
-            super_block_count,
-            data_block_min_elements,
+            parsed.derived_super_block_count,
+            parsed.data_block_min_elements,
         )?;
-        let max_data_block_page_elements = 1usize
-            .checked_shl(max_data_block_page_elements_bits as u32)
-            .ok_or_else(|| {
-                Error::InvalidFormat("extensible array page element count overflow".into())
-            })?;
 
         Ok(MutableExtensibleArrayHeader {
             class_id,
             raw_element_size,
-            index_block_elements,
-            data_block_min_elements,
-            super_block_min_data_ptrs,
-            max_data_block_page_elements,
-            max_index_set,
-            realized_elements,
-            index_block_addr,
-            array_offset_size,
-            index_block_super_blocks,
-            index_block_data_block_addrs,
-            index_block_super_block_addrs,
+            index_block_elements: parsed.index_block_elements,
+            data_block_min_elements: parsed.data_block_min_elements,
+            super_block_min_data_ptrs: parsed.super_block_min_data_ptrs,
+            max_data_block_page_elements: parsed.data_block_page_elements,
+            max_index_set: parsed.max_index_set,
+            realized_elements: parsed.realized_elements,
+            index_block_addr: parsed.index_block_addr,
+            array_offset_size: parsed.array_offset_size,
+            index_block_super_blocks: parsed.index_block_super_blocks,
+            index_block_data_block_addrs: parsed.index_block_data_block_addrs,
+            index_block_super_block_addrs: parsed.index_block_super_block_addrs,
             super_block_info,
-            super_block_count: stored_super_block_count,
-            super_block_size: stored_super_block_size,
-            data_block_count,
-            data_block_size,
-            checksum_pos,
-            super_block_count_pos,
-            super_block_size_pos,
-            data_block_count_pos,
-            data_block_size_pos,
-            max_index_set_pos,
-            realized_elements_pos,
+            super_block_count: parsed.super_block_count,
+            super_block_size: parsed.super_block_size,
+            data_block_count: parsed.data_block_count,
+            data_block_size: parsed.data_block_size,
+            checksum_pos: parsed.checksum_pos,
+            super_block_count_pos: parsed.super_block_count_pos,
+            super_block_size_pos: parsed.super_block_size_pos,
+            data_block_count_pos: parsed.data_block_count_pos,
+            data_block_size_pos: parsed.data_block_size_pos,
+            max_index_set_pos: parsed.max_index_set_pos,
+            realized_elements_pos: parsed.realized_elements_pos,
         })
     }
 
@@ -2444,10 +2445,6 @@ impl MutableFile {
     ) -> Result<()> {
         let ndims = chunk_coords.len();
         let sa = self.superblock.sizeof_addr as usize;
-        let key_size = 4 + 4 + (ndims + 1) * 8;
-        let entry_size = key_size + sa;
-        let header_size = 4 + 1 + 1 + 2 + sa * 2;
-        let max_entries = 64usize;
 
         let mut guard = self.inner.lock();
         guard.reader.seek(btree_addr)?;
@@ -2484,34 +2481,24 @@ impl MutableFile {
             self.rebuild_chunk_btree_from_entries(btree_addr, &entries, element_size, sa)?;
             return Ok(());
         }
-        let entries_start = btree_addr + header_size as u64;
-        let mut entries = Vec::with_capacity(entries_used + 1);
-        for entry_idx in 0..entries_used {
-            let key_pos = entries_start + (entry_idx * entry_size) as u64;
-            guard.reader.seek(key_pos)?;
-            let existing_size = guard.reader.read_u32()?;
-            let filter_mask = guard.reader.read_u32()?;
-            let mut coords = Vec::with_capacity(ndims);
-            for _ in 0..ndims {
-                coords.push(guard.reader.read_u64()?);
-            }
-            let _extra = guard.reader.read_u64()?;
-            let child_addr = guard.reader.read_addr()?;
-            if coords == chunk_coords {
-                drop(guard);
-                self.write_btree_entry(key_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
-                return Ok(());
-            }
-            entries.push(ChunkBTreeEntry {
-                coords,
-                chunk_size: existing_size,
-                filter_mask,
-                child_addr,
-            });
-        }
+        let entries = Self::read_chunk_btree_leaf_entries(
+            &mut guard.reader,
+            btree_addr,
+            ndims,
+            entries_used,
+            sa,
+        )?;
         drop(guard);
 
-        if entries_used >= max_entries {
+        if let Some((entry_pos, _)) =
+            Self::find_chunk_btree_entry_position(&entries, btree_addr, ndims, sa, chunk_coords)
+        {
+            self.write_btree_entry(entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
+            return Ok(());
+        }
+
+        if entries_used >= CHUNK_BTREE_MAX_LEAF_ENTRIES {
+            let mut entries = entries;
             entries.push(ChunkBTreeEntry {
                 coords: chunk_coords.to_vec(),
                 chunk_size,
@@ -2523,16 +2510,101 @@ impl MutableFile {
             return Ok(());
         }
 
-        self.write_handle.seek(SeekFrom::Start(btree_addr + 6))?;
+        self.append_chunk_btree_leaf_entry(
+            btree_addr,
+            ndims,
+            entries_used,
+            chunk_coords,
+            chunk_size,
+            chunk_addr,
+            element_size,
+            sa,
+        )?;
+
+        Ok(())
+    }
+
+    fn chunk_btree_leaf_layout(node_addr: u64, ndims: usize, sizeof_addr: usize) -> (u64, usize) {
+        let key_size = 4 + 4 + (ndims + 1) * 8;
+        let entry_size = key_size + sizeof_addr;
+        let header_size = 4 + 1 + 1 + 2 + sizeof_addr * 2;
+        (node_addr + header_size as u64, entry_size)
+    }
+
+    fn read_chunk_btree_leaf_entries<R: std::io::Read + Seek>(
+        reader: &mut HdfReader<R>,
+        node_addr: u64,
+        ndims: usize,
+        entries_used: usize,
+        sizeof_addr: usize,
+    ) -> Result<Vec<ChunkBTreeEntry>> {
+        let (entries_start, entry_size) =
+            Self::chunk_btree_leaf_layout(node_addr, ndims, sizeof_addr);
+        let mut entries = Vec::with_capacity(entries_used + 1);
+        for entry_idx in 0..entries_used {
+            let key_pos = entries_start + (entry_idx * entry_size) as u64;
+            reader.seek(key_pos)?;
+            let chunk_size = reader.read_u32()?;
+            let filter_mask = reader.read_u32()?;
+            let mut coords = Vec::with_capacity(ndims);
+            for _ in 0..ndims {
+                coords.push(reader.read_u64()?);
+            }
+            let _extra = reader.read_u64()?;
+            let child_addr = reader.read_addr()?;
+            entries.push(ChunkBTreeEntry {
+                coords,
+                chunk_size,
+                filter_mask,
+                child_addr,
+            });
+        }
+        Ok(entries)
+    }
+
+    fn find_chunk_btree_entry_position(
+        entries: &[ChunkBTreeEntry],
+        node_addr: u64,
+        ndims: usize,
+        sizeof_addr: usize,
+        chunk_coords: &[u64],
+    ) -> Option<(u64, usize)> {
+        let (entries_start, entry_size) =
+            Self::chunk_btree_leaf_layout(node_addr, ndims, sizeof_addr);
+        entries
+            .iter()
+            .position(|entry| entry.coords.as_slice() == chunk_coords)
+            .map(|entry_idx| (entries_start + (entry_idx * entry_size) as u64, entry_idx))
+    }
+
+    fn append_chunk_btree_leaf_entry(
+        &mut self,
+        node_addr: u64,
+        ndims: usize,
+        entries_used: usize,
+        chunk_coords: &[u64],
+        chunk_size: u32,
+        chunk_addr: u64,
+        element_size: u32,
+        sizeof_addr: usize,
+    ) -> Result<()> {
+        let (entries_start, entry_size) =
+            Self::chunk_btree_leaf_layout(node_addr, ndims, sizeof_addr);
+        self.write_handle.seek(SeekFrom::Start(node_addr + 6))?;
         self.write_handle
             .write_all(&((entries_used + 1) as u16).to_le_bytes())?;
 
         let new_entry_pos = entries_start + (entries_used * entry_size) as u64;
-        self.write_btree_entry(new_entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
+        self.write_btree_entry(
+            new_entry_pos,
+            chunk_coords,
+            chunk_size,
+            chunk_addr,
+            sizeof_addr,
+        )?;
 
         let final_key_pos = entries_start + ((entries_used + 1) * entry_size) as u64;
         self.write_btree_final_key(final_key_pos, chunk_coords, element_size)?;
-
         Ok(())
     }
 

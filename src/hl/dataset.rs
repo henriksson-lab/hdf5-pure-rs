@@ -53,6 +53,62 @@ struct VirtualMapping {
     virtual_select: VirtualSelection,
 }
 
+struct VirtualSourceData {
+    info: DatasetInfo,
+    raw: Vec<u8>,
+}
+
+struct VirtualPointMap {
+    source_points: Vec<Vec<u64>>,
+    virtual_points: Vec<Vec<u64>>,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkBTreeRecord {
+    coords: Vec<u64>,
+    chunk_addr: u64,
+    chunk_size: u64,
+    filter_mask: u32,
+}
+
+struct ChunkCopyPlan {
+    out_strides: Vec<usize>,
+    chunk_strides: Vec<usize>,
+    chunk_suffix_products: Vec<usize>,
+    total_chunk_elements: usize,
+}
+
+struct ChunkReadContext<'a> {
+    idx_addr: u64,
+    data_dims: &'a [u64],
+    chunk_dims: &'a [u64],
+    chunk_bytes: usize,
+    element_size: usize,
+    total_bytes: usize,
+}
+
+struct VirtualHyperslabHeader {
+    flags: u8,
+    enc_size: usize,
+}
+
+struct DecodedRegularHyperslabDim {
+    start: u64,
+    stride: u64,
+    count: u64,
+    block: u64,
+}
+
+struct DecodedIrregularHyperslabBlock {
+    start: Vec<u64>,
+    end: Vec<u64>,
+}
+
+struct DecodedVirtualSourceNames {
+    file_name: String,
+    dataset_name: String,
+}
+
 #[derive(Debug, Clone)]
 enum VirtualSelection {
     All,
@@ -66,7 +122,7 @@ enum VirtualSelection {
 /// child-pointer addresses. Mirrors the structural distinction libhdf5
 /// makes via the `H5B_t` `level == 0` test.
 enum ChunkBTreeNode {
-    Leaf(Vec<(Vec<u64>, u64, u64, u32)>),
+    Leaf(Vec<ChunkBTreeRecord>),
     Internal(Vec<u64>),
 }
 
@@ -862,10 +918,7 @@ impl Dataset {
     }
 
     /// Read all data as a typed Vec, overriding the VDS view policy.
-    pub fn read_with_vds_view<T: crate::hl::types::H5Type>(
-        &self,
-        view: VdsView,
-    ) -> Result<Vec<T>> {
+    pub fn read_with_vds_view<T: crate::hl::types::H5Type>(&self, view: VdsView) -> Result<Vec<T>> {
         let info = self.info()?;
         let conversion = crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
         let raw = self.read_raw_with_vds_view(view)?;
@@ -944,7 +997,32 @@ impl Dataset {
         let selection = sel.into_selection(&shape);
         let slices = selection.to_slices(&shape);
         let out_shape = selection.output_shape(&shape);
-        let total_out = if out_shape.is_empty() {
+        let total_out = Self::selection_output_elements(&out_shape)?;
+        let total_out_usize = usize_from_u64(total_out, "selection element count")?;
+        let elem_size = T::type_size();
+
+        if let Some(raw) = self.try_read_slice_contiguous_1d(&shape, &slices, elem_size)? {
+            return crate::hl::types::bytes_to_vec(raw);
+        }
+
+        let all_data = self.read::<T>()?;
+
+        if shape.len() == 1 && slices.len() == 1 {
+            return Self::extract_1d_selection(&all_data, &slices[0]);
+        }
+
+        Self::extract_nd_selection(
+            &all_data,
+            &shape,
+            &slices,
+            &out_shape,
+            total_out,
+            total_out_usize,
+        )
+    }
+
+    fn selection_output_elements(out_shape: &[u64]) -> Result<u64> {
+        Ok(if out_shape.is_empty() {
             1
         } else {
             out_shape.iter().try_fold(1u64, |acc, &dim| {
@@ -952,56 +1030,69 @@ impl Dataset {
                     .ok_or_else(|| Error::InvalidFormat("selection element count overflow".into()))
             })?
         }
-        .max(1);
-        let total_out_usize = usize_from_u64(total_out, "selection element count")?;
-        let elem_size = T::type_size();
+        .max(1))
+    }
 
-        // For 1D contiguous selections, optimize with direct seek+read
-        if shape.len() == 1 && slices.len() == 1 && slices[0].step == 1 {
-            let info = self.info()?;
-            if info.layout.layout_class == LayoutClass::Contiguous {
-                if let Some(addr) = info.layout.contiguous_addr {
-                    if !crate::io::reader::is_undef_addr(addr) {
-                        let start_byte = usize_from_u64(slices[0].start, "selection start")?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| {
-                                Error::InvalidFormat("selection byte offset overflow".into())
-                            })?;
-                        let nbytes = usize_from_u64(slices[0].count(), "selection count")?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| {
-                                Error::InvalidFormat("selection byte count overflow".into())
-                            })?;
-                        let mut guard = self.inner.lock();
-                        let read_addr = addr.checked_add(start_byte as u64).ok_or_else(|| {
-                            Error::InvalidFormat("selection read address overflow".into())
-                        })?;
-                        guard.reader.seek(read_addr)?;
-                        let raw = guard.reader.read_bytes(nbytes)?;
-                        return crate::hl::types::bytes_to_vec(raw);
-                    }
-                }
-            }
+    fn try_read_slice_contiguous_1d(
+        &self,
+        shape: &[u64],
+        slices: &[crate::hl::selection::SliceInfo],
+        elem_size: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        if !(shape.len() == 1 && slices.len() == 1 && slices[0].step == 1) {
+            return Ok(None);
         }
 
-        // General case: read all data and extract the selection
-        let all_data = self.read::<T>()?;
-
-        if shape.len() == 1 && slices.len() == 1 {
-            let s = &slices[0];
-            let start = usize_from_u64(s.start, "selection start")?;
-            let end = usize_from_u64(s.end, "selection end")?;
-            if start > all_data.len() {
-                return Ok(Vec::new());
-            }
-            return Ok(all_data[start..end.min(all_data.len())].to_vec());
+        let info = self.info()?;
+        if info.layout.layout_class != LayoutClass::Contiguous {
+            return Ok(None);
         }
 
-        // N-D extraction
+        let Some(addr) = info.layout.contiguous_addr else {
+            return Ok(None);
+        };
+        if crate::io::reader::is_undef_addr(addr) {
+            return Ok(None);
+        }
+
+        let start_byte = usize_from_u64(slices[0].start, "selection start")?
+            .checked_mul(elem_size)
+            .ok_or_else(|| Error::InvalidFormat("selection byte offset overflow".into()))?;
+        let nbytes = usize_from_u64(slices[0].count(), "selection count")?
+            .checked_mul(elem_size)
+            .ok_or_else(|| Error::InvalidFormat("selection byte count overflow".into()))?;
+        let read_addr = addr
+            .checked_add(start_byte as u64)
+            .ok_or_else(|| Error::InvalidFormat("selection read address overflow".into()))?;
+
+        let mut guard = self.inner.lock();
+        guard.reader.seek(read_addr)?;
+        Ok(Some(guard.reader.read_bytes(nbytes)?))
+    }
+
+    fn extract_1d_selection<T: crate::hl::types::H5Type>(
+        all_data: &[T],
+        slice: &crate::hl::selection::SliceInfo,
+    ) -> Result<Vec<T>> {
+        let start = usize_from_u64(slice.start, "selection start")?;
+        let end = usize_from_u64(slice.end, "selection end")?;
+        if start > all_data.len() {
+            return Ok(Vec::new());
+        }
+        Ok(all_data[start..end.min(all_data.len())].to_vec())
+    }
+
+    fn extract_nd_selection<T: crate::hl::types::H5Type>(
+        all_data: &[T],
+        shape: &[u64],
+        slices: &[crate::hl::selection::SliceInfo],
+        out_shape: &[u64],
+        total_out: u64,
+        total_out_usize: usize,
+    ) -> Result<Vec<T>> {
         let mut result = Vec::with_capacity(total_out_usize);
         let ndims = shape.len();
 
-        // Compute input strides
         let mut in_strides = vec![1usize; ndims];
         for d in (0..ndims - 1).rev() {
             in_strides[d] = in_strides[d + 1]
@@ -1009,10 +1100,8 @@ impl Dataset {
                 .ok_or_else(|| Error::InvalidFormat("selection stride overflow".into()))?;
         }
 
-        // Iterate over output elements
         let mut out_idx = vec![0u64; ndims];
         for _ in 0..total_out {
-            // Map output index to input index
             let mut in_linear = 0usize;
             for d in 0..ndims {
                 let in_d = slices[d].start + out_idx[d] * slices[d].step;
@@ -1030,7 +1119,6 @@ impl Dataset {
                 result.push(all_data[in_linear]);
             }
 
-            // Increment output index
             for d in (0..ndims).rev() {
                 out_idx[d] += 1;
                 if out_idx[d] < out_shape[d] {
@@ -1057,7 +1145,6 @@ impl Dataset {
             .ok_or_else(|| Error::InvalidFormat("chunked dataset missing chunk dims".into()))?;
         let chunk_data_dims = Self::chunk_data_dims(data_dims, chunk_dims)?;
         let chunk_bytes = Self::chunk_byte_len(chunk_dims, chunk_data_dims, element_size)?;
-
         let idx_addr = info
             .layout
             .chunk_index_addr
@@ -1067,79 +1154,44 @@ impl Dataset {
             return Self::filled_data(total_bytes / element_size, element_size, info);
         }
 
-        // Determine which index type to use
-        let idx_type = info.layout.chunk_index_type.clone();
+        let chunk_ctx = ChunkReadContext {
+            idx_addr,
+            data_dims,
+            chunk_dims: chunk_data_dims,
+            chunk_bytes,
+            element_size,
+            total_bytes,
+        };
 
-        match idx_type {
-            Some(ChunkIndexType::SingleChunk) | None if info.layout.version <= 3 => {
-                if info.layout.version <= 3 {
-                    Self::read_chunked_btree_v1(
-                        reader,
-                        idx_addr,
-                        info,
-                        data_dims,
-                        chunk_data_dims,
-                        chunk_bytes,
-                        element_size,
-                        total_bytes,
-                    )
-                } else {
-                    Self::read_single_chunk(reader, idx_addr, info, chunk_bytes, element_size, total_bytes)
-                }
+        Self::read_chunked_with_index(reader, info, &chunk_ctx)
+    }
+
+    fn read_chunked_with_index<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        info: &DatasetInfo,
+        chunk_ctx: &ChunkReadContext<'_>,
+    ) -> Result<Vec<u8>> {
+        match info.layout.chunk_index_type.clone() {
+            Some(ChunkIndexType::SingleChunk) => Self::read_single_chunk(
+                reader,
+                chunk_ctx.idx_addr,
+                info,
+                chunk_ctx.chunk_bytes,
+                chunk_ctx.element_size,
+                chunk_ctx.total_bytes,
+            ),
+            Some(ChunkIndexType::BTreeV1) => Self::read_chunked_btree_v1(reader, info, chunk_ctx),
+            Some(ChunkIndexType::Implicit) => Self::read_chunked_implicit(reader, info, chunk_ctx),
+            Some(ChunkIndexType::FixedArray) => {
+                Self::read_chunked_fixed_array(reader, info, chunk_ctx)
             }
-            Some(ChunkIndexType::SingleChunk) => {
-                Self::read_single_chunk(reader, idx_addr, info, chunk_bytes, element_size, total_bytes)
+            Some(ChunkIndexType::ExtensibleArray) => {
+                Self::read_chunked_extensible_array(reader, info, chunk_ctx)
             }
-            Some(ChunkIndexType::BTreeV1) => Self::read_chunked_btree_v1(
-                reader,
-                idx_addr,
-                info,
-                data_dims,
-                chunk_data_dims,
-                chunk_bytes,
-                element_size,
-                total_bytes,
-            ),
-            Some(ChunkIndexType::Implicit) => Self::read_chunked_implicit(
-                reader,
-                idx_addr,
-                info,
-                data_dims,
-                chunk_data_dims,
-                chunk_bytes,
-                element_size,
-                total_bytes,
-            ),
-            Some(ChunkIndexType::FixedArray) => Self::read_chunked_fixed_array(
-                reader,
-                idx_addr,
-                info,
-                data_dims,
-                chunk_data_dims,
-                chunk_bytes,
-                element_size,
-                total_bytes,
-            ),
-            Some(ChunkIndexType::ExtensibleArray) => Self::read_chunked_extensible_array(
-                reader,
-                idx_addr,
-                info,
-                data_dims,
-                chunk_data_dims,
-                chunk_bytes,
-                element_size,
-                total_bytes,
-            ),
-            Some(ChunkIndexType::BTreeV2) => Self::read_chunked_btree_v2(
-                reader,
-                idx_addr,
-                info,
-                data_dims,
-                chunk_data_dims,
-                chunk_bytes,
-                element_size,
-                total_bytes,
-            ),
+            Some(ChunkIndexType::BTreeV2) => Self::read_chunked_btree_v2(reader, info, chunk_ctx),
+            None if info.layout.version <= 3 => {
+                Self::read_chunked_btree_v1(reader, info, chunk_ctx)
+            }
             None => Err(Error::InvalidFormat(
                 "chunked dataset missing chunk index type".into(),
             )),
@@ -1224,58 +1276,27 @@ impl Dataset {
 
     fn read_chunked_btree_v1<R: Read + Seek>(
         reader: &mut HdfReader<R>,
-        btree_addr: u64,
         info: &DatasetInfo,
-        data_dims: &[u64],
-        chunk_dims: &[u64],
-        chunk_bytes: usize,
-        element_size: usize,
-        total_bytes: usize,
+        chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
-        let ndims = data_dims.len();
-        let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
+        let ndims = chunk_ctx.data_dims.len();
+        let mut output = Self::filled_data(
+            chunk_ctx.total_bytes / chunk_ctx.element_size,
+            chunk_ctx.element_size,
+            info,
+        )?;
+        let chunk_records = Self::collect_btree_v1_chunks(reader, chunk_ctx.idx_addr, ndims)?;
 
-        // Collect all chunk entries from the B-tree
-        let chunks = Self::collect_btree_v1_chunks(reader, btree_addr, ndims)?;
-
-        for (coords, chunk_addr, chunk_size, filter_mask) in &chunks {
-            let scaled = Self::scaled_chunk_coords(coords, chunk_dims)?;
-            Self::trace_btree1_chunk_lookup(
-                btree_addr,
-                &scaled,
-                *chunk_addr,
-                *chunk_size,
-                *filter_mask,
-            );
-
-            if crate::io::reader::is_undef_addr(*chunk_addr) {
-                continue;
-            }
-
-            reader.seek(*chunk_addr)?;
-            let read_size = usize_from_u64(*chunk_size, "v1 B-tree chunk size")?;
-            let mut raw = reader.read_bytes(read_size)?;
-
-            // Apply filter pipeline if present (respecting filter mask)
-            if let Some(ref pipeline) = info.filter_pipeline {
-                if !pipeline.filters.is_empty() {
-                    raw = filters::apply_pipeline_reverse_with_mask_expected(
-                        &raw,
-                        pipeline,
-                        element_size,
-                        *filter_mask,
-                        chunk_bytes,
-                    )?;
-                }
-            }
-
-            // Copy chunk data into the output buffer at the correct position
-            Self::copy_chunk_to_output(
-                &raw,
-                coords,
-                data_dims,
-                chunk_dims,
-                element_size,
+        for chunk_record in &chunk_records {
+            Self::process_btree_v1_chunk_record(
+                reader,
+                chunk_ctx.idx_addr,
+                chunk_record,
+                info,
+                chunk_ctx.data_dims,
+                chunk_ctx.chunk_dims,
+                chunk_ctx.chunk_bytes,
+                chunk_ctx.element_size,
                 &mut output,
             )?;
         }
@@ -1299,55 +1320,103 @@ impl Dataset {
             "virtual dataset element count",
         )?;
         let mut output = Self::filled_data(total_elements, element_size, info)?;
+        let virtual_strides = Self::row_major_strides(&output_dims)?;
 
         for mapping in mappings {
-            let source_file = Self::resolve_virtual_source_path(file_path, &mapping.file_name)?;
-            let source = crate::hl::file::File::open(&source_file)?;
-            let source_ds = source.dataset(&mapping.dataset_name)?;
-            let source_info = source_ds.info()?;
-            if source_info.datatype.size != info.datatype.size {
-                return Err(Error::Unsupported(
-                    "virtual dataset source datatype size does not match destination".into(),
-                ));
-            }
-            let source_raw = source_ds.read_raw()?;
-            let source_points = Self::materialize_virtual_selection_points(
-                &mapping.source_select,
-                &source_info.dataspace.dims,
+            let source = Self::open_virtual_source_dataset(file_path, &mapping, info)?;
+            let point_map = Self::materialize_virtual_point_map(
+                &mapping,
+                &source.info.dataspace.dims,
+                &output_dims,
             )?;
-            let virtual_points =
-                Self::materialize_virtual_selection_points(&mapping.virtual_select, &output_dims)?;
-            if source_points.len() != virtual_points.len() {
-                return Err(Error::InvalidFormat(
-                    "virtual dataset source and destination selections differ in size".into(),
-                ));
-            }
-
-            let source_strides = Self::row_major_strides(&source_info.dataspace.dims)?;
-            let virtual_strides = Self::row_major_strides(&output_dims)?;
-            for (src, dst) in source_points.iter().zip(virtual_points.iter()) {
-                let src_index = Self::linear_index(src, &source_strides)?;
-                let dst_index = Self::linear_index(dst, &virtual_strides)?;
-                let src_start = src_index.checked_mul(element_size).ok_or_else(|| {
-                    Error::InvalidFormat("virtual source byte offset overflow".into())
-                })?;
-                let dst_start = dst_index.checked_mul(element_size).ok_or_else(|| {
-                    Error::InvalidFormat("virtual destination byte offset overflow".into())
-                })?;
-                if src_start
-                    .checked_add(element_size)
-                    .is_some_and(|end| end <= source_raw.len())
-                    && dst_start
-                        .checked_add(element_size)
-                        .is_some_and(|end| end <= output.len())
-                {
-                    output[dst_start..dst_start + element_size]
-                        .copy_from_slice(&source_raw[src_start..src_start + element_size]);
-                }
-            }
+            Self::copy_virtual_mapping(
+                &source.raw,
+                &source.info.dataspace.dims,
+                &virtual_strides,
+                &point_map,
+                element_size,
+                &mut output,
+            )?;
         }
 
         Ok(output)
+    }
+
+    fn open_virtual_source_dataset(
+        file_path: Option<&Path>,
+        mapping: &VirtualMapping,
+        dest_info: &DatasetInfo,
+    ) -> Result<VirtualSourceData> {
+        let source_file = Self::resolve_virtual_source_path(file_path, &mapping.file_name)?;
+        let source = crate::hl::file::File::open(&source_file)?;
+        let source_ds = source.dataset(&mapping.dataset_name)?;
+        let source_info = source_ds.info()?;
+        if source_info.datatype.size != dest_info.datatype.size {
+            return Err(Error::Unsupported(
+                "virtual dataset source datatype size does not match destination".into(),
+            ));
+        }
+        let source_raw = source_ds.read_raw()?;
+        Ok(VirtualSourceData {
+            info: source_info,
+            raw: source_raw,
+        })
+    }
+
+    fn materialize_virtual_point_map(
+        mapping: &VirtualMapping,
+        source_dims: &[u64],
+        output_dims: &[u64],
+    ) -> Result<VirtualPointMap> {
+        let source_points =
+            Self::materialize_virtual_selection_points(&mapping.source_select, source_dims)?;
+        let virtual_points =
+            Self::materialize_virtual_selection_points(&mapping.virtual_select, output_dims)?;
+        if source_points.len() != virtual_points.len() {
+            return Err(Error::InvalidFormat(
+                "virtual dataset source and destination selections differ in size".into(),
+            ));
+        }
+        Ok(VirtualPointMap {
+            source_points,
+            virtual_points,
+        })
+    }
+
+    fn copy_virtual_mapping(
+        source_raw: &[u8],
+        source_dims: &[u64],
+        virtual_strides: &[usize],
+        point_map: &VirtualPointMap,
+        element_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        let source_strides = Self::row_major_strides(source_dims)?;
+        for (src, dst) in point_map
+            .source_points
+            .iter()
+            .zip(point_map.virtual_points.iter())
+        {
+            let src_index = Self::linear_index(src, &source_strides)?;
+            let dst_index = Self::linear_index(dst, virtual_strides)?;
+            let src_start = src_index.checked_mul(element_size).ok_or_else(|| {
+                Error::InvalidFormat("virtual source byte offset overflow".into())
+            })?;
+            let dst_start = dst_index.checked_mul(element_size).ok_or_else(|| {
+                Error::InvalidFormat("virtual destination byte offset overflow".into())
+            })?;
+            if src_start
+                .checked_add(element_size)
+                .is_some_and(|end| end <= source_raw.len())
+                && dst_start
+                    .checked_add(element_size)
+                    .is_some_and(|end| end <= output.len())
+            {
+                output[dst_start..dst_start + element_size]
+                    .copy_from_slice(&source_raw[src_start..src_start + element_size]);
+            }
+        }
+        Ok(())
     }
 
     fn virtual_output_dims(
@@ -1458,56 +1527,142 @@ impl Dataset {
         let mut dataset_names: Vec<String> = Vec::with_capacity(count);
 
         for _ in 0..count {
-            let flags = if version >= 1 {
-                let flags = *heap_data.get(pos).ok_or_else(|| {
-                    Error::InvalidFormat("truncated virtual dataset mapping flags".into())
-                })?;
-                pos += 1;
-                flags
-            } else {
-                0
-            };
-
-            let file_name = if flags & 0x04 != 0 {
-                ".".to_string()
-            } else if flags & 0x01 != 0 {
-                let origin = usize_from_u64(
-                    read_le_uint_at(heap_data, &mut pos, sizeof_size)?,
-                    "virtual dataset shared file-name index",
-                )?;
-                file_names.get(origin).cloned().ok_or_else(|| {
-                    Error::InvalidFormat("invalid shared VDS source file reference".into())
-                })?
-            } else {
-                read_c_string(heap_data, &mut pos)?
-            };
-
-            let dataset_name = if flags & 0x02 != 0 {
-                let origin = usize_from_u64(
-                    read_le_uint_at(heap_data, &mut pos, sizeof_size)?,
-                    "virtual dataset shared dataset-name index",
-                )?;
-                dataset_names.get(origin).cloned().ok_or_else(|| {
-                    Error::InvalidFormat("invalid shared VDS source dataset reference".into())
-                })?
-            } else {
-                read_c_string(heap_data, &mut pos)?
-            };
-
-            let source_select = Self::decode_virtual_selection(heap_data, &mut pos)?;
-            let virtual_select = Self::decode_virtual_selection(heap_data, &mut pos)?;
-            trace_vds_source_resolve(&file_name, &dataset_name);
-            file_names.push(file_name.clone());
-            dataset_names.push(dataset_name.clone());
-            mappings.push(VirtualMapping {
-                file_name,
-                dataset_name,
-                source_select,
-                virtual_select,
-            });
+            mappings.push(Self::decode_virtual_mapping(
+                heap_data,
+                &mut pos,
+                version,
+                sizeof_size,
+                &mut file_names,
+                &mut dataset_names,
+            )?);
         }
 
         Ok(mappings)
+    }
+
+    fn decode_virtual_mapping(
+        heap_data: &[u8],
+        pos: &mut usize,
+        version: u8,
+        sizeof_size: usize,
+        file_names: &mut Vec<String>,
+        dataset_names: &mut Vec<String>,
+    ) -> Result<VirtualMapping> {
+        let flags = Self::decode_virtual_mapping_flags(heap_data, pos, version)?;
+        let names = Self::decode_virtual_source_names(
+            heap_data,
+            pos,
+            sizeof_size,
+            flags,
+            file_names,
+            dataset_names,
+        )?;
+        let source_select = Self::decode_virtual_selection(heap_data, pos)?;
+        let virtual_select = Self::decode_virtual_selection(heap_data, pos)?;
+        trace_vds_source_resolve(&names.file_name, &names.dataset_name);
+        file_names.push(names.file_name.clone());
+        dataset_names.push(names.dataset_name.clone());
+        Ok(VirtualMapping {
+            file_name: names.file_name,
+            dataset_name: names.dataset_name,
+            source_select,
+            virtual_select,
+        })
+    }
+
+    fn decode_virtual_mapping_flags(data: &[u8], pos: &mut usize, version: u8) -> Result<u8> {
+        if version == 0 {
+            return Ok(0);
+        }
+        let flags = *data.get(*pos).ok_or_else(|| {
+            Error::InvalidFormat("truncated virtual dataset mapping flags".into())
+        })?;
+        *pos += 1;
+        Ok(flags)
+    }
+
+    fn decode_virtual_source_names(
+        heap_data: &[u8],
+        pos: &mut usize,
+        sizeof_size: usize,
+        flags: u8,
+        file_names: &[String],
+        dataset_names: &[String],
+    ) -> Result<DecodedVirtualSourceNames> {
+        Ok(DecodedVirtualSourceNames {
+            file_name: Self::decode_virtual_source_file_name(
+                heap_data,
+                pos,
+                sizeof_size,
+                flags,
+                file_names,
+            )?,
+            dataset_name: Self::decode_virtual_source_dataset_name(
+                heap_data,
+                pos,
+                sizeof_size,
+                flags,
+                dataset_names,
+            )?,
+        })
+    }
+
+    fn decode_virtual_source_file_name(
+        heap_data: &[u8],
+        pos: &mut usize,
+        sizeof_size: usize,
+        flags: u8,
+        file_names: &[String],
+    ) -> Result<String> {
+        if flags & 0x04 != 0 {
+            return Ok(".".to_string());
+        }
+        if flags & 0x01 != 0 {
+            return Self::decode_virtual_shared_name_ref(
+                heap_data,
+                pos,
+                sizeof_size,
+                file_names,
+                "virtual dataset shared file-name index",
+                "invalid shared VDS source file reference",
+            );
+        }
+        read_c_string(heap_data, pos)
+    }
+
+    fn decode_virtual_source_dataset_name(
+        heap_data: &[u8],
+        pos: &mut usize,
+        sizeof_size: usize,
+        flags: u8,
+        dataset_names: &[String],
+    ) -> Result<String> {
+        if flags & 0x02 != 0 {
+            return Self::decode_virtual_shared_name_ref(
+                heap_data,
+                pos,
+                sizeof_size,
+                dataset_names,
+                "virtual dataset shared dataset-name index",
+                "invalid shared VDS source dataset reference",
+            );
+        }
+        read_c_string(heap_data, pos)
+    }
+
+    fn decode_virtual_shared_name_ref(
+        heap_data: &[u8],
+        pos: &mut usize,
+        sizeof_size: usize,
+        names: &[String],
+        index_context: &'static str,
+        invalid_context: &'static str,
+    ) -> Result<String> {
+        let origin = usize_from_u64(read_le_uint_at(heap_data, pos, sizeof_size)?, index_context)?;
+        names
+            .get(origin)
+            .cloned()
+            .ok_or_else(|| Error::InvalidFormat(invalid_context.into()))
     }
 
     fn decode_virtual_selection(data: &[u8], pos: &mut usize) -> Result<VirtualSelection> {
@@ -1539,9 +1694,9 @@ impl Dataset {
                 "virtual all-selection version {version}"
             )));
         }
-        *pos = pos.checked_add(8).ok_or_else(|| {
-            Error::InvalidFormat("virtual all-selection offset overflow".into())
-        })?;
+        *pos = pos
+            .checked_add(8)
+            .ok_or_else(|| Error::InvalidFormat("virtual all-selection offset overflow".into()))?;
         if *pos > data.len() {
             return Err(Error::InvalidFormat(
                 "truncated virtual all-selection header".into(),
@@ -1558,9 +1713,9 @@ impl Dataset {
             read_le_uint_at(data, pos, enc_size)?,
             "virtual point selection count",
         )?;
-        let coordinate_count = point_count
-            .checked_mul(rank)
-            .ok_or_else(|| Error::InvalidFormat("virtual point selection coordinate count overflow".into()))?;
+        let coordinate_count = point_count.checked_mul(rank).ok_or_else(|| {
+            Error::InvalidFormat("virtual point selection coordinate count overflow".into())
+        })?;
         let mut points = Vec::with_capacity(point_count);
         for _ in 0..point_count {
             let mut point = Vec::with_capacity(rank);
@@ -1597,20 +1752,25 @@ impl Dataset {
         const H5S_HYPER_REGULAR: u8 = 0x01;
 
         let version = read_le_u32_at(data, pos)?;
-        let (flags, enc_size) = Self::decode_virtual_hyperslab_header(data, pos, version)?;
+        let header = Self::decode_virtual_hyperslab_header(data, pos, version)?;
         let rank = Self::decode_virtual_selection_rank(data, pos)?;
 
-        if flags & H5S_HYPER_REGULAR != 0 {
-            return Self::decode_virtual_regular_hyperslab_selection(data, pos, rank, enc_size);
+        if header.flags & H5S_HYPER_REGULAR != 0 {
+            return Self::decode_virtual_regular_hyperslab_selection(
+                data,
+                pos,
+                rank,
+                header.enc_size,
+            );
         }
-        Self::decode_virtual_irregular_hyperslab_selection(data, pos, rank, enc_size)
+        Self::decode_virtual_irregular_hyperslab_selection(data, pos, rank, header.enc_size)
     }
 
     fn decode_virtual_hyperslab_header(
         data: &[u8],
         pos: &mut usize,
         version: u32,
-    ) -> Result<(u8, usize)> {
+    ) -> Result<VirtualHyperslabHeader> {
         const H5S_SELECT_FLAG_BITS: u8 = 0x01;
 
         let (flags, enc_size) = if version >= 3 {
@@ -1640,7 +1800,7 @@ impl Dataset {
             )));
         }
         validate_vds_selection_enc_size(enc_size, "hyperslab")?;
-        Ok((flags, enc_size))
+        Ok(VirtualHyperslabHeader { flags, enc_size })
     }
 
     fn decode_virtual_selection_rank(data: &[u8], pos: &mut usize) -> Result<usize> {
@@ -1663,17 +1823,13 @@ impl Dataset {
         let mut stride = Vec::with_capacity(rank);
         let mut count = Vec::with_capacity(rank);
         let mut block = Vec::with_capacity(rank);
+
         for _ in 0..rank {
-            start.push(read_le_uint_at(data, pos, enc_size)?);
-            stride.push(read_le_uint_at(data, pos, enc_size)?);
-            count.push(decode_hyperslab_extent(
-                read_le_uint_at(data, pos, enc_size)?,
-                enc_size,
-            ));
-            block.push(decode_hyperslab_extent(
-                read_le_uint_at(data, pos, enc_size)?,
-                enc_size,
-            ));
+            let dim = Self::decode_virtual_regular_hyperslab_dim(data, pos, enc_size)?;
+            start.push(dim.start);
+            stride.push(dim.stride);
+            count.push(dim.count);
+            block.push(dim.block);
         }
 
         Ok(VirtualSelection::Regular(RegularHyperslab {
@@ -1696,23 +1852,73 @@ impl Dataset {
         )?;
         let mut blocks = Vec::with_capacity(block_count);
         for _ in 0..block_count {
-            let mut start = Vec::with_capacity(rank);
-            let mut block = Vec::with_capacity(rank);
-            for _ in 0..rank {
-                start.push(read_le_uint_at(data, pos, enc_size)?);
-            }
-            for start_coord in &start {
-                let end_coord = read_le_uint_at(data, pos, enc_size)?;
-                if end_coord < *start_coord {
-                    return Err(Error::InvalidFormat(
-                        "virtual irregular hyperslab end precedes start".into(),
-                    ));
-                }
-                block.push(end_coord - *start_coord + 1);
-            }
-            blocks.push(IrregularHyperslabBlock { start, block });
+            let block = Self::decode_virtual_irregular_hyperslab_block(data, pos, rank, enc_size)?;
+            blocks.push(Self::materialize_virtual_irregular_hyperslab_block(block)?);
         }
         Ok(VirtualSelection::Irregular(blocks))
+    }
+
+    fn decode_virtual_hyperslab_vector(
+        data: &[u8],
+        pos: &mut usize,
+        rank: usize,
+        enc_size: usize,
+        decode_extent: bool,
+    ) -> Result<Vec<u64>> {
+        let mut values = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            let value = read_le_uint_at(data, pos, enc_size)?;
+            values.push(if decode_extent {
+                decode_hyperslab_extent(value, enc_size)
+            } else {
+                value
+            });
+        }
+        Ok(values)
+    }
+
+    fn decode_virtual_regular_hyperslab_dim(
+        data: &[u8],
+        pos: &mut usize,
+        enc_size: usize,
+    ) -> Result<DecodedRegularHyperslabDim> {
+        Ok(DecodedRegularHyperslabDim {
+            start: read_le_uint_at(data, pos, enc_size)?,
+            stride: read_le_uint_at(data, pos, enc_size)?,
+            count: decode_hyperslab_extent(read_le_uint_at(data, pos, enc_size)?, enc_size),
+            block: decode_hyperslab_extent(read_le_uint_at(data, pos, enc_size)?, enc_size),
+        })
+    }
+
+    fn decode_virtual_irregular_hyperslab_block(
+        data: &[u8],
+        pos: &mut usize,
+        rank: usize,
+        enc_size: usize,
+    ) -> Result<DecodedIrregularHyperslabBlock> {
+        Ok(DecodedIrregularHyperslabBlock {
+            start: Self::decode_virtual_hyperslab_vector(data, pos, rank, enc_size, false)?,
+            end: Self::decode_virtual_hyperslab_vector(data, pos, rank, enc_size, false)?,
+        })
+    }
+
+    fn materialize_virtual_irregular_hyperslab_block(
+        block: DecodedIrregularHyperslabBlock,
+    ) -> Result<IrregularHyperslabBlock> {
+        let mut extents = Vec::with_capacity(block.start.len());
+        for (start_coord, end_coord) in block.start.iter().zip(&block.end) {
+            if end_coord < start_coord {
+                return Err(Error::InvalidFormat(
+                    "virtual irregular hyperslab end precedes start".into(),
+                ));
+            }
+            extents.push(end_coord - start_coord + 1);
+        }
+
+        Ok(IrregularHyperslabBlock {
+            start: block.start,
+            block: extents,
+        })
     }
 
     fn resolve_virtual_source_path(vds_path: Option<&Path>, source: &str) -> Result<PathBuf> {
@@ -2008,13 +2214,8 @@ impl Dataset {
 
     fn read_chunked_implicit<R: Read + Seek>(
         reader: &mut HdfReader<R>,
-        base_addr: u64,
         info: &DatasetInfo,
-        data_dims: &[u64],
-        chunk_dims: &[u64],
-        chunk_bytes: usize,
-        element_size: usize,
-        total_bytes: usize,
+        chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
         if let Some(ref pipeline) = info.filter_pipeline {
             if !pipeline.filters.is_empty() {
@@ -2024,47 +2225,47 @@ impl Dataset {
             }
         }
 
-        let ndims = data_dims.len();
-        let chunks_per_dim = Self::chunks_per_dim(data_dims, chunk_dims)?;
+        let ndims = chunk_ctx.data_dims.len();
+        let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
         let total_chunks: usize = chunks_per_dim
             .iter()
             .try_fold(1usize, |acc, &count| acc.checked_mul(count))
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
 
-        let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
+        let mut output = Self::filled_data(
+            chunk_ctx.total_bytes / chunk_ctx.element_size,
+            chunk_ctx.element_size,
+            info,
+        )?;
         for chunk_index in 0..total_chunks {
-            let coords = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim);
+            let coords =
+                Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim);
             let offset = (chunk_index as u64)
-                .checked_mul(chunk_bytes as u64)
-                .and_then(|off| base_addr.checked_add(off))
+                .checked_mul(chunk_ctx.chunk_bytes as u64)
+                .and_then(|off| chunk_ctx.idx_addr.checked_add(off))
                 .ok_or_else(|| Error::InvalidFormat("implicit chunk address overflow".into()))?;
             reader.seek(offset)?;
-            let raw = reader.read_bytes(chunk_bytes)?;
+            let raw = reader.read_bytes(chunk_ctx.chunk_bytes)?;
             Self::copy_chunk_to_output(
                 &raw,
                 &coords,
-                data_dims,
-                chunk_dims,
-                element_size,
+                chunk_ctx.data_dims,
+                chunk_ctx.chunk_dims,
+                chunk_ctx.element_size,
                 &mut output,
             )?;
         }
 
         if ndims == 0 {
-            output.truncate(total_bytes.min(chunk_bytes));
+            output.truncate(chunk_ctx.total_bytes.min(chunk_ctx.chunk_bytes));
         }
         Ok(output)
     }
 
     fn read_chunked_fixed_array<R: Read + Seek>(
         reader: &mut HdfReader<R>,
-        index_addr: u64,
         info: &DatasetInfo,
-        data_dims: &[u64],
-        chunk_dims: &[u64],
-        chunk_bytes: usize,
-        element_size: usize,
-        total_bytes: usize,
+        chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
         let filtered = info
             .filter_pipeline
@@ -2072,27 +2273,35 @@ impl Dataset {
             .map(|pipeline| !pipeline.filters.is_empty())
             .unwrap_or(false);
         let chunk_size_len = if filtered {
-            Self::filtered_chunk_size_len(info, chunk_bytes, reader.sizeof_size() as usize)?
+            Self::filtered_chunk_size_len(
+                info,
+                chunk_ctx.chunk_bytes,
+                reader.sizeof_size() as usize,
+            )?
         } else {
             0
         };
 
         let elements = crate::format::fixed_array::read_fixed_array_chunks(
             reader,
-            index_addr,
+            chunk_ctx.idx_addr,
             filtered,
             chunk_size_len,
         )?;
-        let chunks_per_dim = Self::chunks_per_dim(data_dims, chunk_dims)?;
-        let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
+        let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
+        let mut output = Self::filled_data(
+            chunk_ctx.total_bytes / chunk_ctx.element_size,
+            chunk_ctx.element_size,
+            info,
+        )?;
 
         for (chunk_index, element) in elements.iter().enumerate() {
             Self::trace_linear_chunk_lookup(
                 "hdf5.chunk_index.fixed_array.lookup",
-                index_addr,
+                chunk_ctx.idx_addr,
                 chunk_index as u64,
                 element.addr,
-                element.nbytes.unwrap_or(chunk_bytes as u64),
+                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
                 element.filter_mask,
             );
 
@@ -2100,10 +2309,11 @@ impl Dataset {
                 continue;
             }
 
-            let coords = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim);
+            let coords =
+                Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim);
             reader.seek(element.addr)?;
             let read_size = usize_from_u64(
-                element.nbytes.unwrap_or(chunk_bytes as u64),
+                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
                 "fixed-array chunk size",
             )?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
@@ -2118,9 +2328,9 @@ impl Dataset {
                     raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
-                        element_size,
+                        chunk_ctx.element_size,
                         element.filter_mask,
-                        chunk_bytes,
+                        chunk_ctx.chunk_bytes,
                     )?;
                 }
             }
@@ -2128,9 +2338,9 @@ impl Dataset {
             Self::copy_chunk_to_output(
                 &raw,
                 &coords,
-                data_dims,
-                chunk_dims,
-                element_size,
+                chunk_ctx.data_dims,
+                chunk_ctx.chunk_dims,
+                chunk_ctx.element_size,
                 &mut output,
             )?;
         }
@@ -2140,13 +2350,8 @@ impl Dataset {
 
     fn read_chunked_extensible_array<R: Read + Seek>(
         reader: &mut HdfReader<R>,
-        index_addr: u64,
         info: &DatasetInfo,
-        data_dims: &[u64],
-        chunk_dims: &[u64],
-        chunk_bytes: usize,
-        element_size: usize,
-        total_bytes: usize,
+        chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
         let filtered = info
             .filter_pipeline
@@ -2154,27 +2359,35 @@ impl Dataset {
             .map(|pipeline| !pipeline.filters.is_empty())
             .unwrap_or(false);
         let chunk_size_len = if filtered {
-            Self::filtered_chunk_size_len(info, chunk_bytes, reader.sizeof_size() as usize)?
+            Self::filtered_chunk_size_len(
+                info,
+                chunk_ctx.chunk_bytes,
+                reader.sizeof_size() as usize,
+            )?
         } else {
             0
         };
 
         let elements = crate::format::extensible_array::read_extensible_array_chunks(
             reader,
-            index_addr,
+            chunk_ctx.idx_addr,
             filtered,
             chunk_size_len,
         )?;
-        let chunks_per_dim = Self::chunks_per_dim(data_dims, chunk_dims)?;
-        let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
+        let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
+        let mut output = Self::filled_data(
+            chunk_ctx.total_bytes / chunk_ctx.element_size,
+            chunk_ctx.element_size,
+            info,
+        )?;
 
         for (chunk_index, element) in elements.iter().enumerate() {
             Self::trace_linear_chunk_lookup(
                 "hdf5.chunk_index.extensible_array.lookup",
-                index_addr,
+                chunk_ctx.idx_addr,
                 chunk_index as u64,
                 element.addr,
-                element.nbytes.unwrap_or(chunk_bytes as u64),
+                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
                 element.filter_mask,
             );
 
@@ -2182,10 +2395,11 @@ impl Dataset {
                 continue;
             }
 
-            let coords = Self::implicit_chunk_coords(chunk_index, chunk_dims, &chunks_per_dim);
+            let coords =
+                Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim);
             reader.seek(element.addr)?;
             let read_size = usize_from_u64(
-                element.nbytes.unwrap_or(chunk_bytes as u64),
+                element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
                 "extensible-array chunk size",
             )?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
@@ -2200,9 +2414,9 @@ impl Dataset {
                     raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
-                        element_size,
+                        chunk_ctx.element_size,
                         element.filter_mask,
-                        chunk_bytes,
+                        chunk_ctx.chunk_bytes,
                     )?;
                 }
             }
@@ -2210,9 +2424,9 @@ impl Dataset {
             Self::copy_chunk_to_output(
                 &raw,
                 &coords,
-                data_dims,
-                chunk_dims,
-                element_size,
+                chunk_ctx.data_dims,
+                chunk_ctx.chunk_dims,
+                chunk_ctx.element_size,
                 &mut output,
             )?;
         }
@@ -2222,13 +2436,8 @@ impl Dataset {
 
     fn read_chunked_btree_v2<R: Read + Seek>(
         reader: &mut HdfReader<R>,
-        index_addr: u64,
         info: &DatasetInfo,
-        data_dims: &[u64],
-        chunk_dims: &[u64],
-        chunk_bytes: usize,
-        element_size: usize,
-        total_bytes: usize,
+        chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
         let filtered = info
             .filter_pipeline
@@ -2236,12 +2445,20 @@ impl Dataset {
             .map(|pipeline| !pipeline.filters.is_empty())
             .unwrap_or(false);
         let chunk_size_len = if filtered {
-            Self::filtered_chunk_size_len(info, chunk_bytes, reader.sizeof_size() as usize)?
+            Self::filtered_chunk_size_len(
+                info,
+                chunk_ctx.chunk_bytes,
+                reader.sizeof_size() as usize,
+            )?
         } else {
             0
         };
-        let records = crate::format::btree_v2::collect_all_records(reader, index_addr)?;
-        let mut output = Self::filled_data(total_bytes / element_size, element_size, info)?;
+        let records = crate::format::btree_v2::collect_all_records(reader, chunk_ctx.idx_addr)?;
+        let mut output = Self::filled_data(
+            chunk_ctx.total_bytes / chunk_ctx.element_size,
+            chunk_ctx.element_size,
+            info,
+        )?;
 
         for record in records {
             let (addr, nbytes, filter_mask, scaled) = Self::decode_btree_v2_chunk_record(
@@ -2249,17 +2466,17 @@ impl Dataset {
                 filtered,
                 chunk_size_len,
                 reader.sizeof_addr() as usize,
-                data_dims.len(),
-                chunk_bytes,
+                chunk_ctx.data_dims.len(),
+                chunk_ctx.chunk_bytes,
             )?;
-            Self::trace_btree2_chunk_lookup(index_addr, &scaled, addr, nbytes, filter_mask);
+            Self::trace_btree2_chunk_lookup(chunk_ctx.idx_addr, &scaled, addr, nbytes, filter_mask);
             if crate::io::reader::is_undef_addr(addr) {
                 continue;
             }
 
             let coords: Vec<u64> = scaled
                 .iter()
-                .zip(chunk_dims)
+                .zip(chunk_ctx.chunk_dims)
                 .map(|(&coord, &chunk)| {
                     coord.checked_mul(chunk).ok_or_else(|| {
                         Error::InvalidFormat("v2-B-tree chunk coordinate overflow".into())
@@ -2283,9 +2500,9 @@ impl Dataset {
                     raw = filters::apply_pipeline_reverse_with_mask_expected(
                         &raw,
                         pipeline,
-                        element_size,
+                        chunk_ctx.element_size,
                         filter_mask,
-                        chunk_bytes,
+                        chunk_ctx.chunk_bytes,
                     )?;
                 }
             }
@@ -2293,9 +2510,9 @@ impl Dataset {
             Self::copy_chunk_to_output(
                 &raw,
                 &coords,
-                data_dims,
-                chunk_dims,
-                element_size,
+                chunk_ctx.data_dims,
+                chunk_ctx.chunk_dims,
+                chunk_ctx.element_size,
                 &mut output,
             )?;
         }
@@ -2584,39 +2801,16 @@ impl Dataset {
         if level == 0 {
             let mut records = Vec::with_capacity(entries_used);
             for _ in 0..entries_used {
-                let chunk_size = reader.read_u32()? as u64;
-                let filter_mask = reader.read_u32()?;
-                let mut coords = Vec::with_capacity(ndims);
-                for _ in 0..ndims {
-                    coords.push(reader.read_u64()?);
-                }
-                let _extra = reader.read_u64()?;
-                let chunk_addr = reader.read_addr()?;
-                records.push((coords, chunk_addr, chunk_size, filter_mask));
+                records.push(Self::decode_chunk_btree_leaf_record(reader, ndims)?);
             }
-            // Read final key to leave the reader past the node.
-            let _final_chunk_size = reader.read_u32()?;
-            let _final_filter_mask = reader.read_u32()?;
-            for _ in 0..=ndims {
-                let _ = reader.read_u64()?;
-            }
+            Self::skip_chunk_btree_final_key(reader, ndims)?;
             Ok(ChunkBTreeNode::Leaf(records))
         } else {
             let mut child_addrs = Vec::with_capacity(entries_used);
             for _ in 0..entries_used {
-                let _chunk_size = reader.read_u32()?;
-                let _filter_mask = reader.read_u32()?;
-                for _ in 0..=ndims {
-                    let _ = reader.read_u64()?;
-                }
-                let child_addr = reader.read_addr()?;
-                child_addrs.push(child_addr);
+                child_addrs.push(Self::decode_chunk_btree_child_addr(reader, ndims)?);
             }
-            let _final_chunk_size = reader.read_u32()?;
-            let _final_filter_mask = reader.read_u32()?;
-            for _ in 0..=ndims {
-                let _ = reader.read_u64()?;
-            }
+            Self::skip_chunk_btree_final_key(reader, ndims)?;
             Ok(ChunkBTreeNode::Internal(child_addrs))
         }
     }
@@ -2628,7 +2822,7 @@ impl Dataset {
         reader: &mut HdfReader<R>,
         addr: u64,
         ndims: usize,
-    ) -> Result<Vec<(Vec<u64>, u64, u64, u32)>> {
+    ) -> Result<Vec<ChunkBTreeRecord>> {
         let node = Self::decode_chunk_btree_node(reader, addr, ndims)?;
         match node {
             ChunkBTreeNode::Leaf(records) => Ok(records),
@@ -2644,6 +2838,117 @@ impl Dataset {
         }
     }
 
+    fn decode_chunk_btree_leaf_record<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        ndims: usize,
+    ) -> Result<ChunkBTreeRecord> {
+        let chunk_size = reader.read_u32()? as u64;
+        let filter_mask = reader.read_u32()?;
+        let mut coords = Vec::with_capacity(ndims);
+        for _ in 0..ndims {
+            coords.push(reader.read_u64()?);
+        }
+        let _extra = reader.read_u64()?;
+        let chunk_addr = reader.read_addr()?;
+        Ok(ChunkBTreeRecord {
+            coords,
+            chunk_addr,
+            chunk_size,
+            filter_mask,
+        })
+    }
+
+    fn decode_chunk_btree_child_addr<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        ndims: usize,
+    ) -> Result<u64> {
+        let _chunk_size = reader.read_u32()?;
+        let _filter_mask = reader.read_u32()?;
+        for _ in 0..=ndims {
+            let _ = reader.read_u64()?;
+        }
+        reader.read_addr()
+    }
+
+    fn skip_chunk_btree_final_key<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        ndims: usize,
+    ) -> Result<()> {
+        let _final_chunk_size = reader.read_u32()?;
+        let _final_filter_mask = reader.read_u32()?;
+        for _ in 0..=ndims {
+            let _ = reader.read_u64()?;
+        }
+        Ok(())
+    }
+
+    fn process_btree_v1_chunk_record<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        btree_addr: u64,
+        chunk_record: &ChunkBTreeRecord,
+        info: &DatasetInfo,
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+        chunk_bytes: usize,
+        element_size: usize,
+        output: &mut [u8],
+    ) -> Result<()> {
+        let scaled = Self::scaled_chunk_coords(&chunk_record.coords, chunk_dims)?;
+        Self::trace_btree1_chunk_lookup(
+            btree_addr,
+            &scaled,
+            chunk_record.chunk_addr,
+            chunk_record.chunk_size,
+            chunk_record.filter_mask,
+        );
+
+        if crate::io::reader::is_undef_addr(chunk_record.chunk_addr) {
+            return Ok(());
+        }
+
+        let raw = Self::read_btree_v1_chunk_payload(
+            reader,
+            chunk_record,
+            info,
+            chunk_bytes,
+            element_size,
+        )?;
+        Self::copy_chunk_to_output(
+            &raw,
+            &chunk_record.coords,
+            data_dims,
+            chunk_dims,
+            element_size,
+            output,
+        )
+    }
+
+    fn read_btree_v1_chunk_payload<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        chunk_record: &ChunkBTreeRecord,
+        info: &DatasetInfo,
+        chunk_bytes: usize,
+        element_size: usize,
+    ) -> Result<Vec<u8>> {
+        reader.seek(chunk_record.chunk_addr)?;
+        let read_size = usize_from_u64(chunk_record.chunk_size, "v1 B-tree chunk size")?;
+        let mut raw = reader.read_bytes(read_size)?;
+
+        if let Some(ref pipeline) = info.filter_pipeline {
+            if !pipeline.filters.is_empty() {
+                raw = filters::apply_pipeline_reverse_with_mask_expected(
+                    &raw,
+                    pipeline,
+                    element_size,
+                    chunk_record.filter_mask,
+                    chunk_bytes,
+                )?;
+            }
+        }
+
+        Ok(raw)
+    }
+
     /// Copy chunk data into the output buffer at the correct position.
     fn copy_chunk_to_output(
         chunk_data: &[u8],
@@ -2656,55 +2961,67 @@ impl Dataset {
         let ndims = data_dims.len();
 
         if ndims == 1 {
-            // Fast path for 1D
-            let start = usize_from_u64(coords[0], "chunk coordinate")?;
-            let chunk_size = usize_from_u64(chunk_dims[0], "chunk dimension")?;
-            let data_size = usize_from_u64(data_dims[0], "dataset dimension")?;
-            if start >= data_size {
-                return Ok(());
-            }
-
-            let n_copy = chunk_size.min(data_size - start);
-            let src_bytes = n_copy
-                .checked_mul(element_size)
-                .ok_or_else(|| Error::InvalidFormat("chunk copy size overflow".into()))?;
-            let dst_offset = start
-                .checked_mul(element_size)
-                .ok_or_else(|| Error::InvalidFormat("chunk copy offset overflow".into()))?;
-
-            if dst_offset
-                .checked_add(src_bytes)
-                .is_some_and(|end| end <= output.len())
-                && src_bytes <= chunk_data.len()
-            {
-                output[dst_offset..dst_offset + src_bytes]
-                    .copy_from_slice(&chunk_data[..src_bytes]);
-            }
-        } else {
-            // General N-dimensional copy
-            Self::copy_chunk_nd(
+            return Self::copy_chunk_1d(
                 chunk_data,
                 coords,
                 data_dims,
                 chunk_dims,
                 element_size,
                 output,
-                ndims,
-            )?;
+            );
         }
-        Ok(())
+
+        let copy_plan = Self::build_chunk_copy_plan(data_dims, chunk_dims, element_size)?;
+        Self::copy_chunk_nd(
+            chunk_data,
+            coords,
+            data_dims,
+            element_size,
+            output,
+            &copy_plan,
+        )
     }
 
-    fn copy_chunk_nd(
+    fn copy_chunk_1d(
         chunk_data: &[u8],
         coords: &[u64],
         data_dims: &[u64],
         chunk_dims: &[u64],
         element_size: usize,
         output: &mut [u8],
-        ndims: usize,
     ) -> Result<()> {
-        // Calculate strides for the output array
+        let start = usize_from_u64(coords[0], "chunk coordinate")?;
+        let chunk_size = usize_from_u64(chunk_dims[0], "chunk dimension")?;
+        let data_size = usize_from_u64(data_dims[0], "dataset dimension")?;
+        if start >= data_size {
+            return Ok(());
+        }
+
+        let n_copy = chunk_size.min(data_size - start);
+        let src_bytes = n_copy
+            .checked_mul(element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk copy size overflow".into()))?;
+        let dst_offset = start
+            .checked_mul(element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk copy offset overflow".into()))?;
+
+        if dst_offset
+            .checked_add(src_bytes)
+            .is_some_and(|end| end <= output.len())
+            && src_bytes <= chunk_data.len()
+        {
+            output[dst_offset..dst_offset + src_bytes].copy_from_slice(&chunk_data[..src_bytes]);
+        }
+        Ok(())
+    }
+
+    fn build_chunk_copy_plan(
+        data_dims: &[u64],
+        chunk_dims: &[u64],
+        element_size: usize,
+    ) -> Result<ChunkCopyPlan> {
+        let ndims = data_dims.len();
+
         let mut out_strides = vec![0usize; ndims];
         out_strides[ndims - 1] = element_size;
         for i in (0..ndims - 1).rev() {
@@ -2713,7 +3030,6 @@ impl Dataset {
                 .ok_or_else(|| Error::InvalidFormat("chunk output stride overflow".into()))?;
         }
 
-        // Calculate strides for the chunk
         let mut chunk_strides = vec![0usize; ndims];
         chunk_strides[ndims - 1] = element_size;
         for i in (0..ndims - 1).rev() {
@@ -2722,7 +3038,6 @@ impl Dataset {
                 .ok_or_else(|| Error::InvalidFormat("chunk stride overflow".into()))?;
         }
 
-        // Precompute suffix products for chunk index decomposition
         let mut chunk_suffix_products = vec![1usize; ndims];
         for d in (0..ndims - 1).rev() {
             chunk_suffix_products[d] = chunk_suffix_products[d + 1]
@@ -2730,22 +3045,37 @@ impl Dataset {
                 .ok_or_else(|| Error::InvalidFormat("chunk suffix product overflow".into()))?;
         }
 
-        // Iterate over elements in the chunk
         let total_chunk_elements = chunk_dims.iter().try_fold(1usize, |acc, &dim| {
             acc.checked_mul(usize_from_u64(dim, "chunk dimension")?)
                 .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
         })?;
+
+        Ok(ChunkCopyPlan {
+            out_strides,
+            chunk_strides,
+            chunk_suffix_products,
+            total_chunk_elements,
+        })
+    }
+
+    fn copy_chunk_nd(
+        chunk_data: &[u8],
+        coords: &[u64],
+        data_dims: &[u64],
+        element_size: usize,
+        output: &mut [u8],
+        copy_plan: &ChunkCopyPlan,
+    ) -> Result<()> {
+        let ndims = data_dims.len();
         let mut idx = vec![0usize; ndims];
 
-        for elem_idx in 0..total_chunk_elements {
-            // Convert linear index to multi-dimensional within chunk
+        for elem_idx in 0..copy_plan.total_chunk_elements {
             let mut remaining = elem_idx;
             for d in 0..ndims {
-                idx[d] = remaining / chunk_suffix_products[d];
-                remaining %= chunk_suffix_products[d];
+                idx[d] = remaining / copy_plan.chunk_suffix_products[d];
+                remaining %= copy_plan.chunk_suffix_products[d];
             }
 
-            // Compute global position
             let mut in_bounds = true;
             let mut out_offset = 0usize;
             let mut chunk_offset = 0usize;
@@ -2757,15 +3087,18 @@ impl Dataset {
                     in_bounds = false;
                     break;
                 }
-                out_offset = out_offset
-                    .checked_add(global.checked_mul(out_strides[d]).ok_or_else(|| {
-                        Error::InvalidFormat("chunk output offset overflow".into())
-                    })?)
-                    .ok_or_else(|| Error::InvalidFormat("chunk output offset overflow".into()))?;
+                out_offset =
+                    out_offset
+                        .checked_add(global.checked_mul(copy_plan.out_strides[d]).ok_or_else(
+                            || Error::InvalidFormat("chunk output offset overflow".into()),
+                        )?)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("chunk output offset overflow".into())
+                        })?;
                 chunk_offset = chunk_offset
-                    .checked_add(idx[d].checked_mul(chunk_strides[d]).ok_or_else(|| {
-                        Error::InvalidFormat("chunk input offset overflow".into())
-                    })?)
+                    .checked_add(idx[d].checked_mul(copy_plan.chunk_strides[d]).ok_or_else(
+                        || Error::InvalidFormat("chunk input offset overflow".into()),
+                    )?)
                     .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
             }
 

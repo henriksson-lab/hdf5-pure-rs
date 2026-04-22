@@ -11,6 +11,13 @@ pub struct CompoundField {
     pub datatype: Box<DatatypeMessage>,
 }
 
+struct DecodedCompoundMember {
+    raw_name: Vec<u8>,
+    name: String,
+    byte_offset: usize,
+    datatype: DatatypeMessage,
+}
+
 /// HDF5 datatype class values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatatypeClass {
@@ -319,9 +326,17 @@ impl DatatypeMessage {
                 "compound datatype member count {nmembers} exceeds supported maximum {MAX_DATATYPE_MEMBERS}"
             )));
         }
-        let mut fields: Vec<CompoundField> = Vec::with_capacity(nmembers);
-        let mut field_name_bytes: Vec<Vec<u8>> = Vec::with_capacity(nmembers);
         let data = &self.properties;
+        let members = self.decode_compound_members(data, nmembers)?;
+        self.build_compound_fields(&members)
+    }
+
+    fn decode_compound_members(
+        &self,
+        data: &[u8],
+        nmembers: usize,
+    ) -> Result<Vec<DecodedCompoundMember>> {
+        let mut members = Vec::with_capacity(nmembers);
         let mut p = 0;
 
         for _ in 0..nmembers {
@@ -330,24 +345,32 @@ impl DatatypeMessage {
                     "compound datatype truncated before member".into(),
                 ));
             }
-            let (raw_name, name) =
-                self.decode_compound_member_name(data, &mut p, &field_name_bytes)?;
-            let byte_offset = self.decode_compound_member_offset(data, &mut p)?;
-            let member_dt = self.decode_compound_member_datatype(data, &mut p)?;
-            let field =
-                self.validate_compound_member_layout(name, byte_offset, member_dt, &fields)?;
-            fields.push(field);
-            field_name_bytes.push(raw_name);
+            members.push(self.decode_compound_member(data, &mut p)?);
         }
 
-        Ok(fields)
+        Ok(members)
+    }
+
+    fn decode_compound_member(
+        &self,
+        data: &[u8],
+        pos: &mut usize,
+    ) -> Result<DecodedCompoundMember> {
+        let (raw_name, name) = self.decode_compound_member_name(data, pos)?;
+        let byte_offset = self.decode_compound_member_offset(data, pos)?;
+        let datatype = self.decode_compound_member_datatype(data, pos)?;
+        Ok(DecodedCompoundMember {
+            raw_name,
+            name,
+            byte_offset,
+            datatype,
+        })
     }
 
     fn decode_compound_member_name(
         &self,
         data: &[u8],
         pos: &mut usize,
-        prior_names: &[Vec<u8>],
     ) -> Result<(Vec<u8>, String)> {
         let name_start = *pos;
         let name_end = data[*pos..].iter().position(|&b| b == 0).ok_or_else(|| {
@@ -355,14 +378,6 @@ impl DatatypeMessage {
         })?;
         let raw_name = data[*pos..*pos + name_end].to_vec();
         let name = String::from_utf8_lossy(&raw_name).to_string();
-        if prior_names
-            .iter()
-            .any(|prior| prior.as_slice() == raw_name.as_slice())
-        {
-            return Err(Error::InvalidFormat(format!(
-                "duplicated compound field name '{name}'"
-            )));
-        }
 
         if self.version < 3 {
             let name_with_null = name_end + 1;
@@ -430,12 +445,9 @@ impl DatatypeMessage {
         let mut dims = Vec::with_capacity(ndims);
         for idx in 0..4 {
             let base = dims_start + idx * 4;
-            let dim = u32::from_le_bytes([
-                data[base],
-                data[base + 1],
-                data[base + 2],
-                data[base + 3],
-            ]) as u64;
+            let dim =
+                u32::from_le_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]])
+                    as u64;
             if idx < ndims {
                 if dim == 0 {
                     return Err(Error::InvalidFormat(
@@ -449,38 +461,72 @@ impl DatatypeMessage {
         Ok(dims)
     }
 
-    fn validate_compound_member_layout(
+    fn build_compound_fields(
         &self,
-        name: String,
-        byte_offset: usize,
-        member_dt: DatatypeMessage,
+        members: &[DecodedCompoundMember],
+    ) -> Result<Vec<CompoundField>> {
+        let mut fields = Vec::with_capacity(members.len());
+
+        for member in members {
+            self.validate_compound_member_name(member, members)?;
+            fields.push(self.build_compound_field(member, &fields)?);
+        }
+
+        Ok(fields)
+    }
+
+    fn validate_compound_member_name(
+        &self,
+        member: &DecodedCompoundMember,
+        members: &[DecodedCompoundMember],
+    ) -> Result<()> {
+        if members.iter().any(|other| {
+            !std::ptr::eq(other, member) && other.raw_name.as_slice() == member.raw_name.as_slice()
+        }) {
+            return Err(Error::InvalidFormat(format!(
+                "duplicated compound field name '{}'",
+                member.name
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn build_compound_field(
+        &self,
+        member: &DecodedCompoundMember,
         fields: &[CompoundField],
     ) -> Result<CompoundField> {
-        let member_type_size = member_dt.size as usize;
-        let member_end = byte_offset.checked_add(member_type_size).ok_or_else(|| {
-            Error::InvalidFormat("compound datatype member offset overflow".into())
-        })?;
+        let member_type_size = member.datatype.size as usize;
+        let member_end = member
+            .byte_offset
+            .checked_add(member_type_size)
+            .ok_or_else(|| {
+                Error::InvalidFormat("compound datatype member offset overflow".into())
+            })?;
         if member_end > self.size as usize {
             return Err(Error::InvalidFormat(format!(
-                "compound datatype member '{name}' exceeds record bounds"
+                "compound datatype member '{}' exceeds record bounds",
+                member.name
             )));
         }
         if fields.iter().any(|field| {
             let field_end = field.byte_offset + field.size;
-            byte_offset < field_end && field.byte_offset < member_end
+            member.byte_offset < field_end && field.byte_offset < member_end
         }) {
             return Err(Error::InvalidFormat(format!(
-                "compound datatype member '{name}' overlaps another member"
+                "compound datatype member '{}' overlaps another member",
+                member.name
             )));
         }
 
         Ok(CompoundField {
-            name,
-            byte_offset,
+            name: member.name.clone(),
+            byte_offset: member.byte_offset,
             size: member_type_size,
-            class: member_dt.class,
-            byte_order: member_dt.byte_order(),
-            datatype: Box::new(member_dt),
+            class: member.datatype.class,
+            byte_order: member.datatype.byte_order(),
+            datatype: Box::new(member.datatype.clone()),
         })
     }
 
@@ -735,165 +781,11 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
         DatatypeClass::FixedPoint | DatatypeClass::BitField => 4,
         DatatypeClass::FloatingPoint => 12,
         DatatypeClass::Time | DatatypeClass::String | DatatypeClass::Reference => 0,
-        DatatypeClass::Opaque => data[8..].iter().position(|&b| b == 0).map_or_else(
-            || {
-                Err(Error::InvalidFormat(
-                    "opaque datatype tag is not terminated".into(),
-                ))
-            },
-            |n| Ok(n + 1),
-        )?,
-        DatatypeClass::Enum => {
-            let base_len = datatype_encoded_len(&data[8..])?;
-            let base = DatatypeMessage::decode(&data[8..8 + base_len])?;
-            let nmembers = class_bits[0] as usize | ((class_bits[1] as usize) << 8);
-            let mut p = 8 + base_len;
-
-            for _ in 0..nmembers {
-                if p >= data.len() {
-                    return Err(Error::InvalidFormat(
-                        "enum datatype member name is truncated".into(),
-                    ));
-                }
-                let name_len = data[p..].iter().position(|&b| b == 0).ok_or_else(|| {
-                    Error::InvalidFormat("enum datatype member name is not terminated".into())
-                })? + 1;
-                if name_len == 1 {
-                    return Err(Error::InvalidFormat(
-                        "enum datatype member name must not be empty".into(),
-                    ));
-                }
-                p += if version < 3 {
-                    (name_len + 7) & !7
-                } else {
-                    name_len
-                };
-                if p > data.len() {
-                    return Err(Error::InvalidFormat(
-                        "enum datatype member name padding is truncated".into(),
-                    ));
-                }
-            }
-
-            p = p
-                .checked_add(nmembers.checked_mul(base.size as usize).ok_or_else(|| {
-                    Error::InvalidFormat("enum datatype member value size overflow".into())
-                })?)
-                .ok_or_else(|| Error::InvalidFormat("enum datatype size overflow".into()))?;
-            if p > data.len() {
-                return Err(Error::InvalidFormat(
-                    "enum datatype member value is truncated".into(),
-                ));
-            }
-            return Ok(p);
-        }
-        DatatypeClass::Compound => {
-            let msg = DatatypeMessage::decode(data)?;
-            let nmembers = msg
-                .compound_nmembers()
-                .ok_or_else(|| Error::InvalidFormat("not a compound datatype".into()))?
-                as usize;
-            if nmembers == 0 {
-                return Err(Error::InvalidFormat(
-                    "invalid number of compound datatype members: 0".into(),
-                ));
-            }
-            let mut p = 8;
-
-            for _ in 0..nmembers {
-                let name_start = p;
-                if p >= data.len() {
-                    return Err(Error::InvalidFormat(
-                        "compound datatype member name is truncated".into(),
-                    ));
-                }
-                let name_len = data[p..].iter().position(|&b| b == 0).ok_or_else(|| {
-                    Error::InvalidFormat("compound datatype member name is not terminated".into())
-                })? + 1;
-                p = if version < 3 {
-                    name_start + ((name_len + 7) & !7)
-                } else {
-                    p + name_len
-                };
-                p = p
-                    .checked_add(compound_member_offset_size(version, size))
-                    .ok_or_else(|| {
-                        Error::InvalidFormat("compound datatype size overflow".into())
-                    })?;
-                if version == 1 {
-                    p = p.checked_add(28).ok_or_else(|| {
-                        Error::InvalidFormat("compound datatype size overflow".into())
-                    })?;
-                }
-                if p > data.len() {
-                    return Err(Error::InvalidFormat(
-                        "compound datatype member metadata is truncated".into(),
-                    ));
-                }
-                let member_len = datatype_encoded_len(&data[p..])?;
-                p = p.checked_add(member_len).ok_or_else(|| {
-                    Error::InvalidFormat("compound datatype size overflow".into())
-                })?;
-            }
-            if p > data.len() {
-                return Err(Error::InvalidFormat(
-                    "compound datatype member datatype is truncated".into(),
-                ));
-            }
-            return Ok(p);
-        }
-        DatatypeClass::VarLen => {
-            if let Ok(base_len) = datatype_encoded_len(&data[8..]) {
-                return 8usize
-                    .checked_add(base_len)
-                    .ok_or_else(|| Error::InvalidFormat("vlen datatype size overflow".into()));
-            }
-            if data.len() < 12 {
-                return Err(Error::InvalidFormat(
-                    "variable-length datatype metadata is truncated".into(),
-                ));
-            }
-            let base_len = datatype_encoded_len(&data[12..])?;
-            return 12usize
-                .checked_add(base_len)
-                .ok_or_else(|| Error::InvalidFormat("vlen datatype size overflow".into()));
-        }
-        DatatypeClass::Array => {
-            if data.len() < 9 {
-                return Err(Error::InvalidFormat(
-                    "array datatype properties are truncated".into(),
-                ));
-            }
-            let ndims = data[8] as usize;
-            let mut p = if version >= 4 { 9usize } else { 12usize };
-            if p > data.len() {
-                return Err(Error::InvalidFormat(
-                    "array datatype header is truncated".into(),
-                ));
-            }
-            p = p
-                .checked_add(ndims.checked_mul(4).ok_or_else(|| {
-                    Error::InvalidFormat("array datatype dimension table overflow".into())
-                })?)
-                .ok_or_else(|| {
-                    Error::InvalidFormat("array datatype dimension table overflow".into())
-                })?;
-            if p > data.len() {
-                return Err(Error::InvalidFormat(
-                    "array datatype dimension table is truncated".into(),
-                ));
-            }
-            let base_len = datatype_encoded_len(&data[p..])?;
-            p = p
-                .checked_add(base_len)
-                .ok_or_else(|| Error::InvalidFormat("array datatype size overflow".into()))?;
-            if p > data.len() {
-                return Err(Error::InvalidFormat(
-                    "array datatype base datatype is truncated".into(),
-                ));
-            }
-            return Ok(p);
-        }
+        DatatypeClass::Opaque => datatype_opaque_prop_len(data)?,
+        DatatypeClass::Enum => return datatype_enum_encoded_len(data, version, class_bits),
+        DatatypeClass::Compound => return datatype_compound_encoded_len(data, version, size),
+        DatatypeClass::VarLen => return datatype_vlen_encoded_len(data),
+        DatatypeClass::Array => return datatype_array_encoded_len(data, version),
     };
 
     let len = 8 + prop_len;
@@ -906,6 +798,182 @@ fn datatype_encoded_len(data: &[u8]) -> Result<usize> {
         return Err(Error::InvalidFormat("datatype size overflow".into()));
     }
     Ok(len)
+}
+
+fn datatype_opaque_prop_len(data: &[u8]) -> Result<usize> {
+    data[8..].iter().position(|&b| b == 0).map_or_else(
+        || {
+            Err(Error::InvalidFormat(
+                "opaque datatype tag is not terminated".into(),
+            ))
+        },
+        |n| Ok(n + 1),
+    )
+}
+
+fn datatype_enum_encoded_len(data: &[u8], version: u8, class_bits: [u8; 3]) -> Result<usize> {
+    let base_len = datatype_encoded_len(&data[8..])?;
+    let base = DatatypeMessage::decode(&data[8..8 + base_len])?;
+    let nmembers = class_bits[0] as usize | ((class_bits[1] as usize) << 8);
+    let mut p = 8 + base_len;
+
+    for _ in 0..nmembers {
+        p = datatype_advance_enum_member_name(data, p, version)?;
+    }
+
+    p = p
+        .checked_add(nmembers.checked_mul(base.size as usize).ok_or_else(|| {
+            Error::InvalidFormat("enum datatype member value size overflow".into())
+        })?)
+        .ok_or_else(|| Error::InvalidFormat("enum datatype size overflow".into()))?;
+    if p > data.len() {
+        return Err(Error::InvalidFormat(
+            "enum datatype member value is truncated".into(),
+        ));
+    }
+    Ok(p)
+}
+
+fn datatype_advance_enum_member_name(data: &[u8], pos: usize, version: u8) -> Result<usize> {
+    if pos >= data.len() {
+        return Err(Error::InvalidFormat(
+            "enum datatype member name is truncated".into(),
+        ));
+    }
+    let name_len = data[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+        Error::InvalidFormat("enum datatype member name is not terminated".into())
+    })? + 1;
+    if name_len == 1 {
+        return Err(Error::InvalidFormat(
+            "enum datatype member name must not be empty".into(),
+        ));
+    }
+    let next = pos
+        + if version < 3 {
+            (name_len + 7) & !7
+        } else {
+            name_len
+        };
+    if next > data.len() {
+        return Err(Error::InvalidFormat(
+            "enum datatype member name padding is truncated".into(),
+        ));
+    }
+    Ok(next)
+}
+
+fn datatype_compound_encoded_len(data: &[u8], version: u8, size: usize) -> Result<usize> {
+    let msg = DatatypeMessage::decode(data)?;
+    let nmembers = msg
+        .compound_nmembers()
+        .ok_or_else(|| Error::InvalidFormat("not a compound datatype".into()))?
+        as usize;
+    if nmembers == 0 {
+        return Err(Error::InvalidFormat(
+            "invalid number of compound datatype members: 0".into(),
+        ));
+    }
+    let mut p = 8;
+
+    for _ in 0..nmembers {
+        p = datatype_advance_compound_member(data, p, version, size)?;
+    }
+    if p > data.len() {
+        return Err(Error::InvalidFormat(
+            "compound datatype member datatype is truncated".into(),
+        ));
+    }
+    Ok(p)
+}
+
+fn datatype_advance_compound_member(
+    data: &[u8],
+    pos: usize,
+    version: u8,
+    size: usize,
+) -> Result<usize> {
+    let name_start = pos;
+    if pos >= data.len() {
+        return Err(Error::InvalidFormat(
+            "compound datatype member name is truncated".into(),
+        ));
+    }
+    let name_len = data[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+        Error::InvalidFormat("compound datatype member name is not terminated".into())
+    })? + 1;
+    let mut next = if version < 3 {
+        name_start + ((name_len + 7) & !7)
+    } else {
+        pos + name_len
+    };
+    next = next
+        .checked_add(compound_member_offset_size(version, size))
+        .ok_or_else(|| Error::InvalidFormat("compound datatype size overflow".into()))?;
+    if version == 1 {
+        next = next
+            .checked_add(28)
+            .ok_or_else(|| Error::InvalidFormat("compound datatype size overflow".into()))?;
+    }
+    if next > data.len() {
+        return Err(Error::InvalidFormat(
+            "compound datatype member metadata is truncated".into(),
+        ));
+    }
+    let member_len = datatype_encoded_len(&data[next..])?;
+    next.checked_add(member_len)
+        .ok_or_else(|| Error::InvalidFormat("compound datatype size overflow".into()))
+}
+
+fn datatype_vlen_encoded_len(data: &[u8]) -> Result<usize> {
+    if let Ok(base_len) = datatype_encoded_len(&data[8..]) {
+        return 8usize
+            .checked_add(base_len)
+            .ok_or_else(|| Error::InvalidFormat("vlen datatype size overflow".into()));
+    }
+    if data.len() < 12 {
+        return Err(Error::InvalidFormat(
+            "variable-length datatype metadata is truncated".into(),
+        ));
+    }
+    let base_len = datatype_encoded_len(&data[12..])?;
+    12usize
+        .checked_add(base_len)
+        .ok_or_else(|| Error::InvalidFormat("vlen datatype size overflow".into()))
+}
+
+fn datatype_array_encoded_len(data: &[u8], version: u8) -> Result<usize> {
+    if data.len() < 9 {
+        return Err(Error::InvalidFormat(
+            "array datatype properties are truncated".into(),
+        ));
+    }
+    let ndims = data[8] as usize;
+    let mut p = if version >= 4 { 9usize } else { 12usize };
+    if p > data.len() {
+        return Err(Error::InvalidFormat(
+            "array datatype header is truncated".into(),
+        ));
+    }
+    p = p
+        .checked_add(ndims.checked_mul(4).ok_or_else(|| {
+            Error::InvalidFormat("array datatype dimension table overflow".into())
+        })?)
+        .ok_or_else(|| Error::InvalidFormat("array datatype dimension table overflow".into()))?;
+    if p > data.len() {
+        return Err(Error::InvalidFormat(
+            "array datatype dimension table is truncated".into(),
+        ));
+    }
+    let base_len = datatype_encoded_len(&data[p..])?;
+    p = p
+        .checked_add(base_len)
+        .ok_or_else(|| Error::InvalidFormat("array datatype size overflow".into()))?;
+    if p > data.len() {
+        return Err(Error::InvalidFormat(
+            "array datatype base datatype is truncated".into(),
+        ));
+    }
+    Ok(p)
 }
 
 fn compound_member_offset_size(version: u8, compound_size: usize) -> usize {
