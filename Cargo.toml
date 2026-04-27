@@ -13,12 +13,12 @@ include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/examples/**/*", "/Car
 
 [dependencies]
 bitflags = "2.4"
-flate2 = "1.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1.4"
 parking_lot = "0.12"
 ndarray = "0.15"
 hdf5-pure-rust-derive = { version = "0.3", path = "derive", optional = true }
-blosc2-pure-rs = { version = "0.3", optional = true }
+blosc2-pure-rs = { version = "0.2.1", optional = true }
 tracehash = { package = "tracehash-rs", version = "0.1", optional = true }
 
 [features]
@@ -30,11 +30,6 @@ tracehash = ["dep:tracehash"]
 [[bench]]
 name = "benchmark"
 harness = false
-
-[[bin]]
-name = "tracehash_corpus"
-path = "src/bin/tracehash_corpus.rs"
-required-features = ["tracehash"]
 
 [dev-dependencies]
 criterion = "0.5"

@@ -6,9 +6,9 @@ before committing the HDF5 faithfulness work.
 ## Keep
 
 - `TODO.md`: tracks completed audit items and remaining compatibility work.
-- `analysis/`: documents unsupported features, tracehash parity work, and this
+- `analysis/`: documents unsupported features, retired tracehash parity work, and this
   audit.
-- `scripts/`: contains tracehash runners and C-library fixture generation.
+- `scripts/`: contains C-library fixture generation and local utility scripts.
 - `tools/tracehash/`: optional local checkout of the
   [`tracehash-rs`](https://crates.io/crates/tracehash-rs) crate, gitignored.
   The Rust-side `tracehash` feature pulls the library from crates.io; this

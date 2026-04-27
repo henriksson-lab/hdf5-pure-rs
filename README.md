@@ -121,16 +121,49 @@ let x_vals: Vec<f64> = ds.read_field::<f64>("x")?;
 
 ## Benchmark
 
-1M f64 elements, chunked (50K), deflate level 1:
+These numbers are for local development only. They are intended to guide
+translation work and performance regressions, not to make broad claims about
+general HDF5 performance.
 
-| Operation | h5py/C (v1.14.5) | hdf5-pure-rust | Speedup |
-|-----------|------------------:|---------------:|--------:|
-| Write     | 68.7 ms           | 42.4 ms        | 1.6x    |
-| Read      | 17.3 ms           | 20.4 ms        | 0.85x   |
+Current local read baselines after the recent chunked-read optimizations:
 
-Write is faster due to less overhead (no C FFI, no HDF5 metadata cache management). Read is slightly slower due to the pure-Rust deflate implementation vs C zlib.
+1. Large 1D `f64` dataset, `32,000,000` elements, chunked `(1,000,000)`,
+   gzip/deflate level `1`, no shuffle:
 
-**These benchmarks must be taken with a huge grain of salt. HDF5 is a large complex library with many features, so these benchmarks are primarily intentended to guide further development and track regression**
+| Reader | Average Read Time | Best Read Time |
+|--------|------------------:|---------------:|
+| h5py/libhdf5 | 275.8 ms | 268.5 ms |
+| hdf5-pure-rust | 338.2 ms | 326.1 ms |
+
+The remaining gap on this workload is now mostly in the deflate backend rather
+than in the HDF5 chunk-copy path. Profiling currently shows
+`zlib_rs::inflate::inflate_fast_help_avx2` as the largest single hot symbol.
+
+2. Large 1D `f64` dataset, `16,000,000` elements, chunked `(1,000,000)`,
+   gzip/deflate level `1`, shuffle enabled:
+
+| Reader | Average Read Time | Best Read Time |
+|--------|------------------:|---------------:|
+| h5py/libhdf5 | 172.6 ms | 167.0 ms |
+| hdf5-pure-rust | 166.4 ms | 160.6 ms |
+
+This second case improved substantially after specializing the shuffle reversal
+path for common numeric element sizes and routing full 1D chunk reads directly
+into the final output buffer.
+
+For reproducible local timing, use:
+
+```bash
+scripts/run-read-benchmark.sh
+```
+
+For arbitrary fixture datasets by name, use the benchmark example directly:
+
+```bash
+cargo run --release --example perf_compare -- bench-read-raw tests/data/hdf5_ref/v4_extensible_array_spillover.h5 extensible_array_spillover 3
+```
+
+**These benchmarks must be taken with a huge grain of salt. HDF5 is a large, complex library with many features, so these measurements are primarily intended to guide further development and track regressions.**
 
 ## Derive Macro
 
@@ -153,7 +186,7 @@ struct Measurement {
 |---------|---------|-------------|
 | `derive` | yes | `#[derive(H5Type)]` proc macro |
 | `blosc`  | no  | Blosc decompression via [`blosc2-pure-rs`](https://crates.io/crates/blosc2-pure-rs). Manually verified with `cargo test --features blosc blosc`. |
-| `tracehash` | no | Local development probes for Rust-vs-HDF5-C parity tracing. Pulls [`tracehash-rs`](https://crates.io/crates/tracehash-rs) from crates.io. The C-side helpers (`tracehash_c.c`, `tracehash_c.h`) used by a patched libhdf5 build live under `tools/tracehash/c/` and are shipped alongside the crate. Not needed for normal builds. See `analysis/tracehash_divergence.md`. |
+| `tracehash` | no | Internal trace probe hooks for local debugging. The old Rust-vs-HDF5-C corpus runner has been retired because it no longer matched the current crate surface. Not needed for normal builds. |
 
 ## Test Suite
 

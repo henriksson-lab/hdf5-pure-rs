@@ -4,8 +4,6 @@ pub mod filters;
 pub mod format;
 pub mod hl;
 pub mod io;
-#[cfg(feature = "tracehash")]
-pub mod tracehash_corpus;
 
 pub use error::{Error, Result};
 pub use hl::attribute::Attribute;

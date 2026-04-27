@@ -61,6 +61,14 @@ pub struct DatasetSpec<'a> {
     pub data: &'a [u8],
 }
 
+#[derive(Debug, Clone)]
+struct ChunkBTreeEntry {
+    coords: Vec<u64>,
+    chunk_size: u32,
+    filter_mask: u32,
+    child_addr: u64,
+}
+
 /// Describes the dataset fill-value message to write.
 #[derive(Debug, Clone, Copy)]
 pub struct FillValueSpec<'a> {
@@ -1338,74 +1346,124 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         ndims: usize,
         element_size: u32,
     ) -> Result<u64> {
-        let sa = self.sizeof_addr as usize;
-        let nchunks = chunks.len();
+        let entries: Vec<ChunkBTreeEntry> = chunks
+            .iter()
+            .map(|(coords, addr, compressed_size)| ChunkBTreeEntry {
+                coords: coords.clone(),
+                chunk_size: *compressed_size,
+                filter_mask: 0,
+                child_addr: *addr,
+            })
+            .collect();
+        self.write_chunk_btree_entries_v1(&entries, ndims, element_size)
+    }
 
-        // Key = chunk_size(4) + filter_mask(4) + (ndims+1)*8
+    fn write_chunk_btree_entries_v1(
+        &mut self,
+        entries: &[ChunkBTreeEntry],
+        ndims: usize,
+        element_size: u32,
+    ) -> Result<u64> {
+        let node_size = Self::chunk_btree_node_size(ndims, self.sizeof_addr as usize);
+        let root_addr = self.allocator.allocate(node_size as u64, 8);
+        let final_coords = entries[entries.len() - 1].coords.clone();
+
+        if entries.len() <= 64 {
+            let leaf =
+                self.encode_chunk_btree_node_v1(0, entries, &final_coords, ndims, element_size)?;
+            self.write_at(root_addr, &leaf)?;
+            return Ok(root_addr);
+        }
+
+        let leaf_count = entries.len().div_ceil(64);
+        if leaf_count > 64 {
+            return Err(Error::Unsupported(
+                "writer chunk B-tree currently supports at most a two-level root".into(),
+            ));
+        }
+
+        let mut root_entries = Vec::with_capacity(leaf_count);
+        for leaf_entries in entries.chunks(64) {
+            let leaf_addr = self.allocator.allocate(node_size as u64, 8);
+            let leaf_final_coords = leaf_entries[leaf_entries.len() - 1].coords.clone();
+            let leaf = self.encode_chunk_btree_node_v1(
+                0,
+                leaf_entries,
+                &leaf_final_coords,
+                ndims,
+                element_size,
+            )?;
+            self.write_at(leaf_addr, &leaf)?;
+            root_entries.push(ChunkBTreeEntry {
+                coords: leaf_entries[0].coords.clone(),
+                chunk_size: leaf_entries[0].chunk_size,
+                filter_mask: leaf_entries[0].filter_mask,
+                child_addr: leaf_addr,
+            });
+        }
+
+        let root =
+            self.encode_chunk_btree_node_v1(1, &root_entries, &final_coords, ndims, element_size)?;
+        self.write_at(root_addr, &root)?;
+        Ok(root_addr)
+    }
+
+    fn chunk_btree_node_size(ndims: usize, sizeof_addr: usize) -> usize {
         let key_size = 4 + 4 + (ndims + 1) * 8;
+        let max_entries = 64usize;
+        let header_size = 4 + 1 + 1 + 2 + sizeof_addr * 2;
+        header_size + (max_entries + 1) * key_size + max_entries * sizeof_addr
+    }
 
-        // The C library allocates B-tree node read buffer based on max capacity (2*K+1 keys, 2*K children).
-        // Default chunk btree K = 32, so max entries = 64.
-        // Max node size = header(4+1+1+2+sa*2) + (2K+1)*key_size + (2K)*sa
-        let btree_k: usize = 32; // HDF5_BTREE_CHUNK_IK_DEF
-        let max_entries = 2 * btree_k;
-        let header_size = 4 + 1 + 1 + 2 + sa * 2;
-        let max_node_size = header_size + (max_entries + 1) * key_size + max_entries * sa;
+    fn encode_chunk_btree_node_v1(
+        &self,
+        level: u8,
+        entries: &[ChunkBTreeEntry],
+        final_coords: &[u64],
+        ndims: usize,
+        element_size: u32,
+    ) -> Result<Vec<u8>> {
+        if entries.is_empty() {
+            return Err(Error::InvalidFormat(
+                "cannot write empty chunk B-tree node".into(),
+            ));
+        }
+        if entries.len() > 64 {
+            return Err(Error::InvalidFormat(
+                "chunk B-tree node entry count exceeds v1 node capacity".into(),
+            ));
+        }
 
-        let mut buf = Vec::with_capacity(max_node_size);
-
-        // Magic
-        buf.extend_from_slice(b"TREE");
-        // Type = 1 (raw data chunks)
-        buf.push(1);
-        // Level = 0 (leaf)
-        buf.push(0);
-        // Number of entries
-        buf.extend_from_slice(&(nchunks as u16).to_le_bytes());
-        // Left sibling = UNDEF
+        let sa = self.sizeof_addr as usize;
+        let node_size = Self::chunk_btree_node_size(ndims, sa);
+        let mut buf = Vec::with_capacity(node_size);
         let undef = UNDEF_ADDR.to_le_bytes();
+
+        buf.extend_from_slice(b"TREE");
+        buf.push(1);
+        buf.push(level);
+        buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
         buf.extend_from_slice(&undef[..sa]);
-        // Right sibling = UNDEF
         buf.extend_from_slice(&undef[..sa]);
 
-        // Entries: key + child alternating
-        for (coords, addr, compressed_size) in chunks {
-            // Key: chunk_size(4) + filter_mask(4) + coords(ndims*8) + extra_dim(8)
-            buf.extend_from_slice(&compressed_size.to_le_bytes());
-            buf.extend_from_slice(&0u32.to_le_bytes()); // filter_mask = 0 (all filters applied)
-            for &c in coords {
-                buf.extend_from_slice(&c.to_le_bytes());
+        for entry in entries {
+            buf.extend_from_slice(&entry.chunk_size.to_le_bytes());
+            buf.extend_from_slice(&entry.filter_mask.to_le_bytes());
+            for &coord in &entry.coords {
+                buf.extend_from_slice(&coord.to_le_bytes());
             }
-            buf.extend_from_slice(&0u64.to_le_bytes()); // extra dimension = 0
-
-            // Child: chunk address
-            let addr_bytes = addr.to_le_bytes();
-            buf.extend_from_slice(&addr_bytes[..sa]);
+            buf.extend_from_slice(&0u64.to_le_bytes());
+            buf.extend_from_slice(&entry.child_addr.to_le_bytes()[..sa]);
         }
 
-        // Final key (sentinel)
-        buf.extend_from_slice(&0u32.to_le_bytes()); // chunk_size = 0
-        buf.extend_from_slice(&0u32.to_le_bytes()); // filter_mask = 0
-                                                    // Final coords = last chunk's coords (or data shape end)
-        if let Some((last_coords, _, _)) = chunks.last() {
-            for &c in last_coords {
-                buf.extend_from_slice(&c.to_le_bytes());
-            }
-        } else {
-            for _ in 0..ndims {
-                buf.extend_from_slice(&0u64.to_le_bytes());
-            }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for &coord in final_coords {
+            buf.extend_from_slice(&coord.to_le_bytes());
         }
-        // Extra dim for final key = element size (required by C library)
         buf.extend_from_slice(&(element_size as u64).to_le_bytes());
-
-        // Pad to max node size so the C library can read the full expected buffer
-        buf.resize(max_node_size, 0);
-
-        let btree_addr = self.allocator.allocate(buf.len() as u64, 8);
-        self.write_at(btree_addr, &buf)?;
-
-        Ok(btree_addr)
+        buf.resize(node_size, 0);
+        Ok(buf)
     }
 
     fn write_dense_link_storage(&mut self, links: &[(String, u64)]) -> Result<(u64, u64)> {

@@ -30,7 +30,7 @@ an open TODO entry for a dedicated fixture or exact error assertion.
 | ScaleOffset | Supported for datatype-aware integer and decimal floating-point set-local parameters used by current fixtures. | `test_scaleoffset_filter_i32_read`, `test_scaleoffset_filter_f32_read`; coverage gap for minbits, signed values, zero minbits, all scale types, and malformed parameter fixtures. |
 | Per-chunk filter masks | Supported for skipped filters in tested filtered chunk layouts. | `test_filtered_chunk_mask_skips_unapplied_filters`, `test_filtered_single_chunk_mask_skips_unapplied_filters`; coverage gap for middle-filter skips in multi-filter pipelines. |
 | SZip | Intentionally unsupported unless a pure-Rust decoder is added. | `test_unsupported_filters_fail_explicitly`; coverage gap for a real SZip fixture and exact high-level error surface. |
-| Unknown filters | Required unknown filters return `Unsupported`. Unknown optional filters are skipped during read-side pipeline application, matching libhdf5's optional-filter behavior when the filter is unavailable. | `test_unsupported_filters_fail_explicitly`, `test_branchable_error_messages_are_stable`, `masked_unknown_optional_filter_is_skipped`, `unmasked_unknown_optional_filter_fails` |
+| Unknown filters | Unknown filters return `Unsupported` when the stored chunk filter mask says they were applied. Filters skipped by the per-chunk mask are ignored. | `test_unsupported_filters_fail_explicitly`, `test_branchable_error_messages_are_stable`, `masked_unknown_optional_filter_is_skipped`, `unmasked_unknown_optional_filter_fails` |
 | Malformed filter pipelines | Truncated payloads, too many filters, invalid masks, and datatype-aware filters with missing parameters fail explicitly. | `test_datatype_aware_filters_reject_missing_parameters`, `test_filter_pipeline_rejects_out_of_range_filter_mask`, `test_filter_pipeline_rejects_more_than_32_filters`, `test_filter_pipeline_rejects_truncated_decode_payloads` |
 
 ## Datatypes And Conversion
@@ -76,22 +76,7 @@ translation holes in the current crate scope.
 
 ## Tracehash Parity Boundary
 
-The supported tracehash corpus is intentionally read-side focused. Rust-side
-probes cover datatype property parsing, dataspace and selection decode, fill
-values, chunk lookup, filter application, fractal-heap reads, global-heap
-dereference, variable-length string reads, external-link target decode, and
-same-file VDS source resolution. The vendored HDF5 tree has matching probes and
-a public-API corpus driver.
-
-The current default local comparison matches exactly:
-
-- Rust output: `/tmp/rust.tsv`
-- Patched HDF5 C output: `/tmp/c.tsv`
-- Result: 22839 matched rows, with no count differences, missing inputs, or
-  matched-output divergences.
-
-Focused probes for external-link target decode and same-file VDS source
-resolution also match, but those fixtures remain outside the default tracehash
-corpus to avoid conflating supported metadata decode with unsupported
-link-traversal and full VDS source-file read behavior. See
-`analysis/tracehash_divergence_report.md`.
+The old tracehash corpus workflow has been retired because its patched C
+harness and Rust corpus walker no longer matched the current crate surface.
+The remaining `tracehash` Cargo feature is a local-debug probe hook only, not a
+supported compatibility claim. See `analysis/tracehash_divergence_report.md`.

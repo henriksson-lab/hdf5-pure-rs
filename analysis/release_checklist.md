@@ -4,7 +4,7 @@
 - Record the HDF5 C source revision in `hdf5-source.json`.
 - Run the default test matrix locally: `cargo test --workspace`.
 - Run feature checks used by CI: `--no-default-features`, `--features derive`, `--features blosc`, and `--features tracehash`.
-- Run tracehash comparison scripts and refresh `analysis/tracehash_divergence.md` if expected output changes.
+- Do not rely on the retired tracehash corpus workflow for release validation; use fixture tests and documented unsupported-feature coverage instead.
 - Run `cargo check --examples` and `cargo check --benches`.
 - Update README feature notes and avoid hard-coding the total test count.
 - Review `analysis/compatibility_matrix.md` for any newly supported or removed behavior.

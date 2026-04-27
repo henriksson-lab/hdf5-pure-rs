@@ -1166,7 +1166,7 @@ fn test_branchable_error_messages_are_stable() {
         other => panic!("expected Unsupported, got {other:?}"),
     }
 
-    let out = hdf5_pure_rust::filters::apply_pipeline_reverse(
+    let err = hdf5_pure_rust::filters::apply_pipeline_reverse(
         &[1, 2, 3, 4],
         &FilterPipelineMessage {
             version: 2,
@@ -1179,8 +1179,8 @@ fn test_branchable_error_messages_are_stable() {
         },
         4,
     )
-    .expect("unknown optional filter should be skipped");
-    assert_eq!(out, vec![1, 2, 3, 4]);
+    .expect_err("unknown optional filter should fail on read when not masked out");
+    assert!(matches!(err, hdf5_pure_rust::Error::Unsupported(_)));
 
     let err = hdf5_pure_rust::filters::apply_pipeline_reverse_with_mask(
         &[1, 2, 3, 4],

@@ -279,6 +279,46 @@ fn t10d_shuffle_deflate() {
     }
 }
 
+#[test]
+fn t10d_many_chunk_deflate_two_level_btree() {
+    let (_dir, p) = tmp("many_chunk_deflate_two_level_btree");
+    let data: Vec<i32> = (0..5000).collect();
+    {
+        let mut wf = WritableFile::create(&p).unwrap();
+        wf.new_dataset_builder("d")
+            .shape(&[data.len() as u64])
+            .chunk(&[50])
+            .deflate(1)
+            .write::<i32>(&data)
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&p).unwrap();
+    let vals: Vec<i32> = f.dataset("d").unwrap().read::<i32>().unwrap();
+    assert_eq!(vals, data);
+
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import h5py; f=h5py.File('{}','r'); \
+             x=f['d'][:]; \
+             assert len(x)==5000; \
+             assert int(x[0])==0 and int(x[-1])==4999; \
+             print('OK'); f.close()",
+            p.display()
+        ))
+        .output();
+    if let Ok(out) = out {
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("OK"),
+            "h5py: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 // T10e: Attribute write round-trip
 
 #[test]

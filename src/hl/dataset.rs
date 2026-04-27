@@ -850,7 +850,12 @@ impl Dataset {
                 }
 
                 guard.reader.seek(addr)?;
-                let data = guard.reader.read_bytes(size)?;
+                if size < total_bytes {
+                    return Err(Error::InvalidFormat(format!(
+                        "contiguous dataset data size {size} is smaller than expected {total_bytes}"
+                    )));
+                }
+                let data = guard.reader.read_bytes(total_bytes)?;
                 Ok(data)
             }
             LayoutClass::Chunked => Self::read_chunked(&mut guard.reader, &info, total_bytes),
@@ -1280,14 +1285,32 @@ impl Dataset {
         chunk_ctx: &ChunkReadContext<'_>,
     ) -> Result<Vec<u8>> {
         let ndims = chunk_ctx.data_dims.len();
-        let mut output = Self::filled_data(
-            chunk_ctx.total_bytes / chunk_ctx.element_size,
-            chunk_ctx.element_size,
-            info,
-        )?;
         let chunk_records = Self::collect_btree_v1_chunks(reader, chunk_ctx.idx_addr, ndims)?;
+        let mut output = if Self::has_full_chunk_coverage_1d(&chunk_records, chunk_ctx)? {
+            Self::uninitialized_output(chunk_ctx.total_bytes)
+        } else {
+            Self::filled_data(
+                chunk_ctx.total_bytes / chunk_ctx.element_size,
+                chunk_ctx.element_size,
+                info,
+            )?
+        };
+        let mut compressed_scratch = Vec::new();
 
         for chunk_record in &chunk_records {
+            if Self::try_read_full_chunk_1d_into_output(
+                reader,
+                info,
+                chunk_ctx,
+                &chunk_record.coords,
+                chunk_record.chunk_addr,
+                usize_from_u64(chunk_record.chunk_size, "v1 B-tree chunk size")?,
+                chunk_record.filter_mask,
+                &mut output,
+                &mut compressed_scratch,
+            )? {
+                continue;
+            }
             Self::process_btree_v1_chunk_record(
                 reader,
                 chunk_ctx.idx_addr,
@@ -1302,6 +1325,88 @@ impl Dataset {
         }
 
         Ok(output)
+    }
+
+    fn has_full_chunk_coverage_1d(
+        chunk_records: &[ChunkBTreeRecord],
+        chunk_ctx: &ChunkReadContext<'_>,
+    ) -> Result<bool> {
+        if chunk_ctx.data_dims.len() != 1 || chunk_ctx.chunk_dims.len() != 1 {
+            return Ok(false);
+        }
+
+        let data_size = usize_from_u64(chunk_ctx.data_dims[0], "dataset dimension")?;
+        let chunk_size = usize_from_u64(chunk_ctx.chunk_dims[0], "chunk dimension")?;
+        if chunk_size == 0 {
+            return Ok(false);
+        }
+        let expected_chunks = data_size.div_ceil(chunk_size);
+        if chunk_records.len() != expected_chunks {
+            return Ok(false);
+        }
+
+        for (index, record) in chunk_records.iter().enumerate() {
+            if record.coords.len() != 1 {
+                return Ok(false);
+            }
+            let expected_start = index
+                .checked_mul(chunk_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+            if usize_from_u64(record.coords[0], "chunk coordinate")? != expected_start {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn can_skip_chunk_prefill_for_implicit_1d(
+        chunk_ctx: &ChunkReadContext<'_>,
+    ) -> Result<bool> {
+        Ok(Self::expected_chunk_count_1d(chunk_ctx)?.is_some())
+    }
+
+    fn has_full_linear_chunk_coverage_1d<'a, I>(
+        elements: I,
+        chunk_ctx: &ChunkReadContext<'_>,
+    ) -> Result<bool>
+    where
+        I: IntoIterator<Item = &'a crate::format::fixed_array::FixedArrayElement>,
+    {
+        let Some(expected_chunks) = Self::expected_chunk_count_1d(chunk_ctx)? else {
+            return Ok(false);
+        };
+        let mut count = 0usize;
+        for element in elements {
+            if crate::io::reader::is_undef_addr(element.addr) {
+                return Ok(false);
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
+        }
+        Ok(count == expected_chunks)
+    }
+
+    fn expected_chunk_count_1d(chunk_ctx: &ChunkReadContext<'_>) -> Result<Option<usize>> {
+        if chunk_ctx.data_dims.len() != 1 || chunk_ctx.chunk_dims.len() != 1 {
+            return Ok(None);
+        }
+        let data_size = usize_from_u64(chunk_ctx.data_dims[0], "dataset dimension")?;
+        let chunk_size = usize_from_u64(chunk_ctx.chunk_dims[0], "chunk dimension")?;
+        if chunk_size == 0 {
+            return Ok(None);
+        }
+        Ok(Some(data_size.div_ceil(chunk_size)))
+    }
+
+    fn uninitialized_output(total_bytes: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(total_bytes);
+        // Safe because callers only use this helper when they can prove that
+        // every byte in the buffer is written before the Vec is observed.
+        unsafe {
+            out.set_len(total_bytes);
+        }
+        out
     }
 
     fn read_virtual_dataset(
@@ -2232,11 +2337,16 @@ impl Dataset {
             .try_fold(1usize, |acc, &count| acc.checked_mul(count))
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
 
-        let mut output = Self::filled_data(
-            chunk_ctx.total_bytes / chunk_ctx.element_size,
-            chunk_ctx.element_size,
-            info,
-        )?;
+        let mut output = if Self::can_skip_chunk_prefill_for_implicit_1d(chunk_ctx)? {
+            Self::uninitialized_output(chunk_ctx.total_bytes)
+        } else {
+            Self::filled_data(
+                chunk_ctx.total_bytes / chunk_ctx.element_size,
+                chunk_ctx.element_size,
+                info,
+            )?
+        };
+        let mut compressed_scratch = Vec::new();
         for chunk_index in 0..total_chunks {
             let coords =
                 Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim);
@@ -2244,6 +2354,19 @@ impl Dataset {
                 .checked_mul(chunk_ctx.chunk_bytes as u64)
                 .and_then(|off| chunk_ctx.idx_addr.checked_add(off))
                 .ok_or_else(|| Error::InvalidFormat("implicit chunk address overflow".into()))?;
+            if Self::try_read_full_chunk_1d_into_output(
+                reader,
+                info,
+                chunk_ctx,
+                &coords,
+                offset,
+                chunk_ctx.chunk_bytes,
+                0,
+                &mut output,
+                &mut compressed_scratch,
+            )? {
+                continue;
+            }
             reader.seek(offset)?;
             let raw = reader.read_bytes(chunk_ctx.chunk_bytes)?;
             Self::copy_chunk_to_output(
@@ -2289,11 +2412,16 @@ impl Dataset {
             chunk_size_len,
         )?;
         let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
-        let mut output = Self::filled_data(
-            chunk_ctx.total_bytes / chunk_ctx.element_size,
-            chunk_ctx.element_size,
-            info,
-        )?;
+        let mut output = if Self::has_full_linear_chunk_coverage_1d(elements.iter(), chunk_ctx)? {
+            Self::uninitialized_output(chunk_ctx.total_bytes)
+        } else {
+            Self::filled_data(
+                chunk_ctx.total_bytes / chunk_ctx.element_size,
+                chunk_ctx.element_size,
+                info,
+            )?
+        };
+        let mut compressed_scratch = Vec::new();
 
         for (chunk_index, element) in elements.iter().enumerate() {
             Self::trace_linear_chunk_lookup(
@@ -2311,11 +2439,24 @@ impl Dataset {
 
             let coords =
                 Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim);
-            reader.seek(element.addr)?;
             let read_size = usize_from_u64(
                 element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
                 "fixed-array chunk size",
             )?;
+            if Self::try_read_full_chunk_1d_into_output(
+                reader,
+                info,
+                chunk_ctx,
+                &coords,
+                element.addr,
+                read_size,
+                element.filter_mask,
+                &mut output,
+                &mut compressed_scratch,
+            )? {
+                continue;
+            }
+            reader.seek(element.addr)?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to read fixed-array chunk {chunk_index} at address {} with size {read_size}: {err}",
@@ -2375,11 +2516,16 @@ impl Dataset {
             chunk_size_len,
         )?;
         let chunks_per_dim = Self::chunks_per_dim(chunk_ctx.data_dims, chunk_ctx.chunk_dims)?;
-        let mut output = Self::filled_data(
-            chunk_ctx.total_bytes / chunk_ctx.element_size,
-            chunk_ctx.element_size,
-            info,
-        )?;
+        let mut output = if Self::has_full_linear_chunk_coverage_1d(elements.iter(), chunk_ctx)? {
+            Self::uninitialized_output(chunk_ctx.total_bytes)
+        } else {
+            Self::filled_data(
+                chunk_ctx.total_bytes / chunk_ctx.element_size,
+                chunk_ctx.element_size,
+                info,
+            )?
+        };
+        let mut compressed_scratch = Vec::new();
 
         for (chunk_index, element) in elements.iter().enumerate() {
             Self::trace_linear_chunk_lookup(
@@ -2397,11 +2543,24 @@ impl Dataset {
 
             let coords =
                 Self::implicit_chunk_coords(chunk_index, chunk_ctx.chunk_dims, &chunks_per_dim);
-            reader.seek(element.addr)?;
             let read_size = usize_from_u64(
                 element.nbytes.unwrap_or(chunk_ctx.chunk_bytes as u64),
                 "extensible-array chunk size",
             )?;
+            if Self::try_read_full_chunk_1d_into_output(
+                reader,
+                info,
+                chunk_ctx,
+                &coords,
+                element.addr,
+                read_size,
+                element.filter_mask,
+                &mut output,
+                &mut compressed_scratch,
+            )? {
+                continue;
+            }
+            reader.seek(element.addr)?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to read extensible-array chunk {chunk_index} at address {} with size {read_size}: {err}",
@@ -2459,6 +2618,7 @@ impl Dataset {
             chunk_ctx.element_size,
             info,
         )?;
+        let mut compressed_scratch = Vec::new();
 
         for record in records {
             let (addr, nbytes, filter_mask, scaled) = Self::decode_btree_v2_chunk_record(
@@ -2483,12 +2643,25 @@ impl Dataset {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let read_size = usize_from_u64(nbytes, "v2-B-tree chunk size")?;
+            if Self::try_read_full_chunk_1d_into_output(
+                reader,
+                info,
+                chunk_ctx,
+                &coords,
+                addr,
+                read_size,
+                filter_mask,
+                &mut output,
+                &mut compressed_scratch,
+            )? {
+                continue;
+            }
             reader.seek(addr).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to seek to v2-B-tree chunk address {addr}: {err}"
                 ))
             })?;
-            let read_size = usize_from_u64(nbytes, "v2-B-tree chunk size")?;
             let mut raw = reader.read_bytes(read_size).map_err(|err| {
                 Error::InvalidFormat(format!(
                     "failed to read v2-B-tree chunk at address {addr} with size {nbytes}: {err}"
@@ -3015,6 +3188,130 @@ impl Dataset {
         Ok(())
     }
 
+    fn try_read_full_chunk_1d_into_output<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        info: &DatasetInfo,
+        chunk_ctx: &ChunkReadContext<'_>,
+        coords: &[u64],
+        addr: u64,
+        read_size: usize,
+        filter_mask: u32,
+        output: &mut [u8],
+        compressed_scratch: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let Some(dst_range) = Self::full_chunk_1d_output_range(coords, chunk_ctx, output.len())?
+        else {
+            return Ok(false);
+        };
+
+        match info.filter_pipeline.as_ref() {
+            None => {
+                if read_size != dst_range.len() {
+                    return Ok(false);
+                }
+                reader.seek(addr)?;
+                reader.read_exact(&mut output[dst_range])?;
+                Ok(true)
+            }
+            Some(pipeline) if pipeline.filters.is_empty() => {
+                if read_size != dst_range.len() {
+                    return Ok(false);
+                }
+                reader.seek(addr)?;
+                reader.read_exact(&mut output[dst_range])?;
+                Ok(true)
+            }
+            Some(pipeline) if Self::is_deflate_only_pipeline(pipeline) && filter_mask == 0 => {
+                Self::read_chunk_into_scratch(reader, addr, read_size, compressed_scratch)?;
+                crate::filters::deflate::decompress_exact_into(
+                    compressed_scratch,
+                    &mut output[dst_range],
+                )?;
+                Ok(true)
+            }
+            Some(pipeline)
+                if Self::is_shuffle_deflate_pipeline(pipeline) && filter_mask == 0 =>
+            {
+                Self::read_chunk_into_scratch(reader, addr, read_size, compressed_scratch)?;
+                let mut shuffled = crate::filters::deflate::decompress_exact(
+                    compressed_scratch,
+                    dst_range.len(),
+                )?;
+                crate::filters::shuffle::unshuffle_into(
+                    &shuffled,
+                    chunk_ctx.element_size,
+                    &mut output[dst_range],
+                )?;
+                shuffled.clear();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn read_chunk_into_scratch<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        read_size: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<()> {
+        reader.seek(addr)?;
+        scratch.resize(read_size, 0);
+        reader.read_exact(scratch)?;
+        Ok(())
+    }
+
+    fn full_chunk_1d_output_range(
+        coords: &[u64],
+        chunk_ctx: &ChunkReadContext<'_>,
+        output_len: usize,
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        if chunk_ctx.data_dims.len() != 1 || chunk_ctx.chunk_dims.len() != 1 || coords.len() != 1 {
+            return Ok(None);
+        }
+
+        let start = usize_from_u64(coords[0], "chunk coordinate")?;
+        let chunk_size = usize_from_u64(chunk_ctx.chunk_dims[0], "chunk dimension")?;
+        let data_size = usize_from_u64(chunk_ctx.data_dims[0], "dataset dimension")?;
+        if start >= data_size {
+            return Ok(None);
+        }
+        let end = start
+            .checked_add(chunk_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+        if end > data_size {
+            return Ok(None);
+        }
+
+        let dst_offset = start
+            .checked_mul(chunk_ctx.element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk copy offset overflow".into()))?;
+        let dst_len = chunk_size
+            .checked_mul(chunk_ctx.element_size)
+            .ok_or_else(|| Error::InvalidFormat("chunk copy size overflow".into()))?;
+        let dst_end = dst_offset
+            .checked_add(dst_len)
+            .ok_or_else(|| Error::InvalidFormat("chunk copy end overflow".into()))?;
+        if dst_end > output_len {
+            return Ok(None);
+        }
+        Ok(Some(dst_offset..dst_end))
+    }
+
+    fn is_deflate_only_pipeline(pipeline: &FilterPipelineMessage) -> bool {
+        pipeline.filters.len() == 1
+            && pipeline.filters[0].id
+                == crate::format::messages::filter_pipeline::FILTER_DEFLATE
+    }
+
+    fn is_shuffle_deflate_pipeline(pipeline: &FilterPipelineMessage) -> bool {
+        pipeline.filters.len() == 2
+            && pipeline.filters[0].id
+                == crate::format::messages::filter_pipeline::FILTER_SHUFFLE
+            && pipeline.filters[1].id
+                == crate::format::messages::filter_pipeline::FILTER_DEFLATE
+    }
+
     fn build_chunk_copy_plan(
         data_dims: &[u64],
         chunk_dims: &[u64],
@@ -3503,10 +3800,10 @@ mod tests {
         let chunks = Dataset::collect_btree_v1_chunks(&mut reader, 0, 2).unwrap();
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].0, vec![4, 8]);
-        assert_eq!(chunks[0].1, large_chunk_addr);
-        assert_eq!(chunks[0].2, 16);
-        assert_eq!(chunks[0].3, 0);
+        assert_eq!(chunks[0].coords, vec![4, 8]);
+        assert_eq!(chunks[0].chunk_addr, large_chunk_addr);
+        assert_eq!(chunks[0].chunk_size, 16);
+        assert_eq!(chunks[0].filter_mask, 0);
     }
 
     #[test]
@@ -3556,7 +3853,15 @@ mod tests {
             fill_value: None,
         };
         let mut reader = HdfReader::new(Cursor::new(Vec::<u8>::new()));
-        let err = Dataset::read_chunked_implicit(&mut reader, 0, &info, &[4], &[2], 8, 4, 16)
+        let chunk_ctx = ChunkReadContext {
+            idx_addr: 0,
+            data_dims: &[4],
+            chunk_dims: &[2],
+            chunk_bytes: 8,
+            element_size: 4,
+            total_bytes: 16,
+        };
+        let err = Dataset::read_chunked_implicit(&mut reader, &info, &chunk_ctx)
             .expect_err("filtered implicit chunk indexes should be rejected");
 
         assert!(matches!(err, Error::Unsupported(_)));

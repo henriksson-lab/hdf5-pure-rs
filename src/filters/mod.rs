@@ -93,13 +93,9 @@ fn apply_pipeline_reverse_with_mask_and_expected(
         if filter_mask & (1u32 << index) != 0 {
             continue;
         }
-        match apply_filter_reverse(&buf, filter, element_size) {
-            Ok(next) => buf = next,
-            Err(Error::Unsupported(_)) if filter.flags & 0x0001 != 0 => {
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
+        let deflate_exact_len =
+            deflate_exact_len_hint(pipeline, filter_mask, index, expected_len);
+        buf = apply_filter_reverse(&buf, filter, element_size, expected_len, deflate_exact_len)?;
     }
 
     if let Some(expected_len) = expected_len {
@@ -122,9 +118,21 @@ fn apply_pipeline_reverse_with_mask_and_expected(
     Ok(buf)
 }
 
-fn apply_filter_reverse(data: &[u8], filter: &FilterDesc, element_size: usize) -> Result<Vec<u8>> {
+fn apply_filter_reverse(
+    data: &[u8],
+    filter: &FilterDesc,
+    element_size: usize,
+    expected_len: Option<usize>,
+    deflate_exact_len: Option<usize>,
+) -> Result<Vec<u8>> {
     match filter.id {
-        FILTER_DEFLATE => deflate::decompress(data),
+        FILTER_DEFLATE => {
+            if let Some(expected_len) = deflate_exact_len {
+                deflate::decompress_exact(data, expected_len)
+            } else {
+                deflate::decompress_with_hint(data, expected_len)
+            }
+        }
         FILTER_SHUFFLE => shuffle::unshuffle(data, element_size),
         FILTER_FLETCHER32 => fletcher32::verify_and_strip(data),
         FILTER_NBIT => nbit::decompress(data, &filter.client_data),
@@ -146,6 +154,28 @@ fn apply_filter_reverse(data: &[u8], filter: &FilterDesc, element_size: usize) -
             filter.id
         ))),
     }
+}
+
+fn deflate_exact_len_hint(
+    pipeline: &FilterPipelineMessage,
+    filter_mask: u32,
+    current_index: usize,
+    expected_len: Option<usize>,
+) -> Option<usize> {
+    let expected_len = expected_len?;
+    if pipeline.filters[current_index].id != FILTER_DEFLATE {
+        return None;
+    }
+    for (index, filter) in pipeline.filters[..current_index].iter().enumerate() {
+        if filter_mask & (1u32 << index) != 0 {
+            continue;
+        }
+        let preserves_len = matches!(filter.id, FILTER_SHUFFLE | FILTER_FLETCHER32);
+        if !preserves_len {
+            return None;
+        }
+    }
+    Some(expected_len)
 }
 
 #[cfg(test)]
@@ -192,8 +222,10 @@ mod tests {
             apply_pipeline_reverse_with_mask_expected(&compressed, &deflate_pipeline(), 1, 0, 3)
                 .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("filter pipeline output length mismatch"),
+            err.to_string().contains("filter pipeline output length mismatch")
+                || err
+                    .to_string()
+                    .contains("deflate decompression produced more bytes than expected"),
             "unexpected error: {err}"
         );
     }
@@ -206,8 +238,12 @@ mod tests {
 
     #[test]
     fn unmasked_unknown_optional_filter_fails() {
-        let out = apply_pipeline_reverse_with_mask(b"abcd", &unknown_pipeline(1), 1, 0).unwrap();
-        assert_eq!(out, b"abcd");
+        let err = apply_pipeline_reverse_with_mask(b"abcd", &unknown_pipeline(1), 1, 0)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("filter 32099 not implemented"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
