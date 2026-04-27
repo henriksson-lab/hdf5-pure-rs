@@ -5,11 +5,11 @@ members = [".", "derive"]
 name = "hdf5-pure-rust"
 version = "0.3.0"
 edition = "2021"
-description = "Pure Rust implementation of the HDF5 file format. No C dependencies."
+description = "Pure Rust implementation of the HDF5 file format"
 license = "BSD-3-Clause"
 repository = "https://github.com/henriksson-lab/hdf5-pure-rs"
 homepage = "https://github.com/henriksson-lab/hdf5-pure-rs"
-include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/examples/**/*", "/Cargo.toml", "/README.md", "/LICENSE-*"]
+include = ["/src/**/*", "/derive/**/*", "/benches/**/*", "/examples/**/*", "/Cargo.toml", "/README.md", "/LICENSE", "/LICENSE-*"]
 
 [dependencies]
 bitflags = "2.4"
@@ -34,9 +34,3 @@ harness = false
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.9"
-
-# Local dev override: use the in-tree blosc2-pure-rs checkout (sibling
-# directory) instead of the crates.io build. Drop this once the local
-# changes are published.
-[patch.crates-io]
-blosc2-pure-rs = { path = "../blosc2-rs" }
