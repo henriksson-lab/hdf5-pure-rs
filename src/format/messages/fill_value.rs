@@ -52,14 +52,9 @@ impl FillValueMessage {
                     "fill value v2 missing value size".into(),
                 ));
             }
-            let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-            if data.len() < 8 + size {
-                return Err(Error::InvalidFormat(
-                    "fill value v2 value is truncated".into(),
-                ));
-            }
+            let size = read_u32_le_at(data, 4, "fill value v2 value size")? as usize;
             if size > 0 {
-                Some(data[8..8 + size].to_vec())
+                Some(checked_window(data, 8, size, "fill value v2 value")?.to_vec())
             } else {
                 None
             }
@@ -109,14 +104,9 @@ impl FillValueMessage {
                     "fill value v3 missing value size".into(),
                 ));
             }
-            let size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]) as usize;
-            if data.len() < 6 + size {
-                return Err(Error::InvalidFormat(
-                    "fill value v3 value is truncated".into(),
-                ));
-            }
+            let size = read_u32_le_at(data, 2, "fill value v3 value size")? as usize;
             if size > 0 {
-                Some(data[6..6 + size].to_vec())
+                Some(checked_window(data, 6, size, "fill value v3 value")?.to_vec())
             } else {
                 None
             }
@@ -157,12 +147,9 @@ impl FillValueMessage {
             return Err(Error::InvalidFormat("old fill value too short".into()));
         }
 
-        let size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let size = read_u32_le_at(data, 0, "old fill value size")? as usize;
         let value = if size > 0 {
-            if data.len() < 4 + size {
-                return Err(Error::InvalidFormat("old fill value is truncated".into()));
-            }
-            Some(data[4..4 + size].to_vec())
+            Some(checked_window(data, 4, size, "old fill value")?.to_vec())
         } else {
             None
         };
@@ -184,6 +171,40 @@ impl FillValueMessage {
         };
         trace_fill_value(data, 0, 2, 2, message.defined, &message.value);
         Ok(message)
+    }
+}
+
+fn checked_end(pos: usize, len: usize, context: &str) -> Result<usize> {
+    pos.checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = checked_end(pos, len, context)?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn read_u32_le_at(data: &[u8], pos: usize, context: &str) -> Result<u32> {
+    let bytes = checked_window(data, pos, 4, context)?;
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_window_rejects_offset_overflow() {
+        let err = checked_window(&[], usize::MAX, 1, "fill value test window").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fill value test window offset overflow"),
+            "unexpected error: {err}"
+        );
     }
 }
 

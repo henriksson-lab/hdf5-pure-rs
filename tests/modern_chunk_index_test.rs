@@ -27,6 +27,41 @@ fn corrupt_metadata_checksum(src: impl AsRef<Path>, magic: &[u8]) -> (tempfile::
     panic!("metadata checksum field should be discoverable");
 }
 
+fn patch_filtered_fixed_array_to_implicit(src: impl AsRef<Path>) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("filtered_implicit_chunk_index.h5");
+    let mut bytes = fs::read(src).unwrap();
+
+    // Data layout v4 chunked payload for the filtered fixed-array fixture:
+    // version=4, class=chunked, flags=0, rank=2, dim-bytes=1,
+    // chunk dims=[16, 2], index type=3 (fixed array). Rewriting the index type
+    // to 2 creates the malformed filtered implicit-index case.
+    let layout_pattern = [4u8, 2, 0, 2, 1, 16, 2, 3];
+    let layout_pos = bytes
+        .windows(layout_pattern.len())
+        .position(|window| window == layout_pattern)
+        .expect("filtered fixed-array layout should be present");
+    let index_type_pos = layout_pos + layout_pattern.len() - 1;
+
+    let ohdr_pos = bytes[..layout_pos]
+        .windows(4)
+        .rposition(|window| window == b"OHDR")
+        .expect("object header should precede layout message");
+    let checksum_search_end = (layout_pos + 512).min(bytes.len().saturating_sub(4));
+    let checksum_pos = (layout_pos..checksum_search_end)
+        .find(|&pos| {
+            let stored = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            stored == checksum_metadata(&bytes[ohdr_pos..pos])
+        })
+        .expect("object-header checksum should be discoverable");
+
+    bytes[index_type_pos] = 2;
+    let checksum = checksum_metadata(&bytes[ohdr_pos..checksum_pos]);
+    bytes[checksum_pos..checksum_pos + 4].copy_from_slice(&checksum.to_le_bytes());
+    fs::write(&dst, bytes).unwrap();
+    (dir, dst)
+}
+
 fn assert_chunk_index_checksum_error(path: &Path, dataset: &str, expected: &str) {
     let f = File::open(path).unwrap();
     let err = f
@@ -111,6 +146,23 @@ fn test_v4_filtered_fixed_array_chunks_read() {
         .read::<i16>()
         .unwrap();
     assert_eq!(vals, (0..64).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_filtered_implicit_chunk_index_fixture_is_rejected() {
+    let (_dir, path) =
+        patch_filtered_fixed_array_to_implicit("tests/data/hdf5_ref/v4_filtered_chunked.h5");
+    let f = File::open(&path).unwrap();
+    let err = f
+        .dataset("filtered_chunked")
+        .unwrap()
+        .read::<i16>()
+        .expect_err("filtered implicit chunk index should be rejected");
+    assert!(
+        err.to_string()
+            .contains("v4 implicit chunk index with filters"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

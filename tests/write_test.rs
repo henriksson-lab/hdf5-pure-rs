@@ -24,6 +24,7 @@ fn test_write_and_read_back_simple() {
             &DatasetSpec {
                 name: "mydata",
                 shape: &[5],
+                max_shape: None,
                 dtype: DtypeSpec::F64,
                 data: &data_bytes,
             },
@@ -58,6 +59,31 @@ fn test_write_and_read_back_simple() {
 }
 
 #[test]
+fn test_engine_writer_rejects_dataset_data_length_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_bad_len.h5");
+
+    let f = fs::File::create(&path).unwrap();
+    let mut w = HdfFileWriter::new(f);
+    w.begin().unwrap();
+    w.create_root_group().unwrap();
+
+    let err = w
+        .create_dataset(
+            "/",
+            &DatasetSpec {
+                name: "bad",
+                shape: &[2],
+                max_shape: None,
+                dtype: DtypeSpec::I32,
+                data: &[1, 2, 3, 4],
+            },
+        )
+        .expect_err("raw data byte length should match shape * dtype size");
+    assert!(err.to_string().contains("dataset byte length"));
+}
+
+#[test]
 fn test_write_multiple_datasets() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("written_multi.h5");
@@ -77,6 +103,7 @@ fn test_write_multiple_datasets() {
             &DatasetSpec {
                 name: "floats",
                 shape: &[3],
+                max_shape: None,
                 dtype: DtypeSpec::F64,
                 data: &f64_data,
             },
@@ -92,6 +119,7 @@ fn test_write_multiple_datasets() {
             &DatasetSpec {
                 name: "ints",
                 shape: &[4],
+                max_shape: None,
                 dtype: DtypeSpec::I32,
                 data: &i32_data,
             },
@@ -143,6 +171,7 @@ fn test_write_with_group() {
             &DatasetSpec {
                 name: "tiny",
                 shape: &[1],
+                max_shape: None,
                 dtype: DtypeSpec::U8,
                 data: &data,
             },
@@ -188,6 +217,7 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
             &DatasetSpec {
                 name: "status",
                 shape: &[3],
+                max_shape: None,
                 dtype: DtypeSpec::Enum {
                     base: Box::new(DtypeSpec::U16),
                     members: vec![
@@ -207,6 +237,7 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
             &DatasetSpec {
                 name: "opaque",
                 shape: &[2],
+                max_shape: None,
                 dtype: DtypeSpec::Opaque {
                     size: 4,
                     tag: "hdf5-pure-rust blob".to_string(),
@@ -221,6 +252,7 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
             &DatasetSpec {
                 name: "matrix_cells",
                 shape: &[2],
+                max_shape: None,
                 dtype: DtypeSpec::Array {
                     dims: vec![2, 3],
                     base: Box::new(DtypeSpec::I16),
@@ -272,6 +304,7 @@ fn test_write_enum_opaque_array_and_nested_compound_datatypes() {
             &DatasetSpec {
                 name: "nested_compound",
                 shape: &[2],
+                max_shape: None,
                 dtype: nested_compound_dtype,
                 data: &compound_data,
             },
@@ -364,6 +397,7 @@ fn test_write_readable_by_h5dump() {
             &DatasetSpec {
                 name: "data",
                 shape: &[3],
+                max_shape: None,
                 dtype: DtypeSpec::F64,
                 data: &data,
             },

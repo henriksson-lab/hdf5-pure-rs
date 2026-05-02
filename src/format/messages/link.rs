@@ -97,8 +97,9 @@ impl LinkMessage {
 
         // Link name
         ensure_available(data, pos, name_len, "link name")?;
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).to_string();
-        pos += name_len;
+        let name_end = checked_end(pos, name_len, "link name")?;
+        let name = String::from_utf8_lossy(&data[pos..name_end]).to_string();
+        advance_pos(&mut pos, name_len, "link name")?;
 
         // Link value based on type
         let mut hard_link_addr = None;
@@ -118,8 +119,9 @@ impl LinkMessage {
                 let target_len =
                     read_le_u64(data, &mut pos, 2, "soft link target length")? as usize;
                 ensure_available(data, pos, target_len, "soft link target")?;
+                let target_end = checked_end(pos, target_len, "soft link target")?;
                 soft_link_target =
-                    Some(String::from_utf8_lossy(&data[pos..pos + target_len]).to_string());
+                    Some(String::from_utf8_lossy(&data[pos..target_end]).to_string());
             }
             LinkType::External => {
                 let info_len =
@@ -130,7 +132,8 @@ impl LinkMessage {
                     ));
                 }
                 ensure_available(data, pos, info_len, "external link info")?;
-                let (filename, obj_path) = unpack_external_link_value(&data[pos..pos + info_len])?;
+                let info_end = checked_end(pos, info_len, "external link info")?;
+                let (filename, obj_path) = unpack_external_link_value(&data[pos..info_end])?;
                 trace_external_link_resolve(&filename, &obj_path);
 
                 external_link = Some((filename, obj_path));
@@ -179,7 +182,7 @@ fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Resul
 fn read_u8(data: &[u8], pos: &mut usize, context: &str) -> Result<u8> {
     ensure_available(data, *pos, 1, context)?;
     let value = data[*pos];
-    *pos += 1;
+    advance_pos(pos, 1, context)?;
     Ok(value)
 }
 
@@ -189,13 +192,29 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
             "{context} has invalid byte width {size}"
         )));
     }
-    ensure_available(data, *pos, size, context)?;
+    let bytes = checked_window(data, *pos, size, context)?;
     let mut val = 0u64;
-    for i in 0..size {
-        val |= (data[*pos + i] as u64) << (i * 8);
+    for (i, byte) in bytes.iter().enumerate() {
+        val |= u64::from(*byte) << (i * 8);
     }
-    *pos += size;
+    advance_pos(pos, size, context)?;
     Ok(val)
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = checked_end(pos, len, context)?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn checked_end(pos: usize, len: usize, context: &str) -> Result<usize> {
+    pos.checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
+}
+
+fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
+    *pos = checked_end(*pos, len, context)?;
+    Ok(())
 }
 
 fn unpack_external_link_value(data: &[u8]) -> Result<(String, String)> {
@@ -233,12 +252,17 @@ fn unpack_external_link_value(data: &[u8]) -> Result<(String, String)> {
     let filename_end = payload.iter().position(|&b| b == 0).ok_or_else(|| {
         Error::InvalidFormat("external link buffer does not contain an object path".into())
     })?;
-    if filename_end + 1 >= payload.len() {
+    let obj_start = filename_end
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("external link filename offset overflow".into()))?;
+    if obj_start >= payload.len() {
         return Err(Error::InvalidFormat(
             "external link buffer does not contain an object path".into(),
         ));
     }
-    let obj_payload = &payload[filename_end + 1..];
+    let obj_payload = payload.get(obj_start..).ok_or_else(|| {
+        Error::InvalidFormat("external link buffer does not contain an object path".into())
+    })?;
     let obj_end = obj_payload.iter().position(|&b| b == 0).ok_or_else(|| {
         Error::InvalidFormat("external link buffer does not contain an object path".into())
     })?;

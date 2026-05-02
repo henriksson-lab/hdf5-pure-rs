@@ -81,12 +81,30 @@ fn test_raw_message_inspection_apis() {
 
     let plist = ds.create_plist().unwrap();
     assert!(plist.filters.is_empty());
+    assert_eq!(plist.external_count(), 0);
+    assert!(plist.external(0).is_none());
+    assert!(plist.filter(0).is_none());
+    assert!(plist.filter_by_id(1).is_none());
+
+    let access = ds.access_plist();
+    assert_eq!(
+        access.virtual_view(),
+        hdf5_pure_rust::VdsView::LastAvailable
+    );
+    assert_eq!(access.virtual_prefix(), None);
+    assert_eq!(
+        access.virtual_missing_source_policy(),
+        hdf5_pure_rust::VdsMissingSourcePolicy::Error
+    );
 }
 
 #[test]
 fn test_read_chunked_typed() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("chunked").unwrap();
+    let plist = ds.create_plist().unwrap();
+    assert!(plist.chunk_opts().is_none() || plist.chunk_opts() == Some(0));
+
     let values: Vec<f32> = ds.read::<f32>().unwrap();
     assert_eq!(values.len(), 100);
     for (i, v) in values.iter().enumerate() {
@@ -100,6 +118,10 @@ fn test_attr_read_typed() {
     let attr = f.attr("int_attr").unwrap();
     let val: i64 = attr.read_scalar::<i64>().unwrap();
     assert_eq!(val, 42);
+    let narrowed: i8 = attr.read_scalar::<i8>().unwrap();
+    assert_eq!(narrowed, 42);
+    let as_float: f64 = attr.read_scalar::<f64>().unwrap();
+    assert_eq!(as_float, 42.0);
 }
 
 #[test]
@@ -108,6 +130,8 @@ fn test_attr_read_array_typed() {
     let attr = f.attr("array_attr").unwrap();
     let values: Vec<f64> = attr.read::<f64>().unwrap();
     assert_eq!(values, vec![1.0, 2.0, 3.0]);
+    let values32: Vec<f32> = attr.read::<f32>().unwrap();
+    assert_eq!(values32, vec![1.0, 2.0, 3.0]);
 }
 
 #[test]

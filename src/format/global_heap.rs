@@ -32,6 +32,114 @@ pub struct GlobalHeapCollection {
 }
 
 impl GlobalHeapCollection {
+    pub fn create() -> Self {
+        Self {
+            objects: Vec::new(),
+        }
+    }
+
+    pub fn protect(collection: Self) -> Self {
+        collection
+    }
+
+    pub fn alloc(&mut self, data: Vec<u8>) -> Result<u32> {
+        let next = self
+            .objects
+            .iter()
+            .map(|(idx, _)| *idx)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("global heap object index overflow".into()))?;
+        self.objects.push((next, data));
+        Ok(next)
+    }
+
+    pub fn extend(&mut self, additional: usize) {
+        self.objects.reserve(additional);
+    }
+
+    pub fn insert(&mut self, index: u32, data: Vec<u8>) -> Result<()> {
+        if index == 0 {
+            return Err(Error::InvalidFormat(
+                "global heap object index zero is reserved".into(),
+            ));
+        }
+        if self.objects.iter().any(|(idx, _)| *idx == index) {
+            return Err(Error::InvalidFormat(format!(
+                "global heap object {index} already exists"
+            )));
+        }
+        self.objects.push((index, data));
+        Ok(())
+    }
+
+    pub fn link(&mut self, index: u32) -> Result<()> {
+        if self.get_object(index).is_some() {
+            Ok(())
+        } else {
+            Err(Error::InvalidFormat(format!(
+                "global heap object {index} not found"
+            )))
+        }
+    }
+
+    pub fn remove(&mut self, index: u32) -> Result<Vec<u8>> {
+        let pos = self
+            .objects
+            .iter()
+            .position(|(idx, _)| *idx == index)
+            .ok_or_else(|| Error::InvalidFormat(format!("global heap object {index} not found")))?;
+        Ok(self.objects.remove(pos).1)
+    }
+
+    pub fn free(&mut self) {
+        self.objects.clear();
+    }
+
+    pub fn hdr_deserialize<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+    ) -> Result<GlobalHeapHeader> {
+        Self::decode_header(reader, addr)
+    }
+
+    pub fn cache_heap_get_final_load_size(header: &GlobalHeapHeader) -> Result<usize> {
+        heap_object_len(header.collection_size, "global heap collection size")
+    }
+
+    pub fn cache_heap_image_len(&self) -> Result<usize> {
+        let mut len = 16usize;
+        for (_, data) in &self.objects {
+            let padded = data
+                .len()
+                .checked_add(7)
+                .map(|size| size & !7)
+                .ok_or_else(|| Error::InvalidFormat("global heap object image overflow".into()))?;
+            len = len
+                .checked_add(16)
+                .and_then(|value| value.checked_add(padded))
+                .ok_or_else(|| Error::InvalidFormat("global heap image length overflow".into()))?;
+        }
+        Ok(len)
+    }
+
+    pub fn get_addr(reference: &GlobalHeapRef) -> u64 {
+        reference.collection_addr
+    }
+
+    pub fn get_size(&self, index: u32) -> Option<usize> {
+        self.get_object(index).map(|data| data.len())
+    }
+
+    pub fn get_free_size(&self) -> usize {
+        self.objects.capacity().saturating_sub(self.objects.len())
+    }
+
+    pub fn debug(&self) -> String {
+        format!("GlobalHeapCollection(objects={})", self.objects.len())
+    }
+
     /// Read a global heap collection at the given address.
     ///
     /// Thin wrapper around the full deserialize path.
@@ -99,7 +207,10 @@ impl GlobalHeapCollection {
 
         while reader.position()? < data_end {
             let pos = reader.position()?;
-            if pos + 16 > data_end {
+            let min_entry_end = pos.checked_add(16).ok_or_else(|| {
+                Error::InvalidFormat("global heap object header offset overflow".into())
+            })?;
+            if min_entry_end > data_end {
                 break;
             }
 

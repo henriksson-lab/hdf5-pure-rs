@@ -1,4 +1,5 @@
-use hdf5_pure_rust::{Error, File};
+use hdf5_pure_rust::hl::plist::dataset_create::VirtualSelectionInfo;
+use hdf5_pure_rust::{DatasetAccess, Error, File, VdsMissingSourcePolicy, VdsView};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +44,19 @@ fn test_virtual_dataset_all_selection_read() {
     let ds = f.dataset("vds_all").unwrap();
     assert!(ds.is_virtual().unwrap());
     assert_eq!(ds.shape().unwrap(), vec![4, 6]);
+    let plist = ds.create_plist().unwrap();
+    assert_eq!(plist.virtual_count(), 1);
+    assert_eq!(plist.virtual_filename(0), Some("vds_all_source.h5"));
+    assert_eq!(plist.virtual_dsetname(0), Some("/source"));
+    assert!(matches!(
+        plist.virtual_srcspace(0),
+        Some(VirtualSelectionInfo::All)
+    ));
+    assert!(matches!(
+        plist.virtual_vspace(0),
+        Some(VirtualSelectionInfo::All)
+    ));
+    assert!(!plist.virtual_spatial_tree());
 
     let vals: Vec<i32> = ds.read::<i32>().unwrap();
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
@@ -105,6 +119,16 @@ fn test_virtual_dataset_f64_read() {
         .map(|value| (value as f64 / 2.0) + 0.25)
         .collect::<Vec<_>>();
     assert_eq!(vals, expected);
+}
+
+#[test]
+fn test_virtual_dataset_converts_source_datatype_to_destination() {
+    let f = File::open("tests/data/hdf5_ref/vds_i32_to_f64.h5").unwrap();
+    let ds = f.dataset("vds_f64_from_i32").unwrap();
+    assert!(ds.is_virtual().unwrap());
+
+    let vals: Vec<f64> = ds.read::<f64>().unwrap();
+    assert_eq!(vals, vec![1.0, -2.0, 300.0, 4000.0]);
 }
 
 #[test]
@@ -183,6 +207,16 @@ fn test_virtual_dataset_irregular_hyperslab_read() {
     let ds = f.dataset("vds_irregular_hyperslab").unwrap();
     assert!(ds.is_virtual().unwrap());
     assert_eq!(ds.shape().unwrap(), vec![4, 4]);
+    let plist = ds.create_plist().unwrap();
+    assert_eq!(plist.virtual_count(), 1);
+    assert!(matches!(
+        plist.virtual_srcspace(0),
+        Some(VirtualSelectionInfo::Irregular(blocks)) if blocks.len() == 2
+    ));
+    assert!(matches!(
+        plist.virtual_vspace(0),
+        Some(VirtualSelectionInfo::Irregular(blocks)) if blocks.len() == 2
+    ));
 
     let vals: Vec<i32> = ds.read::<i32>().unwrap();
     let mut expected = vec![-2; 4 * 4];
@@ -199,6 +233,16 @@ fn test_virtual_dataset_point_selection_read() {
     let ds = f.dataset("vds_point_selection").unwrap();
     assert!(ds.is_virtual().unwrap());
     assert_eq!(ds.shape().unwrap(), vec![4, 4]);
+    let plist = ds.create_plist().unwrap();
+    assert_eq!(plist.virtual_count(), 1);
+    assert!(matches!(
+        plist.virtual_srcspace(0),
+        Some(VirtualSelectionInfo::Points(points)) if points == &vec![vec![2, 1]]
+    ));
+    assert!(matches!(
+        plist.virtual_vspace(0),
+        Some(VirtualSelectionInfo::Points(points)) if points == &vec![vec![0, 3]]
+    ));
 
     let vals: Vec<i32> = ds.read::<i32>().unwrap();
     let mut expected = vec![-2; 4 * 4];
@@ -225,6 +269,22 @@ fn test_virtual_dataset_missing_source_file_fails_without_access_property_policy
 }
 
 #[test]
+fn test_virtual_dataset_missing_source_file_can_read_fill_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let vds_path = dir.path().join("vds_all.h5");
+    std::fs::copy("tests/data/hdf5_ref/vds_all.h5", &vds_path).unwrap();
+
+    let access =
+        DatasetAccess::new().with_virtual_missing_source_policy(VdsMissingSourcePolicy::Fill);
+    let f = File::open(&vds_path).unwrap();
+    let ds = f.dataset("vds_all").unwrap();
+
+    assert_eq!(ds.shape_with_access(&access).unwrap(), vec![4, 6]);
+    let vals: Vec<i32> = ds.read_with_access(&access).unwrap();
+    assert_eq!(vals, vec![0; 24]);
+}
+
+#[test]
 fn test_virtual_dataset_uses_hdf5_vds_prefix_directory() {
     let _guard = vds_env_lock().lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -248,6 +308,31 @@ fn test_virtual_dataset_uses_hdf5_vds_prefix_directory() {
 }
 
 #[test]
+fn test_virtual_dataset_uses_explicit_access_prefix_directory() {
+    let _guard = vds_env_lock().lock().unwrap();
+    std::env::remove_var("HDF5_VDS_PREFIX");
+    let dir = tempfile::tempdir().unwrap();
+    let vds_path = dir.path().join("vds_all.h5");
+    let prefixed_dir = dir.path().join("prefixed");
+    std::fs::create_dir(&prefixed_dir).unwrap();
+
+    std::fs::copy("tests/data/hdf5_ref/vds_all.h5", &vds_path).unwrap();
+    std::fs::copy(
+        "tests/data/hdf5_ref/vds_all_source.h5",
+        prefixed_dir.join("vds_all_source.h5"),
+    )
+    .unwrap();
+
+    let access = DatasetAccess::new().with_virtual_prefix(&prefixed_dir);
+    let f = File::open(&vds_path).unwrap();
+    let ds = f.dataset("vds_all").unwrap();
+    assert_eq!(ds.shape_with_access(&access).unwrap(), vec![4, 6]);
+    let vals: Vec<i32> = ds.read_with_access(&access).unwrap();
+
+    assert_eq!(vals, (0..24).collect::<Vec<_>>());
+}
+
+#[test]
 fn test_virtual_dataset_uses_hdf5_vds_prefix_origin_expansion() {
     let _guard = vds_env_lock().lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -266,6 +351,35 @@ fn test_virtual_dataset_uses_hdf5_vds_prefix_origin_expansion() {
     let f = File::open(&vds_path).unwrap();
     let vals: Vec<i32> = f.dataset("vds_all").unwrap().read::<i32>().unwrap();
     std::env::remove_var("HDF5_VDS_PREFIX");
+
+    assert_eq!(vals, (0..24).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_virtual_dataset_access_prefix_expands_origin() {
+    let _guard = vds_env_lock().lock().unwrap();
+    std::env::remove_var("HDF5_VDS_PREFIX");
+    let dir = tempfile::tempdir().unwrap();
+    let vds_path = dir.path().join("vds_all.h5");
+    let prefixed_dir = dir.path().join("prefixed");
+    std::fs::create_dir(&prefixed_dir).unwrap();
+
+    std::fs::copy("tests/data/hdf5_ref/vds_all.h5", &vds_path).unwrap();
+    std::fs::copy(
+        "tests/data/hdf5_ref/vds_all_source.h5",
+        prefixed_dir.join("vds_all_source.h5"),
+    )
+    .unwrap();
+
+    let access = DatasetAccess::new()
+        .with_virtual_prefix("${ORIGIN}/prefixed")
+        .with_virtual_view(VdsView::LastAvailable);
+    let f = File::open(&vds_path).unwrap();
+    let vals: Vec<i32> = f
+        .dataset("vds_all")
+        .unwrap()
+        .read_with_access(&access)
+        .unwrap();
 
     assert_eq!(vals, (0..24).collect::<Vec<_>>());
 }

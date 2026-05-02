@@ -10,3 +10,4 @@ pub mod messages;
 pub mod object_header;
 pub mod superblock;
 pub mod symbol_table;
+pub mod vm;

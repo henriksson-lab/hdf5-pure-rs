@@ -21,6 +21,7 @@ fn test_write_compact_dataset() {
             &DatasetSpec {
                 name: "small",
                 shape: &[5],
+                max_shape: None,
                 dtype: DtypeSpec::U8,
                 data: &data,
             },
@@ -53,6 +54,31 @@ fn test_write_compact_dataset() {
             assert!(stdout.contains("1, 2, 3, 4, 5"));
         }
     }
+}
+
+#[test]
+fn test_engine_writer_rejects_compact_data_length_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_compact_bad_len.h5");
+
+    let f = fs::File::create(&path).unwrap();
+    let mut w = HdfFileWriter::new(f);
+    w.begin().unwrap();
+    w.create_root_group().unwrap();
+
+    let err = w
+        .create_compact_dataset(
+            "/",
+            &DatasetSpec {
+                name: "bad",
+                shape: &[2],
+                max_shape: None,
+                dtype: DtypeSpec::I16,
+                data: &[1, 2],
+            },
+        )
+        .expect_err("compact data byte length should match shape * dtype size");
+    assert!(err.to_string().contains("dataset byte length"));
 }
 
 #[test]

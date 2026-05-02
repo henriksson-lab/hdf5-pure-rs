@@ -70,19 +70,93 @@ impl WritableFile {
             shape: &[],
             dtype,
             data,
-        });
-        Ok(())
+        })
+    }
+
+    /// Add a one-dimensional array attribute to the root group.
+    pub fn add_attr_array<T: H5Type>(&mut self, name: &str, values: &[T]) -> Result<()> {
+        let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
+        let byte_len = values
+            .len()
+            .checked_mul(T::type_size())
+            .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
+        let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        self.writer.add_root_attr(&AttrSpec {
+            name,
+            shape: &[values.len() as u64],
+            dtype,
+            data,
+        })
+    }
+
+    /// Add a fixed-length ASCII string attribute to the root group.
+    pub fn add_fixed_ascii_attr(&mut self, name: &str, value: &str, len: usize) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(&[value], len, false)?;
+        self.writer.add_root_attr(&AttrSpec {
+            name,
+            shape: &[],
+            dtype,
+            data: &data,
+        })
+    }
+
+    /// Add a fixed-length UTF-8 string attribute to the root group.
+    pub fn add_fixed_utf8_attr(&mut self, name: &str, value: &str, len: usize) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(&[value], len, true)?;
+        self.writer.add_root_attr(&AttrSpec {
+            name,
+            shape: &[],
+            dtype,
+            data: &data,
+        })
+    }
+
+    /// Add a one-dimensional fixed-length ASCII string array attribute to the root group.
+    pub fn add_fixed_ascii_attr_array(
+        &mut self,
+        name: &str,
+        values: &[&str],
+        len: usize,
+    ) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(values, len, false)?;
+        self.writer.add_root_attr(&AttrSpec {
+            name,
+            shape: &[values.len() as u64],
+            dtype,
+            data: &data,
+        })
+    }
+
+    /// Add a one-dimensional fixed-length UTF-8 string array attribute to the root group.
+    pub fn add_fixed_utf8_attr_array(
+        &mut self,
+        name: &str,
+        values: &[&str],
+        len: usize,
+    ) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(values, len, true)?;
+        self.writer.add_root_attr(&AttrSpec {
+            name,
+            shape: &[values.len() as u64],
+            dtype,
+            data: &data,
+        })
     }
 
     /// Create a soft link in the root group.
-    pub fn link_soft(&mut self, name: &str, target_path: &str) {
-        self.writer.create_soft_link("/", name, target_path);
+    pub fn link_soft(&mut self, name: &str, target_path: &str) -> Result<()> {
+        self.writer.create_soft_link("/", name, target_path)
+    }
+
+    /// Create a hard-link alias in the root group.
+    pub fn link_hard(&mut self, name: &str, target_path: &str) -> Result<()> {
+        self.writer.create_hard_link("/", name, target_path)
     }
 
     /// Create an external link in the root group.
-    pub fn link_external(&mut self, name: &str, filename: &str, obj_path: &str) {
+    pub fn link_external(&mut self, name: &str, filename: &str, obj_path: &str) -> Result<()> {
         self.writer
-            .create_external_link("/", name, filename, obj_path);
+            .create_external_link("/", name, filename, obj_path)
     }
 
     /// Finalize and close the file. Returns a read-only File handle.
@@ -119,14 +193,159 @@ impl<'a> WritableGroup<'a> {
         DatasetBuilder::new(self.writer, &self.path, name)
     }
 
+    /// Add an attribute to this group.
+    pub fn add_attr<T: H5Type>(&mut self, name: &str, value: T) -> Result<()> {
+        let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
+        let byte_ptr = &value as *const T as *const u8;
+        let data = unsafe { std::slice::from_raw_parts(byte_ptr, T::type_size()) };
+        self.writer.add_group_attr(
+            &self.path,
+            &AttrSpec {
+                name,
+                shape: &[],
+                dtype,
+                data,
+            },
+        )
+    }
+
+    /// Add a one-dimensional array attribute to this group.
+    pub fn add_attr_array<T: H5Type>(&mut self, name: &str, values: &[T]) -> Result<()> {
+        let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
+        let byte_len = values
+            .len()
+            .checked_mul(T::type_size())
+            .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
+        let data = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+        self.writer.add_group_attr(
+            &self.path,
+            &AttrSpec {
+                name,
+                shape: &[values.len() as u64],
+                dtype,
+                data,
+            },
+        )
+    }
+
+    /// Add a fixed-length ASCII string attribute to this group.
+    pub fn add_fixed_ascii_attr(&mut self, name: &str, value: &str, len: usize) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(&[value], len, false)?;
+        self.writer.add_group_attr(
+            &self.path,
+            &AttrSpec {
+                name,
+                shape: &[],
+                dtype,
+                data: &data,
+            },
+        )
+    }
+
+    /// Add a fixed-length UTF-8 string attribute to this group.
+    pub fn add_fixed_utf8_attr(&mut self, name: &str, value: &str, len: usize) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(&[value], len, true)?;
+        self.writer.add_group_attr(
+            &self.path,
+            &AttrSpec {
+                name,
+                shape: &[],
+                dtype,
+                data: &data,
+            },
+        )
+    }
+
+    /// Add a one-dimensional fixed-length ASCII string array attribute to this group.
+    pub fn add_fixed_ascii_attr_array(
+        &mut self,
+        name: &str,
+        values: &[&str],
+        len: usize,
+    ) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(values, len, false)?;
+        self.writer.add_group_attr(
+            &self.path,
+            &AttrSpec {
+                name,
+                shape: &[values.len() as u64],
+                dtype,
+                data: &data,
+            },
+        )
+    }
+
+    /// Add a one-dimensional fixed-length UTF-8 string array attribute to this group.
+    pub fn add_fixed_utf8_attr_array(
+        &mut self,
+        name: &str,
+        values: &[&str],
+        len: usize,
+    ) -> Result<()> {
+        let (dtype, data) = fixed_string_attr(values, len, true)?;
+        self.writer.add_group_attr(
+            &self.path,
+            &AttrSpec {
+                name,
+                shape: &[values.len() as u64],
+                dtype,
+                data: &data,
+            },
+        )
+    }
+
     /// Create a soft link in this group.
-    pub fn link_soft(&mut self, name: &str, target_path: &str) {
-        self.writer.create_soft_link(&self.path, name, target_path);
+    pub fn link_soft(&mut self, name: &str, target_path: &str) -> Result<()> {
+        self.writer.create_soft_link(&self.path, name, target_path)
+    }
+
+    /// Create a hard-link alias in this group.
+    pub fn link_hard(&mut self, name: &str, target_path: &str) -> Result<()> {
+        self.writer.create_hard_link(&self.path, name, target_path)
     }
 
     /// Create an external link in this group.
-    pub fn link_external(&mut self, name: &str, filename: &str, obj_path: &str) {
+    pub fn link_external(&mut self, name: &str, filename: &str, obj_path: &str) -> Result<()> {
         self.writer
-            .create_external_link(&self.path, name, filename, obj_path);
+            .create_external_link(&self.path, name, filename, obj_path)
     }
+}
+
+fn fixed_string_attr(
+    values: &[&str],
+    len: usize,
+    utf8: bool,
+) -> Result<(crate::engine::writer::DtypeSpec, Vec<u8>)> {
+    if len > u32::MAX as usize {
+        return Err(Error::InvalidFormat(
+            "fixed string length exceeds u32".into(),
+        ));
+    }
+    let dtype = if utf8 {
+        crate::engine::writer::DtypeSpec::FixedUtf8String {
+            len: len as u32,
+            padding: 1,
+        }
+    } else {
+        crate::engine::writer::DtypeSpec::FixedAsciiString {
+            len: len as u32,
+            padding: 1,
+        }
+    };
+    let capacity = values.len().checked_mul(len).ok_or_else(|| {
+        Error::InvalidFormat("fixed string attribute payload size overflow".into())
+    })?;
+    let mut data = Vec::with_capacity(capacity);
+    for value in values {
+        let bytes = value.as_bytes();
+        if bytes.len() > len {
+            return Err(Error::InvalidFormat(format!(
+                "fixed string attribute has {} bytes, maximum is {len}",
+                bytes.len()
+            )));
+        }
+        data.extend_from_slice(bytes);
+        data.resize(data.len() + (len - bytes.len()), 0);
+    }
+    Ok((dtype, data))
 }

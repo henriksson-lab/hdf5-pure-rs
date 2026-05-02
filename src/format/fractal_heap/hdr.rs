@@ -73,6 +73,13 @@ impl FractalHeapHeader {
         // Checksum
         let _checksum = reader.read_u32()?;
 
+        validate_doubling_table_geometry(
+            table_width,
+            start_block_size,
+            max_direct_block_size,
+            max_heap_size,
+        )?;
+
         Ok(Self {
             heap_id_len,
             heap_addr: addr,
@@ -95,5 +102,58 @@ impl FractalHeapHeader {
             root_direct_filter_mask,
             filter_pipeline,
         })
+    }
+}
+
+fn validate_doubling_table_geometry(
+    table_width: u16,
+    start_block_size: u64,
+    max_direct_block_size: u64,
+    max_heap_size: u16,
+) -> Result<()> {
+    if table_width == 0 {
+        return Err(Error::InvalidFormat(
+            "fractal heap table width must be nonzero".into(),
+        ));
+    }
+    if start_block_size == 0 || !start_block_size.is_power_of_two() {
+        return Err(Error::InvalidFormat(
+            "fractal heap start block size must be a nonzero power of two".into(),
+        ));
+    }
+    if max_direct_block_size == 0 || !max_direct_block_size.is_power_of_two() {
+        return Err(Error::InvalidFormat(
+            "fractal heap max direct block size must be a nonzero power of two".into(),
+        ));
+    }
+    if max_direct_block_size < start_block_size {
+        return Err(Error::InvalidFormat(
+            "fractal heap max direct block size is smaller than start block size".into(),
+        ));
+    }
+    if max_heap_size > 64 {
+        return Err(Error::Unsupported(format!(
+            "fractal heap max heap size {max_heap_size} exceeds 64-bit offsets"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_doubling_table_geometry;
+
+    #[test]
+    fn rejects_invalid_doubling_table_geometry() {
+        assert!(validate_doubling_table_geometry(0, 8, 64, 32).is_err());
+        assert!(validate_doubling_table_geometry(4, 0, 64, 32).is_err());
+        assert!(validate_doubling_table_geometry(4, 12, 64, 32).is_err());
+        assert!(validate_doubling_table_geometry(4, 64, 8, 32).is_err());
+        assert!(validate_doubling_table_geometry(4, 8, 64, 65).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_doubling_table_geometry() {
+        validate_doubling_table_geometry(4, 8, 64, 32).unwrap();
     }
 }

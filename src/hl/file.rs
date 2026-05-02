@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -25,17 +26,93 @@ pub enum ObjectType {
     Unknown,
 }
 
+/// File open intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIntent {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// File-level metadata summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    pub superblock: SuperblockInfo,
+    pub free_space: FreeSpaceInfo,
+    pub shared_messages: SharedMessageInfo,
+}
+
+/// Superblock/storage information reported by file metadata queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuperblockInfo {
+    pub version: u8,
+    pub size: u64,
+    pub extension_size: u64,
+}
+
+/// Free-space-manager information reported by file metadata queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeSpaceInfo {
+    pub version: u8,
+    pub metadata_size: u64,
+    pub total_space: u64,
+}
+
+/// Shared-object-header-message information reported by file metadata queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedMessageInfo {
+    pub header_size: u64,
+    pub message_info_size: u64,
+}
+
+/// Metadata-cache size/status snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCacheSize {
+    pub max_size: usize,
+    pub min_clean_size: usize,
+    pub current_size: usize,
+    pub current_num_entries: usize,
+}
+
+/// Metadata-cache image status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCacheImageInfo {
+    pub generated: bool,
+    pub size: usize,
+}
+
+/// Page-buffering status counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageBufferingStats {
+    pub metadata_accesses: u64,
+    pub metadata_hits: u64,
+    pub raw_data_accesses: u64,
+    pub raw_data_hits: u64,
+}
+
 /// Internal state of an open HDF5 file.
 pub(crate) struct FileInner<R: Read + Seek> {
     pub reader: HdfReader<R>,
     pub superblock: Superblock,
     pub path: Option<PathBuf>,
+    pub access_plist: crate::hl::plist::file_access::FileAccess,
+    pub dset_no_attrs_hint: bool,
+    pub open_objects: HashMap<u64, OpenObjectKind>,
+    pub next_object_id: u64,
 }
 
 /// An open HDF5 file.
 pub struct File {
     inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     superblock: Superblock,
+    object_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenObjectKind {
+    File,
+    Group,
+    Dataset,
+    Attribute,
 }
 
 impl File {
@@ -62,9 +139,18 @@ impl File {
             reader,
             superblock: superblock.clone(),
             path: Some(path.as_ref().to_path_buf()),
+            access_plist: crate::hl::plist::file_access::FileAccess::default(),
+            dset_no_attrs_hint: false,
+            open_objects: HashMap::new(),
+            next_object_id: 1,
         }));
 
-        Ok(File { inner, superblock })
+        let object_id = register_open_object(&inner, OpenObjectKind::File);
+        Ok(File {
+            inner,
+            superblock,
+            object_id,
+        })
     }
 
     /// Get the superblock.
@@ -72,9 +158,230 @@ impl File {
         &self.superblock
     }
 
+    /// Return the current on-disk file size in bytes.
+    ///
+    /// This mirrors the useful read-side subset of HDF5's `H5Fget_filesize`
+    /// without exposing the broader file-driver API surface.
+    pub fn file_size(&self) -> Result<u64> {
+        self.inner.lock().reader.len()
+    }
+
+    /// Return the path used to open this file, when the file has an on-disk path.
+    ///
+    /// This mirrors the useful file-level subset of HDF5's `H5Fget_name`.
+    pub fn path(&self) -> Option<PathBuf> {
+        self.inner.lock().path.clone()
+    }
+
+    /// Return the access properties for this open file.
+    pub fn access_plist(&self) -> crate::hl::plist::file_access::FileAccess {
+        crate::hl::plist::file_access::FileAccess::from_file(self)
+    }
+
+    pub(crate) fn access_plist_snapshot(&self) -> crate::hl::plist::file_access::FileAccess {
+        self.inner.lock().access_plist.clone()
+    }
+
+    /// Replace the file's stored access-property state.
+    pub fn set_access_plist(&self, plist: crate::hl::plist::file_access::FileAccess) {
+        self.inner.lock().access_plist = plist;
+    }
+
+    /// Return this file's open intent.
+    pub fn intent(&self) -> FileIntent {
+        FileIntent::ReadOnly
+    }
+
+    /// Return the parsed end-of-address marker from the superblock.
+    pub fn eoa(&self) -> u64 {
+        self.superblock.eof_addr
+    }
+
+    /// Return the known free-space size. The reader does not currently parse
+    /// free-space manager state, so this reports zero known free bytes.
+    pub fn freespace(&self) -> u64 {
+        0
+    }
+
+    /// Return file metadata information in the v2 `H5F_info_t` layout.
+    pub fn info(&self) -> Result<FileInfo> {
+        Ok(FileInfo {
+            superblock: SuperblockInfo {
+                version: self.superblock.version,
+                size: u64::try_from(self.superblock.checked_size()?)
+                    .map_err(|_| Error::InvalidFormat("superblock size does not fit u64".into()))?,
+                extension_size: 0,
+            },
+            free_space: FreeSpaceInfo {
+                version: 0,
+                metadata_size: 0,
+                total_space: self.freespace(),
+            },
+            shared_messages: SharedMessageInfo {
+                header_size: 0,
+                message_info_size: 0,
+            },
+        })
+    }
+
+    /// Return file metadata information in the v1 `H5F_info_t` layout.
+    pub fn info_v1(&self) -> Result<FileInfo> {
+        self.info()
+    }
+
+    /// Return the current file image bytes.
+    pub fn file_image(&self) -> Result<Vec<u8>> {
+        let mut guard = self.inner.lock();
+        let pos = guard.reader.position()?;
+        let len = guard.reader.len()?;
+        let len = usize::try_from(len)
+            .map_err(|_| Error::InvalidFormat("file image length does not fit usize".into()))?;
+        guard.reader.seek(0)?;
+        let image = guard.reader.read_bytes(len);
+        let restore = guard.reader.seek(pos);
+        match (image, restore) {
+            (Ok(image), Ok(_)) => Ok(image),
+            (Err(err), _) => Err(err),
+            (_, Err(err)) => Err(err),
+        }
+    }
+
+    /// Return a stable file-number surrogate for this open file.
+    pub fn fileno(&self) -> Result<u64> {
+        let path = self
+            .path()
+            .ok_or_else(|| Error::Unsupported("open file has no filesystem path".into()))?;
+        file_number_from_path(&path)
+    }
+
+    /// Return this file handle's high-level object id.
+    pub fn object_id(&self) -> u64 {
+        self.object_id
+    }
+
+    /// Return the number of currently live high-level objects for this file.
+    pub fn obj_count(&self) -> usize {
+        self.inner.lock().open_objects.len()
+    }
+
+    /// Return currently live high-level object ids for this file.
+    pub fn obj_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.inner.lock().open_objects.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Return the native handle for the direct file driver when available.
+    #[cfg(unix)]
+    pub fn vfd_handle(&self) -> Option<i64> {
+        use std::os::fd::AsRawFd;
+
+        Some(i64::from(
+            self.inner.lock().reader.get_ref().get_ref().as_raw_fd(),
+        ))
+    }
+
+    /// Return the native handle for the direct file driver when available.
+    #[cfg(not(unix))]
+    pub fn vfd_handle(&self) -> Option<i64> {
+        None
+    }
+
+    /// Return whether MPI atomicity is enabled for this file.
+    ///
+    /// This pure-Rust reader does not use MPI or the parallel HDF5 VFD, so
+    /// atomicity is always disabled.
+    pub fn mpi_atomicity(&self) -> bool {
+        false
+    }
+
+    /// Return metadata cache configuration for this file.
+    pub fn mdc_config(&self) -> crate::hl::plist::file_access::MetadataCacheConfig {
+        self.access_plist().mdc_config()
+    }
+
+    /// Set metadata cache configuration for this open file handle.
+    pub fn set_mdc_config(&self, config: crate::hl::plist::file_access::MetadataCacheConfig) {
+        self.inner.lock().access_plist.set_mdc_config(config);
+    }
+
+    /// Set library format-version bounds for this open file handle.
+    pub fn set_libver_bounds(
+        &self,
+        low: crate::hl::plist::file_access::LibverBound,
+        high: crate::hl::plist::file_access::LibverBound,
+    ) {
+        self.inner.lock().access_plist.set_libver_bounds(low, high);
+    }
+
+    /// Set latest-format bounds for this open file handle.
+    pub fn set_latest_format(&self) {
+        use crate::hl::plist::file_access::LibverBound;
+
+        self.set_libver_bounds(LibverBound::Latest, LibverBound::Latest);
+    }
+
+    /// Return metadata cache hit rate. No libhdf5 metadata cache is present.
+    pub fn mdc_hit_rate(&self) -> f64 {
+        0.0
+    }
+
+    /// Return metadata cache size/status.
+    pub fn mdc_size(&self) -> MetadataCacheSize {
+        MetadataCacheSize {
+            max_size: 0,
+            min_clean_size: 0,
+            current_size: 0,
+            current_num_entries: 0,
+        }
+    }
+
+    /// Return metadata cache logging status `(enabled, currently_logging)`.
+    pub fn mdc_logging_status(&self) -> (bool, bool) {
+        (false, false)
+    }
+
+    /// Return page-buffering status counters.
+    pub fn page_buffering_stats(&self) -> PageBufferingStats {
+        PageBufferingStats {
+            metadata_accesses: 0,
+            metadata_hits: 0,
+            raw_data_accesses: 0,
+            raw_data_hits: 0,
+        }
+    }
+
+    /// Return metadata cache image status.
+    pub fn mdc_image_info(&self) -> MetadataCacheImageInfo {
+        MetadataCacheImageInfo {
+            generated: false,
+            size: 0,
+        }
+    }
+
+    /// Return the dataset-no-attributes optimization hint.
+    pub fn dset_no_attrs_hint(&self) -> bool {
+        self.inner.lock().dset_no_attrs_hint
+    }
+
+    /// Set the dataset-no-attributes optimization hint for this open file.
+    pub fn set_dset_no_attrs_hint(&self, enabled: bool) {
+        self.inner.lock().dset_no_attrs_hint = enabled;
+    }
+
     #[cfg(feature = "tracehash")]
     pub(crate) fn inner_arc(&self) -> Arc<Mutex<FileInner<BufReader<fs::File>>>> {
         self.inner.clone()
+    }
+
+    pub(crate) fn from_inner(inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>) -> Self {
+        let superblock = inner.lock().superblock.clone();
+        let object_id = register_open_object(&inner, OpenObjectKind::File);
+        Self {
+            inner,
+            superblock,
+            object_id,
+        }
     }
 
     /// Get the root group.
@@ -104,9 +411,43 @@ impl File {
         crate::hl::attribute::attr_names(&self.inner, self.superblock.root_addr)
     }
 
+    /// List attributes on the root group.
+    pub fn attrs(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
+        crate::hl::attribute::collect_attributes(&self.inner, self.superblock.root_addr)
+    }
+
+    /// List attributes on the root group sorted by tracked creation order.
+    pub fn attrs_by_creation_order(&self) -> Result<Vec<crate::hl::attribute::Attribute>> {
+        crate::hl::attribute::collect_attributes_by_creation_order(
+            &self.inner,
+            self.superblock.root_addr,
+        )
+    }
+
     /// Get an attribute by name on the root group.
     pub fn attr(&self, name: &str) -> Result<crate::hl::attribute::Attribute> {
         crate::hl::attribute::get_attr(&self.inner, self.superblock.root_addr, name)
+    }
+
+    /// Check whether an attribute exists on the root group.
+    pub fn attr_exists(&self, name: &str) -> Result<bool> {
+        crate::hl::attribute::attr_exists(&self.inner, self.superblock.root_addr, name)
+    }
+
+    /// Async-compatible alias for attribute-existence checks.
+    pub fn attr_exists_async(&self, name: &str) -> Result<bool> {
+        self.attr_exists(name)
+    }
+
+    /// Check whether an attribute exists on an object addressed by path.
+    pub fn attr_exists_by_name(&self, object_path: &str, attr_name: &str) -> Result<bool> {
+        let resolved = self.resolve_path(object_path)?;
+        crate::hl::attribute::attr_exists(&resolved.inner, resolved.addr, attr_name)
+    }
+
+    /// Async-compatible alias for path-based attribute-existence checks.
+    pub fn attr_exists_by_name_async(&self, object_path: &str, attr_name: &str) -> Result<bool> {
+        self.attr_exists_by_name(object_path, attr_name)
     }
 
     /// Open a dataset by path from the root group.
@@ -121,11 +462,21 @@ impl File {
         Ok(Dataset::new(resolved.inner, &resolved.path, resolved.addr))
     }
 
+    pub(crate) fn object_type_for_path(&self, path: &str) -> Result<ObjectType> {
+        Ok(self.resolve_path(path)?.object_type)
+    }
+
     fn resolve_path(&self, path: &str) -> Result<ResolvedObject> {
         let mut path = canonical_path(path);
         let mut traversals = 0usize;
+        let mut seen_paths = HashSet::new();
 
         'resolve: loop {
+            if !seen_paths.insert(path.clone()) {
+                return Err(Error::InvalidFormat(format!(
+                    "soft link cycle detected while resolving '{path}'"
+                )));
+            }
             if path == "/" {
                 return Ok(self.root_resolved_object(path));
             }
@@ -330,6 +681,33 @@ impl File {
     }
 }
 
+impl Drop for File {
+    fn drop(&mut self) {
+        unregister_open_object(&self.inner, self.object_id);
+    }
+}
+
+pub(crate) fn register_open_object(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    kind: OpenObjectKind,
+) -> u64 {
+    let mut guard = inner.lock();
+    let id = guard.next_object_id;
+    guard.next_object_id = guard.next_object_id.saturating_add(1);
+    if guard.next_object_id == id {
+        guard.next_object_id = id.saturating_add(1);
+    }
+    guard.open_objects.insert(id, kind);
+    id
+}
+
+pub(crate) fn unregister_open_object(
+    inner: &Arc<Mutex<FileInner<BufReader<fs::File>>>>,
+    object_id: u64,
+) {
+    inner.lock().open_objects.remove(&object_id);
+}
+
 struct ResolvedObject {
     inner: Arc<Mutex<FileInner<BufReader<fs::File>>>>,
     path: String,
@@ -459,4 +837,23 @@ pub(crate) fn collect_v2_link_members(
     }
 
     members
+}
+
+#[cfg(unix)]
+fn file_number_from_path(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.dev() << 32) ^ metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn file_number_from_path(path: &Path) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let metadata = fs::metadata(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    Ok(hasher.finish())
 }

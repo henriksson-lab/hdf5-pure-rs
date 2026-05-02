@@ -1,6 +1,6 @@
 /// Simple bump allocator for file space.
 /// Allocates space sequentially from the end of the file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileAllocator {
     /// Current end-of-file position.
     next_offset: u64,

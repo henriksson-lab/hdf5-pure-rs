@@ -43,6 +43,11 @@ impl<R: Read + Seek> HdfReader<R> {
         self.sizeof_size
     }
 
+    /// Borrow the wrapped reader.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
     /// Get the current position in the stream.
     pub fn position(&mut self) -> Result<u64> {
         Ok(self.inner.stream_position()?)
@@ -155,7 +160,9 @@ impl<R: Read + Seek> HdfReader<R> {
 
     /// Skip `n` bytes.
     pub fn skip(&mut self, n: u64) -> Result<()> {
-        self.inner.seek(SeekFrom::Current(n as i64))?;
+        let delta = i64::try_from(n)
+            .map_err(|_| Error::InvalidFormat("skip distance exceeds i64::MAX".into()))?;
+        self.inner.seek(SeekFrom::Current(delta))?;
         Ok(())
     }
 
@@ -218,5 +225,13 @@ mod tests {
         let mut r = HdfReader::new(Cursor::new(data));
         r.set_sizeof_addr(4);
         assert_eq!(r.read_addr().unwrap(), 0x12345678);
+    }
+
+    #[test]
+    fn skip_rejects_i64_overflow() {
+        let data = vec![0u8; 8];
+        let mut r = HdfReader::new(Cursor::new(data));
+        let err = r.skip(i64::MAX as u64 + 1).unwrap_err();
+        assert!(err.to_string().contains("skip distance"));
     }
 }

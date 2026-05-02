@@ -20,13 +20,9 @@ fn test_read_vlen_string_attr() {
     let f = File::open("tests/data/strings.h5").unwrap();
     let attr = f.attr("vlen_str").unwrap();
 
-    // Variable-length string attributes store data inline (via global heap ref)
-    // For now, just verify we can read the raw data
-    println!(
-        "vlen_str attr raw data ({} bytes): {:?}",
-        attr.raw_data().len(),
-        attr.raw_data()
-    );
+    assert!(attr.dtype().is_vlen());
+    assert_eq!(attr.read_strings().unwrap(), vec!["hello world"]);
+    assert_eq!(attr.read_string(), "hello world");
 }
 
 #[test]

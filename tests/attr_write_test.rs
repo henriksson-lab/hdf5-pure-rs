@@ -26,6 +26,7 @@ fn test_write_dataset_with_attrs() {
             &DatasetSpec {
                 name: "data",
                 shape: &[3],
+                max_shape: None,
                 dtype: DtypeSpec::F64,
                 data: &data,
             },
@@ -74,6 +75,39 @@ fn test_write_dataset_with_attrs() {
 }
 
 #[test]
+fn test_write_dataset_rejects_attribute_data_length_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attr_bad_len.h5");
+
+    let f = fs::File::create(&path).unwrap();
+    let mut w = HdfFileWriter::new(f);
+    w.begin().unwrap();
+    w.create_root_group().unwrap();
+
+    let data = 1i32.to_le_bytes().to_vec();
+    let attr_data = 7i32.to_le_bytes().to_vec();
+    let err = w
+        .create_dataset_with_attrs(
+            "/",
+            &DatasetSpec {
+                name: "data",
+                shape: &[1],
+                max_shape: None,
+                dtype: DtypeSpec::I32,
+                data: &data,
+            },
+            &[AttrSpec {
+                name: "bad_attr",
+                shape: &[2],
+                dtype: DtypeSpec::I32,
+                data: &attr_data,
+            }],
+        )
+        .expect_err("attribute byte length should match shape * dtype size");
+    assert!(err.to_string().contains("attribute byte length"));
+}
+
+#[test]
 fn test_write_root_attrs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("written_root_attrs.h5");
@@ -90,7 +124,8 @@ fn test_write_root_attrs() {
             shape: &[],
             dtype: DtypeSpec::F64,
             data: &val_data,
-        });
+        })
+        .unwrap();
 
         w.finalize().unwrap();
     }
@@ -140,6 +175,7 @@ fn test_write_dataset_with_many_compact_attrs() {
             &DatasetSpec {
                 name: "data",
                 shape: &[1],
+                max_shape: None,
                 dtype: DtypeSpec::I32,
                 data: &data,
             },

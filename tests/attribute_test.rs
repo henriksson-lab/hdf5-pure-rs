@@ -1,15 +1,28 @@
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
+use hdf5_pure_rust::{File, Location};
 
 #[test]
 fn test_list_root_attrs_v0() {
     let f = File::open("tests/data/attrs.h5").unwrap();
     let names = f.attr_names().unwrap();
+    let attrs = f.attrs().unwrap();
     println!("v0 root attrs: {names:?}");
 
     assert!(names.contains(&"string_attr".to_string()));
     assert!(names.contains(&"int_attr".to_string()));
     assert!(names.contains(&"float_attr".to_string()));
     assert!(names.contains(&"array_attr".to_string()));
+    assert_eq!(attrs.len(), names.len());
+    assert!(attrs.iter().any(|attr| attr.name() == "int_attr"));
+    assert_eq!(f.attr_count().unwrap(), names.len());
+    let first_name = f.attr_name_by_idx(0).unwrap();
+    assert_eq!(first_name, names[0]);
+    assert_eq!(
+        f.attr_info_by_idx(0).unwrap(),
+        f.attr(&first_name).unwrap().info()
+    );
+    assert!(f.attr_name_by_idx(names.len()).is_err());
+    assert!(f.attr_info_by_idx(names.len()).is_err());
 }
 
 #[test]
@@ -34,6 +47,18 @@ fn test_read_array_attr_v0() {
     let attr = f.attr("array_attr").unwrap();
     assert_eq!(attr.shape(), &[3]);
     assert_eq!(attr.element_size(), 8);
+    assert!(attr.dtype().is_float());
+    assert_eq!(attr.dtype().class(), DatatypeClass::FloatingPoint);
+    assert_eq!(attr.raw_datatype_message().size, 8);
+    assert!(attr.space().is_simple());
+    assert_eq!(attr.space().shape(), &[3]);
+    assert_eq!(attr.raw_dataspace_message().dims, vec![3]);
+    let info = attr.info();
+    assert!(!info.creation_order_valid);
+    assert_eq!(info.creation_order, 0);
+    assert_eq!(info.char_encoding, 0);
+    assert_eq!(info.data_size, 24);
+    assert_eq!(attr.create_plist().char_encoding(), info.char_encoding);
 
     let data = attr.raw_data();
     let values: Vec<f64> = data
@@ -47,9 +72,30 @@ fn test_read_array_attr_v0() {
 fn test_dataset_attr_v0() {
     let f = File::open("tests/data/attrs.h5").unwrap();
     let ds = f.dataset("data").unwrap();
+    let attrs = ds.attrs().unwrap();
     let attr = ds.attr("ds_attr").unwrap();
     let val = attr.read_scalar_i64().unwrap();
+    assert_eq!(ds.attr_count().unwrap(), 1);
+    assert_eq!(ds.attr_name_by_idx(0).unwrap(), "ds_attr");
+    assert_eq!(ds.attr_info_by_idx(0).unwrap(), attr.info());
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name(), "ds_attr");
     assert_eq!(val, 100);
+}
+
+#[test]
+fn test_attr_exists_on_file_group_and_dataset() {
+    let f = File::open("tests/data/attrs.h5").unwrap();
+    assert!(f.attr_exists("int_attr").unwrap());
+    assert!(!f.attr_exists("missing_attr").unwrap());
+
+    let ds = f.dataset("data").unwrap();
+    assert!(ds.attr_exists("ds_attr").unwrap());
+    assert!(!ds.attr_exists("missing_attr").unwrap());
+
+    let f = File::open("tests/data/simple_v0.h5").unwrap();
+    let group = f.group("group1").unwrap();
+    assert!(!group.attr_exists("missing_attr").unwrap());
 }
 
 #[test]
@@ -99,9 +145,21 @@ fn test_dense_attributes_creation_order_indexing_enabled_and_disabled() {
 
     let tracked = f.group("dense_attrs_tracked").unwrap();
     let tracked_names = tracked.attr_names().unwrap();
+    let tracked_attrs = tracked.attrs().unwrap();
     assert_eq!(tracked_names.len(), 32);
+    assert_eq!(tracked_attrs.len(), 32);
     assert!(tracked_names.contains(&"attr_00".to_string()));
     assert!(tracked_names.contains(&"attr_31".to_string()));
+    assert!(tracked_attrs.iter().any(|attr| attr.name() == "attr_07"));
+    let tracked_by_order = tracked.attrs_by_creation_order().unwrap();
+    assert_eq!(tracked_by_order.len(), 32);
+    assert_eq!(
+        tracked_by_order
+            .iter()
+            .map(|attr| attr.creation_order().unwrap())
+            .collect::<Vec<_>>(),
+        (0..32).collect::<Vec<_>>()
+    );
     assert_eq!(
         tracked.attr("attr_07").unwrap().read::<i32>().unwrap(),
         vec![7, 107]
@@ -112,10 +170,14 @@ fn test_dense_attributes_creation_order_indexing_enabled_and_disabled() {
     assert_eq!(untracked_names.len(), 32);
     assert!(untracked_names.contains(&"attr_00".to_string()));
     assert!(untracked_names.contains(&"attr_31".to_string()));
+    assert_eq!(untracked.attrs_by_creation_order().unwrap().len(), 32);
     assert_eq!(
         untracked.attr("attr_07").unwrap().read::<i32>().unwrap(),
         vec![7, 207]
     );
+
+    let old_file = File::open("tests/data/attrs.h5").unwrap();
+    assert!(old_file.attrs_by_creation_order().is_err());
 }
 
 #[test]
@@ -128,4 +190,5 @@ fn test_variable_length_attribute_payload_raw_read() {
     assert_eq!(attr.element_size(), 16);
     assert_eq!(attr.raw_data().len(), 48);
     assert!(attr.raw_data().iter().any(|&b| b != 0));
+    assert_eq!(attr.read_strings().unwrap(), vec!["", "alpha", "猫"]);
 }

@@ -46,7 +46,7 @@ macro_rules! impl_h5type {
     };
 }
 
-impl_h5type!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+impl_h5type!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
 
 /// Reinterpret a byte slice as a slice of `T`, copying to ensure alignment.
 pub fn bytes_to_slice<T: H5Type>(bytes: &[u8]) -> crate::Result<&[T]> {

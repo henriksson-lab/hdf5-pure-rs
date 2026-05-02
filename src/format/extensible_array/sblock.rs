@@ -2,6 +2,8 @@
 //! the super-block half of `H5EAcache.c`
 //! (`H5EA__cache_sblock_deserialize`).
 
+#![allow(dead_code)]
+
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -24,6 +26,76 @@ pub(super) struct ExtArraySuperBlock {
     /// Addresses of the data blocks owned by this super-block.
     pub(super) data_block_addrs: Vec<u64>,
 }
+
+pub(super) fn sblock_debug(block: &ExtArraySuperBlock) -> String {
+    format!(
+        "ExtArraySuperBlock(page_init_len={}, page_init_size={}, data_block_addrs={})",
+        block.page_init.len(),
+        block.page_init_size,
+        block.data_block_addrs.len()
+    )
+}
+
+pub(super) fn cache_sblock_verify_chksum(data: &[u8]) -> Result<()> {
+    verify_trailing_checksum(data, "extensible array super block")
+}
+
+pub(super) fn cache_sblock_image_len(
+    header: &ExtensibleArrayHeader,
+    info: &SuperBlockInfo,
+    addr_size: usize,
+) -> Result<usize> {
+    let page_init_size = super::data_block_pages(header, info.data_block_elements).div_ceil(8);
+    let page_init_len = super::checked_usize_mul(
+        info.data_blocks,
+        page_init_size,
+        "extensible array super block image length",
+    )?;
+    let addr_len = super::checked_usize_mul(
+        info.data_blocks,
+        addr_size,
+        "extensible array super block image length",
+    )?;
+    4usize
+        .checked_add(1)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(addr_size))
+        .and_then(|value| value.checked_add(header.array_offset_size as usize))
+        .and_then(|value| value.checked_add(page_init_len))
+        .and_then(|value| value.checked_add(addr_len))
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array super block image length overflow".into())
+        })
+}
+
+pub(super) fn cache_sblock_serialize(prefix_and_payload: &[u8]) -> Vec<u8> {
+    let mut out = prefix_and_payload.to_vec();
+    let checksum = crate::format::checksum::checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+pub(super) fn cache_sblock_notify(_block: &ExtArraySuperBlock) {}
+
+pub(super) fn cache_sblock_free_icr(_block: ExtArraySuperBlock) {}
+
+pub(super) fn sblock_alloc(page_init_size: usize, data_blocks: usize) -> ExtArraySuperBlock {
+    ExtArraySuperBlock {
+        page_init: vec![0; page_init_size.saturating_mul(data_blocks)],
+        page_init_size,
+        data_block_addrs: vec![crate::io::reader::UNDEF_ADDR; data_blocks],
+    }
+}
+
+pub(super) fn sblock_unprotect(_block: ExtArraySuperBlock) {}
+
+pub(super) fn sblock_delete(block: &mut ExtArraySuperBlock) {
+    block.page_init.clear();
+    block.data_block_addrs.clear();
+}
+
+pub(super) fn sblock_dest(_block: ExtArraySuperBlock) {}
 
 /// Pure deserializer for an extensible-array super-block.
 pub(super) fn decode_super_block<R: Read + Seek>(
@@ -70,7 +142,12 @@ pub(super) fn decode_super_block<R: Read + Seek>(
         0
     };
     let page_init = if page_init_size > 0 {
-        reader.read_bytes(info.data_blocks * page_init_size)?
+        let page_init_len = super::checked_usize_mul(
+            info.data_blocks,
+            page_init_size,
+            "extensible array super block page-init size",
+        )?;
+        reader.read_bytes(page_init_len)?
     } else {
         Vec::new()
     };
@@ -88,6 +165,25 @@ pub(super) fn decode_super_block<R: Read + Seek>(
     })
 }
 
+fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
+    if data.len() < 4 {
+        return Err(Error::InvalidFormat(format!("{context} image too short")));
+    }
+    let split = data.len() - 4;
+    let stored = u32::from_le_bytes(
+        data[split..]
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} checksum is truncated")))?,
+    );
+    let computed = crate::format::checksum::checksum_metadata(&data[..split]);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    Ok(())
+}
+
 /// Walk a decoded super-block: descend into each owned data block and
 /// stream elements into the shared output vector.
 #[allow(clippy::too_many_arguments)]
@@ -102,11 +198,12 @@ pub(super) fn read_super_block<R: Read + Seek>(
     elements: &mut Vec<FixedArrayElement>,
 ) -> Result<()> {
     if is_undef_addr(super_block_addr) {
-        super::append_fill_elements(
-            header,
-            info.data_blocks * info.data_block_elements,
-            elements,
+        let fill_count = super::checked_usize_mul(
+            info.data_blocks,
+            info.data_block_elements,
+            "extensible array super block fill count",
         )?;
+        super::append_fill_elements(header, fill_count, elements)?;
         return Ok(());
     }
 
@@ -122,10 +219,19 @@ pub(super) fn read_super_block<R: Read + Seek>(
         )?;
         let count = info.data_block_elements.min(remaining);
         let page_init_for_block = if sblock.page_init_size > 0 {
-            Some(
-                &sblock.page_init[data_block_index * sblock.page_init_size
-                    ..(data_block_index + 1) * sblock.page_init_size],
-            )
+            let start = super::checked_usize_mul(
+                data_block_index,
+                sblock.page_init_size,
+                "extensible array super block page-init offset",
+            )?;
+            let end = super::checked_usize_add(
+                start,
+                sblock.page_init_size,
+                "extensible array super block page-init offset",
+            )?;
+            Some(sblock.page_init.get(start..end).ok_or_else(|| {
+                Error::InvalidFormat("extensible array page-init slice out of bounds".into())
+            })?)
         } else {
             None
         };

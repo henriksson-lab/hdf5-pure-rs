@@ -22,22 +22,18 @@ impl FractalHeapHeader {
         // byte 0: version(2 bits) + type(2 bits) + reserved(4 bits)
         // then: offset (ceil(max_heap_size/8) bytes) + length (remaining bytes)
 
-        let offset_bytes = ((self.max_heap_size as usize) + 7) / 8;
+        let offset_bytes = managed_heap_offset_bytes(self.max_heap_size)?;
+        let offset_window = managed_heap_id_window(heap_id, 1, offset_bytes, "offset")?;
+        let offset = read_le_u64_prefix(offset_window, offset_bytes, "heap ID offset")?;
 
-        if heap_id.len() < 1 + offset_bytes {
-            return Err(Error::InvalidFormat("heap ID too short for offset".into()));
-        }
-
-        let mut offset = 0u64;
-        for i in 0..offset_bytes {
-            offset |= (heap_id[1 + i] as u64) << (i * 8);
-        }
-
-        let len_start = 1 + offset_bytes;
-        let mut length = 0u64;
-        for i in 0..(heap_id.len() - len_start).min(8) {
-            length |= (heap_id[len_start + i] as u64) << (i * 8);
-        }
+        let len_start = 1usize
+            .checked_add(offset_bytes)
+            .ok_or_else(|| Error::InvalidFormat("heap ID length offset overflow".into()))?;
+        let length_window = heap_id
+            .get(len_start..)
+            .ok_or_else(|| Error::InvalidFormat("heap ID too short for length".into()))?;
+        let length =
+            read_le_u64_prefix(length_window, length_window.len().min(8), "heap ID length")?;
 
         // Bound checks matching libhdf5's `H5HF__man_op_real`:
         //  - offset must be < 2^max_heap_size (the heap's address space)
@@ -112,17 +108,19 @@ impl FractalHeapHeader {
 
         for row in 0..iblock.nrows {
             if row < max_direct_rows {
-                let block_span = self.row_block_size(row);
+                let block_span = self.checked_row_block_size(row)?;
                 for _ in 0..width {
                     let child_addr = iblock.child_addrs[entry_index];
                     entry_index += 1;
 
                     if crate::io::reader::is_undef_addr(child_addr) {
-                        current_heap_offset += block_span;
+                        current_heap_offset =
+                            checked_add_heap_offset(current_heap_offset, block_span)?;
                         continue;
                     }
 
-                    if offset >= current_heap_offset && offset < current_heap_offset + block_span {
+                    let block_end = checked_add_heap_offset(current_heap_offset, block_span)?;
+                    if offset >= current_heap_offset && offset < block_end {
                         let local_offset = offset - current_heap_offset;
                         return self.read_from_direct_block(
                             reader,
@@ -135,15 +133,16 @@ impl FractalHeapHeader {
                         );
                     }
 
-                    current_heap_offset += block_span;
+                    current_heap_offset = block_end;
                 }
             } else {
-                let child_rows = self.child_indirect_rows(row);
+                let child_rows = self.child_indirect_rows(row)?;
                 let child_span = self.indirect_data_span(reader, child_rows)?;
                 for _ in 0..width {
                     let child_addr = iblock.child_addrs[entry_index];
                     entry_index += 1;
-                    if offset >= current_heap_offset && offset < current_heap_offset + child_span {
+                    let child_end = checked_add_heap_offset(current_heap_offset, child_span)?;
+                    if offset >= current_heap_offset && offset < child_end {
                         if crate::io::reader::is_undef_addr(child_addr) {
                             break;
                         }
@@ -156,7 +155,7 @@ impl FractalHeapHeader {
                             length,
                         );
                     }
-                    current_heap_offset += child_span;
+                    current_heap_offset = child_end;
                 }
             }
         }
@@ -194,34 +193,39 @@ impl FractalHeapHeader {
         length: u64,
     ) -> Result<Vec<u8>> {
         let width = self.table_width as usize;
-        let dblock_header_size = 5
-            + self.sizeof_addr as u64
-            + iblock.block_offset_bytes as u64
-            + if self.has_checksum { 4 } else { 0 };
+        let dblock_header_size = checked_add_heap_offset(
+            checked_add_heap_offset(5, self.sizeof_addr as u64)?,
+            checked_add_heap_offset(
+                iblock.block_offset_bytes as u64,
+                if self.has_checksum { 4 } else { 0 },
+            )?,
+        )?;
         let mut current_heap_offset = 0u64;
         let mut entry_index = 0usize;
 
         for row in 0..iblock.nrows {
-            let block_size = if row < 2 {
-                self.start_block_size
-            } else {
-                self.start_block_size * (1u64 << (row - 1))
-            };
+            let block_size = self.checked_row_block_size(row)?;
 
             if block_size > self.max_direct_block_size {
-                entry_index += width; // indirect-row entries carry no payload to consume here
+                entry_index = entry_index.checked_add(width).ok_or_else(|| {
+                    Error::InvalidFormat("fractal heap filtered entry index overflow".into())
+                })?; // indirect-row entries carry no payload to consume here
                 continue;
             }
 
-            let data_capacity = block_size - dblock_header_size;
+            let data_capacity = block_size.checked_sub(dblock_header_size).ok_or_else(|| {
+                Error::InvalidFormat("fractal heap direct block header exceeds block size".into())
+            })?;
             for _ in 0..width {
                 let entry = &iblock.entries[entry_index];
                 entry_index += 1;
                 if crate::io::reader::is_undef_addr(entry.addr) {
-                    current_heap_offset += data_capacity;
+                    current_heap_offset =
+                        checked_add_heap_offset(current_heap_offset, data_capacity)?;
                     continue;
                 }
-                if offset >= current_heap_offset && offset < current_heap_offset + data_capacity {
+                let block_end = checked_add_heap_offset(current_heap_offset, data_capacity)?;
+                if offset >= current_heap_offset && offset < block_end {
                     return self.read_from_direct_block(
                         reader,
                         entry.addr,
@@ -232,7 +236,7 @@ impl FractalHeapHeader {
                         length,
                     );
                 }
-                current_heap_offset += data_capacity;
+                current_heap_offset = block_end;
             }
         }
 
@@ -254,4 +258,70 @@ impl FractalHeapHeader {
         let iblock = self.decode_filtered_indirect_block(reader, block_addr)?;
         self.lookup_in_filtered_indirect_block(reader, &iblock, offset, length)
     }
+}
+
+fn managed_heap_offset_bytes(max_heap_size: u16) -> Result<usize> {
+    let bytes = (usize::from(max_heap_size) + 7) / 8;
+    if bytes > 8 {
+        return Err(Error::Unsupported(format!(
+            "managed heap ID offset uses {bytes} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn managed_heap_id_window<'a>(
+    heap_id: &'a [u8],
+    offset: usize,
+    len: usize,
+    field: &str,
+) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("heap ID {field} offset overflow")))?;
+    heap_id
+        .get(offset..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("heap ID too short for {field}")))
+}
+
+fn read_le_u64_prefix(bytes: &[u8], len: usize, context: &str) -> Result<u64> {
+    if len > 8 || len > bytes.len() {
+        return Err(Error::InvalidFormat(format!(
+            "{context} byte count is invalid"
+        )));
+    }
+    let mut value = 0u64;
+    for (i, byte) in bytes.iter().take(len).enumerate() {
+        value |= u64::from(*byte) << (i * 8);
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_heap_offset_bytes_rejects_wider_than_u64() {
+        let err = managed_heap_offset_bytes(72).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("managed heap ID offset uses 9 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn managed_heap_id_window_rejects_offset_overflow() {
+        let err = managed_heap_id_window(&[], usize::MAX, 1, "offset").unwrap_err();
+        assert!(
+            err.to_string().contains("heap ID offset offset overflow"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+fn checked_add_heap_offset(lhs: u64, rhs: u64) -> Result<u64> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidFormat("fractal heap offset span overflow".into()))
 }

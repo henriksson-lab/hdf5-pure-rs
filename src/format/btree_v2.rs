@@ -27,6 +27,38 @@ pub struct BTreeV2Header {
 }
 
 impl BTreeV2Header {
+    pub fn hdr_alloc(
+        tree_type: u8,
+        node_size: u32,
+        record_size: u16,
+        split_pct: u8,
+        merge_pct: u8,
+    ) -> Result<Self> {
+        let header = Self {
+            tree_type,
+            node_size,
+            record_size,
+            depth: 0,
+            split_pct,
+            merge_pct,
+            root_addr: 0,
+            root_nrecords: 0,
+            total_records: 0,
+        };
+        header.validate()?;
+        Ok(header)
+    }
+
+    pub fn hdr_create(
+        tree_type: u8,
+        node_size: u32,
+        record_size: u16,
+        split_pct: u8,
+        merge_pct: u8,
+    ) -> Result<Self> {
+        Self::hdr_alloc(tree_type, node_size, record_size, split_pct, merge_pct)
+    }
+
     pub fn read_at<R: Read + Seek>(reader: &mut HdfReader<R>, addr: u64) -> Result<Self> {
         reader.seek(addr).map_err(|err| {
             Error::InvalidFormat(format!("failed to seek to v2 B-tree header {addr}: {err}"))
@@ -80,6 +112,159 @@ impl BTreeV2Header {
             total_records,
         })
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.node_size <= B2_METADATA_PREFIX_SIZE as u32 {
+            return Err(Error::InvalidFormat("invalid v2 B-tree node sizing".into()));
+        }
+        if self.record_size == 0 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree record size must be positive".into(),
+            ));
+        }
+        if self.split_pct == 0 || self.split_pct > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "v2 B-tree split percent {} must be in 1..=100",
+                self.split_pct
+            )));
+        }
+        if self.merge_pct == 0 || self.merge_pct > 100 {
+            return Err(Error::InvalidFormat(format!(
+                "v2 B-tree merge percent {} must be in 1..=100",
+                self.merge_pct
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn cache_hdr_get_initial_load_size() -> usize {
+        4
+    }
+
+    pub fn cache_hdr_image_len(&self) -> usize {
+        B2_METADATA_PREFIX_SIZE + 2 + 2 + 1 + 1 + 8 + 2 + 8 + 4
+    }
+
+    pub fn cache_hdr_serialize(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut image = Vec::with_capacity(self.cache_hdr_image_len());
+        image.extend_from_slice(&B2HD_MAGIC);
+        image.push(0);
+        image.push(self.tree_type);
+        image.extend_from_slice(&self.node_size.to_le_bytes());
+        image.extend_from_slice(&self.record_size.to_le_bytes());
+        image.extend_from_slice(&self.depth.to_le_bytes());
+        image.push(self.split_pct);
+        image.push(self.merge_pct);
+        image.extend_from_slice(&self.root_addr.to_le_bytes());
+        image.extend_from_slice(&self.root_nrecords.to_le_bytes());
+        image.extend_from_slice(&self.total_records.to_le_bytes());
+        let checksum = checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        Ok(image)
+    }
+
+    pub fn cache_hdr_notify(&mut self, action: BTreeV2CacheAction) {
+        if matches!(action, BTreeV2CacheAction::Dirtied) {
+            self.hdr_dirty();
+        }
+    }
+
+    pub fn cache_hdr_free_icr(_image: Vec<u8>) {}
+
+    pub fn hdr_debug(&self) -> String {
+        format!(
+            "BTreeV2Header(type={}, node_size={}, record_size={}, depth={}, root={:#x}, nrec={})",
+            self.tree_type,
+            self.node_size,
+            self.record_size,
+            self.depth,
+            self.root_addr,
+            self.total_records
+        )
+    }
+
+    pub fn hdr_incr(&mut self, nrecords: u64) -> Result<()> {
+        self.total_records = self
+            .total_records
+            .checked_add(nrecords)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree record count overflow".into()))?;
+        Ok(())
+    }
+
+    pub fn hdr_decr(&mut self, nrecords: u64) -> Result<()> {
+        self.total_records = self
+            .total_records
+            .checked_sub(nrecords)
+            .ok_or_else(|| Error::InvalidFormat("v2 B-tree record count underflow".into()))?;
+        Ok(())
+    }
+
+    pub fn hdr_fuse_incr(&mut self) -> Result<()> {
+        self.hdr_incr(1)
+    }
+
+    pub fn hdr_fuse_decr(&mut self) -> Result<()> {
+        self.hdr_decr(1)
+    }
+
+    pub fn hdr_dirty(&mut self) {}
+
+    pub fn hdr_protect(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn hdr_unprotect(self) -> Self {
+        self
+    }
+
+    pub fn hdr_free(self) {}
+
+    pub fn hdr_delete(self) {}
+
+    pub fn size(&self) -> u64 {
+        self.cache_hdr_image_len() as u64
+            + self
+                .total_records
+                .saturating_mul(u64::from(self.record_size))
+    }
+
+    pub fn node_size(&self) -> u32 {
+        self.node_size
+    }
+
+    pub fn create_flush_depend(&self) {}
+
+    pub fn update_flush_depend(&self) {}
+
+    pub fn update_child_flush_depends(&self) {}
+
+    pub fn destroy_flush_depend(&self) {}
+
+    pub fn get_root_addr_test(&self) -> u64 {
+        self.root_addr
+    }
+
+    pub fn get_node_info_test(&self, sizeof_addr: usize) -> Result<Vec<(usize, u64, usize)>> {
+        compute_node_info(self, sizeof_addr).map(|infos| {
+            infos
+                .into_iter()
+                .map(|info| (info.max_nrec, info.cum_max_nrec, info.cum_max_nrec_size))
+                .collect()
+        })
+    }
+
+    pub fn get_node_depth_test(&self) -> u16 {
+        self.depth
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BTreeV2CacheAction {
+    Loaded,
+    Dirtied,
+    Flushed,
+    Evicted,
 }
 
 fn verify_checksum<R: Read + Seek>(
@@ -99,7 +284,9 @@ fn verify_checksum<R: Read + Seek>(
             "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
         )));
     }
-    reader.seek(checksum_pos + 4)?;
+    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
+    })?)?;
     Ok(())
 }
 
@@ -161,7 +348,10 @@ fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<N
     }
 
     let max_nrec_size = bytes_needed(leaf_max as u64);
-    let mut node_info = Vec::with_capacity(header.depth as usize + 1);
+    let depth_count = (header.depth as usize)
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("v2 B-tree depth count overflow".into()))?;
+    let mut node_info = Vec::with_capacity(depth_count);
     node_info.push(NodeInfo {
         max_nrec: leaf_max,
         cum_max_nrec: leaf_max as u64,
@@ -169,15 +359,28 @@ fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<N
     });
 
     for depth in 1..=header.depth as usize {
-        let pointer_size = sizeof_addr + max_nrec_size + node_info[depth - 1].cum_max_nrec_size;
-        if node_size <= B2_METADATA_PREFIX_SIZE + pointer_size {
+        let pointer_size = checked_usize_sum(
+            &[
+                sizeof_addr,
+                max_nrec_size,
+                node_info[depth - 1].cum_max_nrec_size,
+            ],
+            "v2 B-tree pointer size",
+        )?;
+        let prefix_and_pointer = checked_usize_sum(
+            &[B2_METADATA_PREFIX_SIZE, pointer_size],
+            "v2 B-tree internal node prefix",
+        )?;
+        if node_size <= prefix_and_pointer {
             return Err(Error::InvalidFormat(
                 "v2 B-tree internal node cannot hold records".into(),
             ));
         }
 
-        let max_nrec =
-            (node_size - (B2_METADATA_PREFIX_SIZE + pointer_size)) / (record_size + pointer_size);
+        let record_slot = record_size.checked_add(pointer_size).ok_or_else(|| {
+            Error::InvalidFormat("v2 B-tree internal record slot size overflow".into())
+        })?;
+        let max_nrec = (node_size - prefix_and_pointer) / record_slot;
         if max_nrec == 0 {
             return Err(Error::InvalidFormat(
                 "v2 B-tree internal node cannot hold records".into(),
@@ -185,7 +388,13 @@ fn compute_node_info(header: &BTreeV2Header, sizeof_addr: usize) -> Result<Vec<N
         }
 
         let prev_cum = node_info[depth - 1].cum_max_nrec;
-        let cum_max_nrec = ((max_nrec as u64 + 1) * prev_cum) + max_nrec as u64;
+        let cum_max_nrec = (max_nrec as u64)
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(prev_cum))
+            .and_then(|n| n.checked_add(max_nrec as u64))
+            .ok_or_else(|| {
+                Error::InvalidFormat("v2 B-tree cumulative record count overflow".into())
+            })?;
         node_info.push(NodeInfo {
             max_nrec,
             cum_max_nrec,
@@ -205,6 +414,272 @@ pub struct BTreeV2InternalNode {
     /// One entry per child pointer: `(child_addr, child_nrecords)`.
     /// `records.len() + 1` entries total.
     pub children: Vec<(u64, u16)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BTreeV2LeafNode {
+    pub records: Vec<Vec<u8>>,
+}
+
+impl BTreeV2LeafNode {
+    pub fn create_leaf(records: Vec<Vec<u8>>, record_size: usize) -> Result<Self> {
+        validate_records(&records, record_size)?;
+        Ok(Self { records })
+    }
+
+    pub fn protect_leaf(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn neighbor_leaf(&self, record: &[u8], direction: BTreeV2Neighbor) -> Option<Vec<u8>> {
+        neighbor_record(&self.records, record, direction)
+    }
+
+    pub fn insert_leaf(&mut self, record: Vec<u8>, record_size: usize) -> Result<bool> {
+        insert_sorted_unique(&mut self.records, record, record_size)
+    }
+
+    pub fn update_leaf(&mut self, record: Vec<u8>, record_size: usize) -> Result<bool> {
+        validate_record(&record, record_size)?;
+        match self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(&record))
+        {
+            Ok(idx) => {
+                self.records[idx] = record;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    pub fn swap_leaf(&mut self, idx_a: usize, idx_b: usize) -> Result<()> {
+        if idx_a >= self.records.len() || idx_b >= self.records.len() {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree leaf swap index out of bounds".into(),
+            ));
+        }
+        self.records.swap(idx_a, idx_b);
+        Ok(())
+    }
+
+    pub fn remove_leaf(&mut self, record: &[u8]) -> Option<Vec<u8>> {
+        let idx = self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+            .ok()?;
+        Some(self.records.remove(idx))
+    }
+
+    pub fn remove_leaf_by_idx(&mut self, index: usize) -> Option<Vec<u8>> {
+        if index < self.records.len() {
+            Some(self.records.remove(index))
+        } else {
+            None
+        }
+    }
+
+    pub fn assert_leaf(&self, record_size: usize) -> Result<()> {
+        validate_records(&self.records, record_size)?;
+        if !self.records.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree leaf records are not sorted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn assert_leaf2(&self, record_size: usize) -> Result<()> {
+        self.assert_leaf(record_size)
+    }
+
+    pub fn cache_leaf_get_initial_load_size() -> usize {
+        6
+    }
+
+    pub fn cache_leaf_verify_chksum(image: &[u8]) -> Result<()> {
+        verify_image_checksum(image, "v2 B-tree leaf")
+    }
+
+    pub fn cache_leaf_image_len(&self, record_size: usize) -> usize {
+        6 + self.records.len() * record_size + 4
+    }
+
+    pub fn cache_leaf_serialize(&self, tree_type: u8, record_size: usize) -> Result<Vec<u8>> {
+        self.assert_leaf(record_size)?;
+        let mut image = Vec::with_capacity(self.cache_leaf_image_len(record_size));
+        image.extend_from_slice(&B2LF_MAGIC);
+        image.push(0);
+        image.push(tree_type);
+        for record in &self.records {
+            image.extend_from_slice(record);
+        }
+        let checksum = checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        Ok(image)
+    }
+
+    pub fn cache_leaf_notify(&mut self, _action: BTreeV2CacheAction) {}
+
+    pub fn cache_leaf_free_icr(_image: Vec<u8>) {}
+}
+
+impl BTreeV2InternalNode {
+    pub fn create_internal(
+        records: Vec<Vec<u8>>,
+        children: Vec<(u64, u16)>,
+        record_size: usize,
+    ) -> Result<Self> {
+        validate_records(&records, record_size)?;
+        if children.len() != records.len().saturating_add(1) {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal child count must be record count + 1".into(),
+            ));
+        }
+        Ok(Self { records, children })
+    }
+
+    pub fn protect_internal(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn neighbor_internal(&self, record: &[u8], direction: BTreeV2Neighbor) -> Option<Vec<u8>> {
+        neighbor_record(&self.records, record, direction)
+    }
+
+    pub fn insert_internal(
+        &mut self,
+        record: Vec<u8>,
+        right_child: (u64, u16),
+        record_size: usize,
+    ) -> Result<bool> {
+        validate_record(&record, record_size)?;
+        match self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(&record))
+        {
+            Ok(_) => Ok(false),
+            Err(idx) => {
+                self.records.insert(idx, record);
+                self.children.insert(idx + 1, right_child);
+                Ok(true)
+            }
+        }
+    }
+
+    pub fn update_internal(&mut self, record: Vec<u8>, record_size: usize) -> Result<bool> {
+        validate_record(&record, record_size)?;
+        match self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(&record))
+        {
+            Ok(idx) => {
+                self.records[idx] = record;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    pub fn shadow_internal(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn remove_internal(&mut self, record: &[u8]) -> Option<Vec<u8>> {
+        let idx = self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+            .ok()?;
+        self.children.remove(idx + 1);
+        Some(self.records.remove(idx))
+    }
+
+    pub fn remove_internal_by_idx(&mut self, index: usize) -> Option<Vec<u8>> {
+        if index >= self.records.len() {
+            return None;
+        }
+        self.children.remove(index + 1);
+        Some(self.records.remove(index))
+    }
+
+    pub fn internal_free(self) {}
+
+    pub fn assert_internal(&self, record_size: usize) -> Result<()> {
+        validate_records(&self.records, record_size)?;
+        if self.children.len() != self.records.len().saturating_add(1) {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal child count must be record count + 1".into(),
+            ));
+        }
+        if !self.records.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree internal records are not sorted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn assert_internal2(&self, record_size: usize) -> Result<()> {
+        self.assert_internal(record_size)
+    }
+
+    pub fn cache_int_get_initial_load_size() -> usize {
+        6
+    }
+
+    pub fn cache_int_verify_chksum(image: &[u8]) -> Result<()> {
+        verify_image_checksum(image, "v2 B-tree internal")
+    }
+
+    pub fn cache_int_image_len(&self, header: &BTreeV2Header, sizeof_addr: usize) -> Result<usize> {
+        let infos = compute_node_info(header, sizeof_addr)?;
+        let nrec_size = bytes_needed(infos[0].max_nrec as u64);
+        checked_usize_sum(
+            &[
+                6,
+                self.records.len() * header.record_size as usize,
+                self.children.len() * (sizeof_addr + nrec_size),
+                4,
+            ],
+            "v2 B-tree internal image",
+        )
+    }
+
+    pub fn cache_int_serialize(
+        &self,
+        header: &BTreeV2Header,
+        sizeof_addr: usize,
+    ) -> Result<Vec<u8>> {
+        self.assert_internal(header.record_size as usize)?;
+        let infos = compute_node_info(header, sizeof_addr)?;
+        let nrec_size = bytes_needed(infos[0].max_nrec as u64);
+        let mut image = Vec::with_capacity(self.cache_int_image_len(header, sizeof_addr)?);
+        image.extend_from_slice(&B2IN_MAGIC);
+        image.push(0);
+        image.push(header.tree_type);
+        for record in &self.records {
+            image.extend_from_slice(record);
+        }
+        for (addr, nrecords) in &self.children {
+            write_fixed_le(&mut image, *addr, sizeof_addr)?;
+            write_fixed_le(&mut image, u64::from(*nrecords), nrec_size)?;
+        }
+        let checksum = checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        Ok(image)
+    }
+
+    pub fn cache_int_notify(&mut self, _action: BTreeV2CacheAction) {}
+
+    pub fn cache_int_free_icr(_image: Vec<u8>) {}
+
+    pub fn int_debug(&self) -> String {
+        format!(
+            "BTreeV2InternalNode(records={}, children={})",
+            self.records.len(),
+            self.children.len()
+        )
+    }
 }
 
 /// Pure deserializer for a v2 B-tree internal node — mirrors libhdf5's
@@ -233,6 +708,13 @@ fn decode_internal_node<R: Read + Seek>(
     let _version = reader.read_u8()?;
     let _type = reader.read_u8()?;
 
+    if nrecords as usize > node_info[depth as usize].max_nrec {
+        return Err(Error::InvalidFormat(format!(
+            "v2 B-tree internal node has too many records: {} > {}",
+            nrecords, node_info[depth as usize].max_nrec
+        )));
+    }
+
     let mut records = Vec::with_capacity(nrecords as usize);
     for _ in 0..nrecords {
         records.push(reader.read_bytes(header.record_size as usize)?);
@@ -245,7 +727,10 @@ fn decode_internal_node<R: Read + Seek>(
         0
     };
 
-    let mut children = Vec::with_capacity(nrecords as usize + 1);
+    let child_count = (nrecords as usize)
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("v2 B-tree child count overflow".into()))?;
+    let mut children = Vec::with_capacity(child_count);
     for _ in 0..=nrecords {
         let child_addr = reader.read_addr()?;
         let child_nrecords = read_var_uint(reader, max_nrec_size)? as u16;
@@ -367,12 +852,352 @@ fn read_leaf_records<R: Read + Seek>(
     let _version = reader.read_u8()?;
     let _type = reader.read_u8()?;
 
+    if record_size == 0 {
+        return Err(Error::InvalidFormat(
+            "v2 B-tree leaf record size must be positive".into(),
+        ));
+    }
+
     for _ in 0..nrecords {
         let record = reader.read_bytes(record_size as usize)?;
         records.push(record);
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BTreeV2Neighbor {
+    Less,
+    Greater,
+}
+
+#[derive(Debug, Clone)]
+pub struct BTreeV2Tree {
+    pub header: BTreeV2Header,
+    records: Vec<Vec<u8>>,
+    closed: bool,
+}
+
+impl BTreeV2Tree {
+    pub fn create(header: BTreeV2Header) -> Result<Self> {
+        header.validate()?;
+        Ok(Self {
+            header,
+            records: Vec::new(),
+            closed: false,
+        })
+    }
+
+    pub fn open(header: BTreeV2Header, mut records: Vec<Vec<u8>>) -> Result<Self> {
+        header.validate()?;
+        validate_records(&records, header.record_size as usize)?;
+        records.sort();
+        let mut tree = Self {
+            header,
+            records,
+            closed: false,
+        };
+        tree.sync_header_count()?;
+        Ok(tree)
+    }
+
+    pub fn insert(&mut self, record: Vec<u8>) -> Result<bool> {
+        self.ensure_open()?;
+        let inserted =
+            insert_sorted_unique(&mut self.records, record, self.header.record_size as usize)?;
+        if inserted {
+            self.sync_header_count()?;
+        }
+        Ok(inserted)
+    }
+
+    pub fn insert_tree(&mut self, record: Vec<u8>) -> Result<bool> {
+        self.insert(record)
+    }
+
+    pub fn update(&mut self, record: Vec<u8>) -> Result<bool> {
+        self.ensure_open()?;
+        validate_record(&record, self.header.record_size as usize)?;
+        match self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(&record))
+        {
+            Ok(idx) => {
+                self.records[idx] = record;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    pub fn find(&self, record: &[u8]) -> Option<Vec<u8>> {
+        self.records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+            .ok()
+            .map(|idx| self.records[idx].clone())
+    }
+
+    pub fn index(&self, index: usize) -> Option<&[u8]> {
+        self.records.get(index).map(Vec::as_slice)
+    }
+
+    pub fn remove(&mut self, record: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.ensure_open()?;
+        let removed = match self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+        {
+            Ok(idx) => Some(self.records.remove(idx)),
+            Err(_) => None,
+        };
+        if removed.is_some() {
+            self.sync_header_count()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn remove_by_idx(&mut self, index: usize) -> Result<Option<Vec<u8>>> {
+        self.ensure_open()?;
+        let removed = if index < self.records.len() {
+            Some(self.records.remove(index))
+        } else {
+            None
+        };
+        if removed.is_some() {
+            self.sync_header_count()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn get_nrec(&self) -> u64 {
+        self.records.len() as u64
+    }
+
+    pub fn get_addr(&self) -> u64 {
+        self.header.root_addr
+    }
+
+    pub fn neighbor(&self, record: &[u8], direction: BTreeV2Neighbor) -> Option<Vec<u8>> {
+        neighbor_record(&self.records, record, direction)
+    }
+
+    pub fn modify<F>(&mut self, record: &[u8], mut update: F) -> Result<bool>
+    where
+        F: FnMut(&mut Vec<u8>),
+    {
+        self.ensure_open()?;
+        let idx = match self
+            .records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+        {
+            Ok(idx) => idx,
+            Err(_) => return Ok(false),
+        };
+        update(&mut self.records[idx]);
+        validate_record(&self.records[idx], self.header.record_size as usize)?;
+        self.records.sort();
+        Ok(true)
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+
+    pub fn delete(mut self) {
+        self.records.clear();
+        self.header.total_records = 0;
+        self.closed = true;
+    }
+
+    pub fn depend(&self) {}
+
+    pub fn patch_file(&mut self, root_addr: u64) {
+        self.header.root_addr = root_addr;
+    }
+
+    pub fn locate_record(&self, record: &[u8]) -> std::result::Result<usize, usize> {
+        self.records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+    }
+
+    pub fn split1(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        split_records(&self.records)
+    }
+
+    pub fn split_root(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        self.split1()
+    }
+
+    pub fn redistribute2(left: &mut Vec<Vec<u8>>, right: &mut Vec<Vec<u8>>) {
+        rebalance_two(left, right);
+    }
+
+    pub fn redistribute3(
+        left: &mut Vec<Vec<u8>>,
+        middle: &mut Vec<Vec<u8>>,
+        right: &mut Vec<Vec<u8>>,
+    ) {
+        let mut all = Vec::new();
+        all.append(left);
+        all.append(middle);
+        all.append(right);
+        all.sort();
+        let one = all.len() / 3;
+        let two = (all.len() * 2) / 3;
+        *left = all[..one].to_vec();
+        *middle = all[one..two].to_vec();
+        *right = all[two..].to_vec();
+    }
+
+    pub fn merge2(left: Vec<Vec<u8>>, right: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut merged = left;
+        merged.extend(right);
+        merged.sort();
+        merged
+    }
+
+    pub fn merge3(left: Vec<Vec<u8>>, middle: Vec<Vec<u8>>, right: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut merged = left;
+        merged.extend(middle);
+        merged.extend(right);
+        merged.sort();
+        merged
+    }
+
+    pub fn delete_node(records: &mut Vec<Vec<u8>>, record: &[u8]) -> Option<Vec<u8>> {
+        let idx = records
+            .binary_search_by(|probe| probe.as_slice().cmp(record))
+            .ok()?;
+        Some(records.remove(idx))
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            Err(Error::InvalidFormat("v2 B-tree is closed".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn sync_header_count(&mut self) -> Result<()> {
+        self.header.total_records = self.records.len() as u64;
+        self.header.root_nrecords = u16::try_from(self.records.len())
+            .map_err(|_| Error::InvalidFormat("v2 B-tree root record count overflow".into()))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BTreeV2TestContext {
+    pub record_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BTreeV2TestRecord {
+    pub key: u64,
+    pub value: u64,
+}
+
+impl BTreeV2TestContext {
+    pub fn test_crt_context(record_size: usize) -> Result<Self> {
+        if record_size < 8 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree test context record size must be at least 8".into(),
+            ));
+        }
+        Ok(Self { record_size })
+    }
+
+    pub fn test_dst_context(self) {}
+}
+
+impl BTreeV2TestRecord {
+    pub fn test_store(key: u64, value: u64) -> Self {
+        Self { key, value }
+    }
+
+    pub fn test_compare(left: &Self, right: &Self) -> std::cmp::Ordering {
+        left.cmp(right)
+    }
+
+    pub fn test_encode(&self, context: &BTreeV2TestContext) -> Result<Vec<u8>> {
+        let mut out = vec![0; context.record_size];
+        out[..8].copy_from_slice(&self.key.to_le_bytes());
+        if context.record_size >= 16 {
+            out[8..16].copy_from_slice(&self.value.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    pub fn test_decode(context: &BTreeV2TestContext, image: &[u8]) -> Result<Self> {
+        if image.len() < context.record_size || context.record_size < 8 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree test record image is truncated".into(),
+            ));
+        }
+        let key = u64::from_le_bytes(
+            image[..8]
+                .try_into()
+                .map_err(|_| Error::InvalidFormat("v2 B-tree test key is truncated".into()))?,
+        );
+        let value =
+            if context.record_size >= 16 {
+                u64::from_le_bytes(image[8..16].try_into().map_err(|_| {
+                    Error::InvalidFormat("v2 B-tree test value is truncated".into())
+                })?)
+            } else {
+                0
+            };
+        Ok(Self { key, value })
+    }
+
+    pub fn test_debug(&self) -> String {
+        format!("BTreeV2TestRecord(key={}, value={})", self.key, self.value)
+    }
+
+    pub fn test2_store(key: u64, value: u64) -> Self {
+        Self::test_store(key, value)
+    }
+
+    pub fn test2_compare(left: &Self, right: &Self) -> std::cmp::Ordering {
+        right.cmp(left)
+    }
+
+    pub fn test2_encode(&self, context: &BTreeV2TestContext) -> Result<Vec<u8>> {
+        let mut out = vec![0; context.record_size];
+        out[..8].copy_from_slice(&self.key.to_be_bytes());
+        if context.record_size >= 16 {
+            out[8..16].copy_from_slice(&self.value.to_be_bytes());
+        }
+        Ok(out)
+    }
+
+    pub fn test2_decode(context: &BTreeV2TestContext, image: &[u8]) -> Result<Self> {
+        if image.len() < context.record_size || context.record_size < 8 {
+            return Err(Error::InvalidFormat(
+                "v2 B-tree test2 record image is truncated".into(),
+            ));
+        }
+        let key = u64::from_be_bytes(
+            image[..8]
+                .try_into()
+                .map_err(|_| Error::InvalidFormat("v2 B-tree test2 key is truncated".into()))?,
+        );
+        let value =
+            if context.record_size >= 16 {
+                u64::from_be_bytes(image[8..16].try_into().map_err(|_| {
+                    Error::InvalidFormat("v2 B-tree test2 value is truncated".into())
+                })?)
+            } else {
+                0
+            };
+        Ok(Self { key, value })
+    }
+
+    pub fn test2_debug(&self) -> String {
+        format!("BTreeV2Test2Record(key={}, value={})", self.key, self.value)
+    }
 }
 
 fn read_var_uint<R: Read + Seek>(reader: &mut HdfReader<R>, size: usize) -> Result<u64> {
@@ -390,6 +1215,107 @@ fn read_var_uint<R: Read + Seek>(reader: &mut HdfReader<R>, size: usize) -> Resu
     Ok(value)
 }
 
+fn validate_record(record: &[u8], record_size: usize) -> Result<()> {
+    if record.len() != record_size {
+        return Err(Error::InvalidFormat(format!(
+            "v2 B-tree record has size {}, expected {record_size}",
+            record.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_records(records: &[Vec<u8>], record_size: usize) -> Result<()> {
+    for record in records {
+        validate_record(record, record_size)?;
+    }
+    Ok(())
+}
+
+fn insert_sorted_unique(
+    records: &mut Vec<Vec<u8>>,
+    record: Vec<u8>,
+    record_size: usize,
+) -> Result<bool> {
+    validate_record(&record, record_size)?;
+    match records.binary_search_by(|probe| probe.as_slice().cmp(&record)) {
+        Ok(_) => Ok(false),
+        Err(idx) => {
+            records.insert(idx, record);
+            Ok(true)
+        }
+    }
+}
+
+fn neighbor_record(
+    records: &[Vec<u8>],
+    record: &[u8],
+    direction: BTreeV2Neighbor,
+) -> Option<Vec<u8>> {
+    let idx = match records.binary_search_by(|probe| probe.as_slice().cmp(record)) {
+        Ok(idx) => idx,
+        Err(idx) => idx,
+    };
+    match direction {
+        BTreeV2Neighbor::Less => idx.checked_sub(1).and_then(|pos| records.get(pos)).cloned(),
+        BTreeV2Neighbor::Greater => {
+            let pos = if records
+                .get(idx)
+                .is_some_and(|found| found.as_slice() == record)
+            {
+                idx + 1
+            } else {
+                idx
+            };
+            records.get(pos).cloned()
+        }
+    }
+}
+
+fn split_records(records: &[Vec<u8>]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mid = records.len() / 2;
+    (records[..mid].to_vec(), records[mid..].to_vec())
+}
+
+fn rebalance_two(left: &mut Vec<Vec<u8>>, right: &mut Vec<Vec<u8>>) {
+    let mut all = Vec::new();
+    all.append(left);
+    all.append(right);
+    all.sort();
+    let mid = all.len() / 2;
+    *left = all[..mid].to_vec();
+    *right = all[mid..].to_vec();
+}
+
+fn verify_image_checksum(image: &[u8], context: &str) -> Result<()> {
+    if image.len() < 4 {
+        return Err(Error::InvalidFormat(format!("{context} image too short")));
+    }
+    let split = image.len() - 4;
+    let stored = u32::from_le_bytes(
+        image[split..]
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} checksum is truncated")))?,
+    );
+    let computed = checksum_metadata(&image[..split]);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    Ok(())
+}
+
+fn write_fixed_le(out: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
+    if width == 0 || width > 8 {
+        return Err(Error::InvalidFormat(format!(
+            "invalid v2 B-tree integer width {width}"
+        )));
+    }
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+    Ok(())
+}
+
 fn bytes_needed(mut value: u64) -> usize {
     let mut bytes = 1usize;
     while value > 0xff {
@@ -397,4 +1323,82 @@ fn bytes_needed(mut value: u64) -> usize {
         bytes += 1;
     }
     bytes
+}
+
+fn checked_usize_sum(parts: &[usize], context: &str) -> Result<usize> {
+    let mut sum = 0usize;
+    for part in parts {
+        sum = sum
+            .checked_add(*part)
+            .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))?;
+    }
+    Ok(sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        checked_usize_sum, BTreeV2Header, BTreeV2InternalNode, BTreeV2LeafNode, BTreeV2Neighbor,
+        BTreeV2TestContext, BTreeV2TestRecord, BTreeV2Tree,
+    };
+
+    #[test]
+    fn btree_v2_usize_sum_rejects_overflow() {
+        let err = checked_usize_sum(&[usize::MAX, 1], "btree").unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn btree_v2_tree_tracks_sorted_records() {
+        let header = BTreeV2Header::hdr_create(10, 256, 2, 100, 40).unwrap();
+        let mut tree = BTreeV2Tree::create(header).unwrap();
+
+        assert!(tree.insert(vec![2, 0]).unwrap());
+        assert!(tree.insert(vec![1, 0]).unwrap());
+        assert!(!tree.insert(vec![1, 0]).unwrap());
+
+        assert_eq!(tree.get_nrec(), 2);
+        assert_eq!(tree.index(0), Some([1, 0].as_slice()));
+        assert_eq!(tree.find(&[2, 0]), Some(vec![2, 0]));
+        assert_eq!(
+            tree.neighbor(&[1, 0], BTreeV2Neighbor::Greater),
+            Some(vec![2, 0])
+        );
+        assert_eq!(tree.remove(&[1, 0]).unwrap(), Some(vec![1, 0]));
+        assert_eq!(tree.get_nrec(), 1);
+    }
+
+    #[test]
+    fn btree_v2_cache_images_have_valid_checksums() {
+        let header = BTreeV2Header::hdr_create(10, 256, 2, 100, 40).unwrap();
+        let header_image = header.cache_hdr_serialize().unwrap();
+        super::verify_image_checksum(&header_image, "header").unwrap();
+
+        let leaf = BTreeV2LeafNode::create_leaf(vec![vec![1, 0], vec![2, 0]], 2).unwrap();
+        let leaf_image = leaf.cache_leaf_serialize(10, 2).unwrap();
+        BTreeV2LeafNode::cache_leaf_verify_chksum(&leaf_image).unwrap();
+
+        let internal =
+            BTreeV2InternalNode::create_internal(vec![vec![2, 0]], vec![(10, 1), (20, 1)], 2)
+                .unwrap();
+        let internal_image = internal.cache_int_serialize(&header, 8).unwrap();
+        BTreeV2InternalNode::cache_int_verify_chksum(&internal_image).unwrap();
+    }
+
+    #[test]
+    fn btree_v2_test_record_codecs_round_trip() {
+        let context = BTreeV2TestContext::test_crt_context(16).unwrap();
+        let record = BTreeV2TestRecord::test_store(7, 11);
+        let image = record.test_encode(&context).unwrap();
+        assert_eq!(
+            BTreeV2TestRecord::test_decode(&context, &image).unwrap(),
+            record
+        );
+
+        let image2 = record.test2_encode(&context).unwrap();
+        assert_eq!(
+            BTreeV2TestRecord::test2_decode(&context, &image2).unwrap(),
+            record
+        );
+    }
 }

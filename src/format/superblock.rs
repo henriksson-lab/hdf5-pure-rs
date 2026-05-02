@@ -241,7 +241,7 @@ impl Superblock {
         // Verify checksum: compute over the entire superblock except the checksum itself.
         // Superblock v2: signature(8) + version(1) + sizeof_addr(1) + sizeof_size(1) +
         //                status_flags(1) + 4*sizeof_addr addresses = 12 + 4*sizeof_addr bytes
-        let sb_size = 12 + 4 * sizeof_addr as usize;
+        let sb_size = Self::v2_checksum_span(sizeof_addr)?;
         reader.seek(0)?;
         let sb_data = reader.read_bytes(sb_size)?;
         let computed_checksum = checksum_metadata(&sb_data);
@@ -253,7 +253,11 @@ impl Superblock {
         }
 
         // Seek past the checksum to leave reader in correct position
-        reader.seek(sb_size as u64 + 4)?;
+        let checksum_end = u64::try_from(sb_size)
+            .ok()
+            .and_then(|value| value.checked_add(4))
+            .ok_or_else(|| Error::InvalidFormat("superblock checksum offset overflow".into()))?;
+        reader.seek(checksum_end)?;
 
         Ok(Superblock {
             version,
@@ -300,25 +304,53 @@ impl Superblock {
     }
 
     /// Compute the total size of the superblock in bytes.
+    ///
+    /// This infallible helper saturates on arithmetic overflow. Use
+    /// [`Superblock::checked_size`] when malformed metadata should surface as
+    /// an error.
     pub fn size(&self) -> usize {
+        self.checked_size().unwrap_or(usize::MAX)
+    }
+
+    /// Compute the total size of the superblock in bytes with checked arithmetic.
+    pub fn checked_size(&self) -> Result<usize> {
         if self.version < 2 {
             // Fixed: sig(8) + version(1) = 9
             // Variable v0: 16 + 4*sizeof_addr + H5G_SIZEOF_ENTRY
             // H5G_SIZEOF_ENTRY = sizeof_size + sizeof_addr + 4 + 4 + 16
-            let entry_size = self.sizeof_size as usize + self.sizeof_addr as usize + 4 + 4 + 16;
+            let entry_size = (self.sizeof_size as usize)
+                .checked_add(self.sizeof_addr as usize)
+                .and_then(|value| value.checked_add(24))
+                .ok_or_else(|| Error::InvalidFormat("superblock size overflow".into()))?;
             let common = 16; // freespace(1) + rootgrp(1) + reserved(1) + shared(1) + sizes(2) + reserved(1) + btree_k(4) + flags(4) + 1 extra reserved
-            let addrs = 4 * self.sizeof_addr as usize;
+            let addrs = 4usize
+                .checked_mul(self.sizeof_addr as usize)
+                .ok_or_else(|| Error::InvalidFormat("superblock size overflow".into()))?;
             let v1_extra = if self.version > 0 {
                 2 + if self.version == 1 { 2 } else { 0 }
             } else {
                 0
             };
-            9 + common + v1_extra + addrs + entry_size
+            9usize
+                .checked_add(common)
+                .and_then(|value| value.checked_add(v1_extra))
+                .and_then(|value| value.checked_add(addrs))
+                .and_then(|value| value.checked_add(entry_size))
+                .ok_or_else(|| Error::InvalidFormat("superblock size overflow".into()))
         } else {
             // Fixed: sig(8) + version(1) + sizeof_addr(1) + sizeof_size(1) + flags(1) +
             //        4*sizeof_addr + checksum(4)
-            12 + 4 * self.sizeof_addr as usize + 4
+            Self::v2_checksum_span(self.sizeof_addr)?
+                .checked_add(4)
+                .ok_or_else(|| Error::InvalidFormat("superblock size overflow".into()))
         }
+    }
+
+    fn v2_checksum_span(sizeof_addr: u8) -> Result<usize> {
+        4usize
+            .checked_mul(sizeof_addr as usize)
+            .and_then(|addr_bytes| 12usize.checked_add(addr_bytes))
+            .ok_or_else(|| Error::InvalidFormat("superblock checksum span overflow".into()))
     }
 
     fn validate_sizes(sizeof_addr: u8, sizeof_size: u8) -> Result<()> {
@@ -331,6 +363,16 @@ impl Superblock {
         if !valid.contains(&sizeof_size) {
             return Err(Error::InvalidFormat(format!(
                 "invalid sizeof_size: {sizeof_size}"
+            )));
+        }
+        if sizeof_addr > 8 {
+            return Err(Error::Unsupported(format!(
+                "sizeof_addr {sizeof_addr} exceeds current 64-bit address support"
+            )));
+        }
+        if sizeof_size > 8 {
+            return Err(Error::Unsupported(format!(
+                "sizeof_size {sizeof_size} exceeds current 64-bit length support"
             )));
         }
         Ok(())
@@ -384,6 +426,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wide_address_and_length_sizes() {
+        assert!(matches!(
+            Superblock::validate_sizes(16, 8),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            Superblock::validate_sizes(8, 16),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn test_invalid_signature() {
         let data = vec![0u8; 64];
         let mut reader = HdfReader::new(Cursor::new(data));
@@ -394,5 +448,11 @@ mod tests {
     fn test_superblock_size_v2() {
         let sb = Superblock::default();
         assert_eq!(sb.size(), 48); // 12 + 4*8 + 4
+        assert_eq!(sb.checked_size().unwrap(), 48);
+    }
+
+    #[test]
+    fn v2_checksum_span_uses_checked_arithmetic() {
+        assert_eq!(Superblock::v2_checksum_span(8).unwrap(), 44);
     }
 }

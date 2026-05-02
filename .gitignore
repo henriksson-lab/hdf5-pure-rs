@@ -9,6 +9,7 @@ hdf5/
 tools/tracehash/
 *.h5
 !hdf5-pure-rust/tests/data/**/*.h5
+!tests/data/hdf5_ref/vds_i32_to_f64.h5
 tests/data/real_world/*.nxs
 tests/data/real_world/*.mat
 tests/data/real_world/*.nc

@@ -1,6 +1,6 @@
 # TODO: hdf5-pure-rust
 
-## Current status: 326 tests, 0 failures, 0 warnings.
+## Current status: 692 tests, 0 failures, 0 warnings.
 
 ## Audit Backlog (generated 2026-04-15)
 
@@ -64,6 +64,8 @@
 - [x] Add v1 B-tree tests for large chunk offsets that require full address-size handling.
 - [x] Add v2 B-tree chunk index tests with multiple internal levels, not just one internal root path.
 - [x] Add v2 B-tree tests for filtered chunks with nonzero per-record filter masks.
+  v2 B-tree chunk-record decoding now uses checked reader-position arithmetic
+  for address, filtered-size, filter-mask, and scaled-coordinate fields.
 - [x] Add fixed-array tests for all page initialization states, including absent pages and fill-value fallback.
 - [x] Add extensible-array tests for secondary block addressing across index-block, data-block, and super-block transitions.
 - [x] Add implicit chunk index tests for multidimensional datasets and partial edge chunks.
@@ -161,7 +163,7 @@
 - [x] Extend `MutableFile::write_chunk` to handle full v1 B-tree leaf rebalancing.
 - [x] Add `MutableFile` support for updating v4 fixed-array chunk indexes when replacing existing chunks.
 - [x] Implement paged fixed-array chunk index data blocks.
-- [x] Keep filtered v4 implicit chunk indexes explicitly unsupported; HDF5 does not normally choose implicit indexes for filtered datasets.
+- [x] Keep filtered v4 implicit chunk indexes explicitly unsupported; HDF5 does not normally choose implicit indexes for filtered datasets. Covered by an on-disk regression that patches a filtered fixed-array fixture into a filtered implicit-index layout while repairing the object-header checksum.
 - [x] Implement filtered directly addressed huge fractal-heap object reads.
 - [x] Keep documenting SZip as permanently unsupported unless a pure-Rust decoder is added later.
 - [x] Broaden the tracehash corpus with fixtures for extensible-array and paged fixed-array spillover.
@@ -335,13 +337,81 @@
   splitting — each fits on a single screen and already maps cleanly to
   one C file.
 
-- [ ] Mirror libhdf5's file/module split for the `hl/` tree. Two
-  oversized files remain:
+- [x] Mirror libhdf5's file/module split for the `hl/` tree. The previously
+  oversized `hl` roots are now small module fronts:
   - `src/hl/mutable_file.rs` → split by subsystem (chunk-btree update,
     extensible-array update, object-header rewrite, dense-storage
-    update, allocator/io).
+    update, allocator/io). Initial slices extracted:
+    `src/hl/mutable_file/attr_mutation.rs` now owns compact attribute
+    object-header delete/rename mutation helpers and public wrappers;
+    `src/hl/mutable_file/resize.rs` now owns dataset resize and dataspace
+    object-header message rewrite lookup; `src/hl/mutable_file/write_chunk.rs`
+    now owns the public chunk-write front-end plus chunk validation and
+    filter encoding dispatch; `src/hl/mutable_file/chunk_btree_v1.rs` now
+    owns raw-data v1 chunk B-tree update, traversal, rebuild, and node
+    encoding helpers; `src/hl/mutable_file/chunk_fixed_array.rs` now owns
+    fixed-array chunk-index element rewrites;
+    `src/hl/mutable_file/chunk_btree_v2.rs` now owns v2 B-tree chunk-index
+    record replacement, rebuild, and leaf/internal node encoding helpers;
+    `src/hl/mutable_file/chunk_extensible_array.rs` now owns
+    the full extensible-array chunk-index mutation path: mutation state
+    structs, chunk-write planning, header decoding, direct/spillover append
+    dispatch, super-block creation/updates, page-init bitmap helpers, sizing
+    helpers, index/data-block verification, element address lookup,
+    data-block/page encoding, element writes, and all EA checksum rewrites;
+    `src/hl/mutable_file/support.rs` now owns shared checksum, reopen,
+    allocation, integer-write, and chunk-index geometry helpers used by the
+    sibling mutation modules.
   - `src/hl/dataset.rs` (~3300 LOC) → split read paths (chunked /
-    contiguous / virtual) into siblings under `src/hl/dataset/`.
+    contiguous / virtual) into siblings under `src/hl/dataset/`. Initial
+    slice extracted: `src/hl/dataset/access.rs` now owns `DatasetAccess`
+    and VDS access policy types while `dataset.rs` re-exports the original
+    public API; `src/hl/dataset/chunk_read.rs` now owns chunk-read private
+    state structs plus the chunked-read dispatcher, single-chunk path,
+    chunk geometry helpers, full-coverage/prefill detection, linear chunk
+    coordinate helpers, fast-path filter classification, chunk copy
+    planning, generic N-D chunk materialization, and direct/decompress-into
+    full 1-D chunk fast paths, plus implicit chunk-index read dispatch and
+    shared chunk geometry helpers;
+    `src/hl/dataset/chunk_btree_v1.rs` now owns the v1 B-tree chunk-index
+    reader, recursive node walk, node/key decoding, payload filtering, and v1
+    trace hook; `src/hl/dataset/chunk_btree_v2.rs` now owns the v2 B-tree
+    chunk-index read path, v2 record decoding, and v2 trace hooks;
+    `src/hl/dataset/chunk_copy.rs` now owns chunk copy planning,
+    generic N-D chunk materialization, direct/decompress-into full 1-D chunk
+    fast paths, and fast-path filter classification;
+    `src/hl/dataset/chunk_linear_index.rs` now owns fixed-array and
+    extensible-array chunk-index read paths, linear-index full-coverage
+    checks, and linear lookup trace hooks; `src/hl/dataset/info.rs`
+    now owns `DatasetInfo` /
+    external-file-list metadata structs, object-header metadata parsing,
+    external-file-list message decoding, attribute wrappers, and dataset
+    property/shape accessors; `src/hl/dataset/storage.rs` now owns external
+    contiguous raw-data reads and external-file path resolution;
+    `src/hl/dataset/support.rs` now owns shared integer-size conversion and
+    little-endian byte decoding helpers used by the sibling modules;
+    `src/hl/dataset/read.rs` now owns raw storage-class dispatch, fill-value
+    materialization, typed/scalar read wrappers, dataspace element counts, and
+    ndarray read wrappers;
+    `src/hl/dataset/selection.rs` now owns `read_slice`, typed point /
+    hyperslab / slice extraction helpers, selection validation, the
+    contiguous 1-D slice fast path, and shared row-major index helpers;
+    `src/hl/dataset/value_read.rs` now owns fixed/variable-length string
+    reads, compound field readers, recursive high-level value decoding,
+    vlen heap tracing, field byte-swapping, and local endian/string decode
+    helpers;
+    `src/hl/dataset/virtual_dataset.rs` now owns the private VDS mapping,
+    selection, and materialized-hyperslab data types plus VDS raw
+    read/source-copy execution, dynamic output-shape resolution,
+    point/hyperslab materialization, VDS selection span helpers, and
+    selection coordinate validation; `src/hl/dataset/virtual_decode.rs` now
+    owns VDS heap/mapping decode, encoded selection decode,
+    decoded-selection helper structs, and VDS decoder trace hooks;
+    `src/hl/dataset/virtual_source.rs` now owns VDS source-file, prefix,
+    environment-prefix, and `${ORIGIN}` path resolution;
+    `src/hl/dataset/tests.rs` now owns the dataset-module unit tests, leaving
+    `src/hl/dataset.rs` as the 79-line module root, public re-export surface,
+    and minimal `Dataset` shell.
   Bigger refactor than the `format/` tree because libhdf5 doesn't have
   one-to-one analogs; we'd be partitioning by Rust-internal subsystem
   rather than mirroring C exactly.
@@ -379,6 +449,71 @@
     `max_creation_index > u32::MAX`, matching upstream
     `H5O__linfo_decode`'s `H5L_MAX_CRT_IDX_VAL` bound. Covered by two
     tests in `tests/robustness_test.rs`.
+  - `format/fractal_heap/huge.rs` now decodes direct/filtered huge heap
+    IDs and huge-object v2 B-tree records through checked layout
+    helpers before slicing. Malformed files now get explicit
+    `InvalidFormat` diagnostics for overflowing field offsets or record
+    size formulas instead of relying on unchecked `usize` arithmetic.
+  - Fractal-heap doubling-table geometry now uses checked row-block
+    sizes, child indirect-row derivation, span multiplication, and
+    managed-object offset advancement. Filtered indirect-block decode
+    uses the same checked row-size helper, so extreme row counts no
+    longer reach unchecked shifts or block-size multiplication.
+  Managed and tiny heap-ID payload decoding now uses checked byte windows
+  and rejects offset widths beyond the crate's `u64` representation before
+    shifting; dense-link heap-ID extraction also uses a checked record window.
+    Filtered huge heap-ID filter masks now decode through a checked `u32`
+    helper instead of direct fixed-index arrays.
+  - Fractal-heap header decode now validates doubling-table geometry at
+    the boundary: nonzero table width, power-of-two start/max direct
+    block sizes, max direct block size >= start block size, and
+    max-heap-size values that fit the crate's current 64-bit offset
+    representation.
+  - The shared `HdfReader::skip` helper now rejects distances above
+    `i64::MAX` before calling `SeekFrom::Current`, and global-heap
+    object walking checks the minimum object-entry end offset before
+    comparing it with the declared collection bound.
+  - Object-header v1/v2 message loops now compute message-header,
+    payload-start, and creation-order bounds through checked helpers.
+    Shared-message reference/table offset arithmetic and nested
+    continuation chunk-index advancement also reject overflow
+    explicitly.
+  - Attribute, filter-pipeline, data-layout, dataspace, and link message
+    decoders now use checked cursor advancement and checked slice-end
+    calculations for file-controlled names, compact payloads, datatype /
+    dataspace submessages, filter names, link names, soft-link targets,
+    and external-link buffers.
+  - Link-info, attribute-info, fill-value, and symbol-table message
+    decoders now use checked cursor advancement and checked payload-end
+    calculations for address fields and fill-value byte spans instead of
+    unchecked `pos += size` / `base + size` arithmetic.
+  - V2 B-tree node geometry now range-checks pointer-size sums,
+    internal record-slot sizes, cumulative record-count formulas,
+    child-count allocation, overfull internal nodes, and zero leaf
+    record sizes. Superblock decode now rejects 16/32-byte address or
+    length widths explicitly as unsupported by the crate's current
+    `u64` address/length representation.
+  - V1 group B-tree traversal now rejects undefined child pointers,
+    detects recursive traversal cycles, and caps recursion depth before
+    descending through symbol-table nodes. Symbol-table group scratch-pad
+    sizing now checks address-width multiplication and rejects cached
+    group payloads that exceed the fixed 16-byte scratch area.
+  - V1 chunk-index B-tree traversal now mirrors the group-tree guards:
+    undefined node/child addresses are rejected, recursive traversal
+    cycles are detected, and recursion depth is capped before descending
+    through internal chunk-index nodes.
+  - Implicit fixed-array/extensible-array chunk coordinate calculation
+    now validates rank agreement, rejects zero chunks-per-dimension, and
+    checks `chunk_index * chunk_dim` coordinate multiplication before
+    copying chunk payloads.
+  - Variable-length dataset string/value descriptor decoding now uses a
+    shared checked parser for descriptor size, address width, heap
+    address bytes, and object-index offsets before dereferencing global
+    heap objects.
+  - Datatype compound and enum decoders now use checked member-name
+    padding, cursor advancement, member-offset bounds, inline-array
+    dimension offsets, enum value spans, and encoded-length arithmetic
+    instead of raw `pos + len` / padded-name calculations.
   Other C-only error strings were investigated and cleared as
   non-actionable: most are runtime identifier checks that don't apply
   to a typed Rust API, validation that already lives in a different
@@ -440,29 +575,223 @@ forward-looking backlog for "add all features of the original" within this
 crate's intended scope.
 
 ### Planned Parity Work
-- [ ] Add fuller dataspace selector parity beyond the current decode and
+- [x] Add bounded real functionality for the easiest unsupported-subsystem
+  surfaces exposed by the explicit low-level stubs:
+  - Metadata/no-op query APIs around existing state: cache hit-rate counters,
+    page-buffer stats, file intent/access flags, and basic SWMR/logging flags.
+    Implemented as file-level query structs over existing counters and flags.
+  - Multi/family/splitter/log VFD config serialization: property/config
+    encode/decode and validation without real I/O. Implemented deterministic
+    round-trip codecs and validation helpers while keeping actual driver I/O
+    explicitly unsupported.
+  - External file cache bookkeeping: track opened external files in a small
+    map, max count, release/close behavior. Implemented bounded cache state
+    without arbitrary external-link traversal.
+  - VOL registry/introspection improvements: connector lookup, capability
+    flags, optional-op registry, connector value/name APIs. Implemented
+    registry introspection and optional-operation listing without plugin
+    dispatch.
+  - HDFS/S3/ROS3 explicit unsupported config parsing: parse/store config
+    values and fail only on open/read/write. Implemented HDFS and ROS3 FAPL
+    config storage plus existing S3 URL parsing; network/open/read/write
+    operations remain explicitly unsupported.
+- [x] Add fuller dataspace selector parity beyond the current decode and
   selected materialization paths:
-  `H5S_select_*`, `H5S__none_*`, bounds/shape helpers, iterator families,
-  projection helpers, and remaining regularity/contiguity helpers.
-- [ ] Add fuller soft-link traversal parity:
-  `H5G__traverse_slink*`, tighter cycle detection, bounded traversal, and
-  libhdf5-closer path resolution behavior.
-- [ ] Add virtual-dataset dataset-access property-list parity:
-  `H5Pset_virtual_view`, `H5Pset_virtual_prefix`, and the remaining
-  missing-file policy APIs.
+  current support includes `all`, `none`, points, stepped slices, regular
+  block hyperslabs, combine operators via bounded point materialization, and
+  count/bounds/regularity/contiguity/linear-span helpers, iterator-style point
+  traversal, and dimension projection helpers. Bounds helpers now avoid
+  coordinate overflow on extreme slices/hyperslabs; N-D slice extraction now
+  rejects coordinate/index overflow instead of relying on unchecked `u64`
+  arithmetic; hyperslab `selected_count` now reports overflow instead of
+  saturating per-dimension count/block products; dataset selection/VDS byte
+  readers now use checked range arithmetic for malformed offsets.
+- [x] Add fuller soft-link traversal parity:
+  public link iteration and tracked creation-order link iteration are
+  implemented; file-level and group-relative opens now share soft-link
+  traversal, relative target normalization handles `.`/`..`, and repeated
+  soft-link resolution paths report a direct cycle diagnostic before the
+  traversal-limit fallback.
+- [x] Finish virtual-dataset dataset-access property-list parity:
+  `H5Pset_virtual_view` / `H5Pset_virtual_prefix` equivalents are exposed via
+  `DatasetAccess`; fixed-shape missing-source fill behavior is supported, and
+  unlimited-dimension missing-source fill behavior now uses declared virtual
+  selection extents where they are encoded so `FirstMissing` and
+  `LastAvailable` sizing remain distinct. VDS source string decoding now
+  rejects out-of-range starts and unterminated strings explicitly. VDS output
+  extent and hyperslab materialization paths now use checked coordinate/span
+  arithmetic for extreme selections, including irregular hyperslab block
+  coordinate materialization. VDS source-to-destination raw materialization
+  now uses the shared integer/float datatype conversion path instead of
+  requiring matching source and destination element sizes; covered by a real
+  h5py-generated i32-source to f64-destination VDS fixture.
 - [ ] Add broader writer-side chunk-index parity if writer scope expands:
   creation/growth paths for fixed-array, extensible-array, and deeper v2
-  B-tree chunk indexes beyond the currently supported subset.
+  B-tree chunk indexes beyond the currently supported subset. Incremental
+  fixed-array update robustness added: helper chunk-grid indexing now rejects
+  zero chunk dimensions, chunk-count overflow, and usize conversion overflow
+  explicitly; aligned append helpers now reject zero alignment and checked
+  padding offset overflow. Incremental v2 B-tree update robustness added:
+  chunk-record sizing, leaf/internal capacity arithmetic, record distribution,
+  and scaled-coordinate decoding now fail explicitly on malformed overflow
+  cases. Incremental extensible-array robustness added: read/write
+  super-block geometry planning now rejects start-index span overflow instead
+  of relying on unchecked multiplication; read-side extensible-array
+  data/super-block walks now range-check page sizes, page offsets, skip spans,
+  page-init slices, fill counts, and spillover address-table indices.
+  Writer-side extensible-array data/super-block allocation and update helpers
+  now range-check block sizes, page-init byte spans, address offsets, and
+  checksum spans before allocating, slicing, or seeking. Additional
+  writer-side extensible-array element-location, data-block page write, and
+  data/page checksum helpers now range-check element offsets and checksum
+  addresses before file I/O. Spillover append and metadata-rewrite helpers now
+  range-check super-block spans, block offsets, index-block address-table
+  offsets, header counters, and header checksum field offsets before patching
+  mutable metadata. Incremental v1 chunk B-tree writer robustness added: leaf
+  layout, entry-position, entry-count, and node-size helpers now use checked
+  arithmetic before reading, appending, rebuilding, or encoding B-tree nodes.
+  v1 chunk B-tree collection now rejects oversized node entry counts,
+  unsupported depth, child-key coordinate-count overflow, and overlarge
+  collected two-level trees before recursing or extending buffers. Fixed-array
+  locate/read paths now range-check data-block prefix sizes, page sizes, page
+  offsets, element offsets, and page addresses before seeking. Shared mutable
+  object-header checksum rewrites and fixed-array/extensible-array/v2-B-tree
+  checksum verifiers now check checksum end offsets before seeking.
 - [ ] Add broader filter parity where practical:
   pure-Rust SZip support if it becomes available, plus fuller NBit and
-  ScaleOffset parameter-space parity.
+  ScaleOffset parameter-space parity. Incremental ScaleOffset parity added:
+  integer sign, minimum-bit bounds, and the 16-byte arithmetic limit are now
+  validated before element decoding, including empty chunks; unsupported
+  datatype classes, unsupported floating-point sizes, and unsupported float
+  scale types are rejected before chunk-header parsing; header and output
+  offsets now use checked arithmetic for malformed chunks. Incremental NBit
+  parity added: zero datatype sizes, invalid atomic byte order, zero nested
+  array base sizes, and non-divisible array/base sizes now fail explicitly;
+  datatype precision/offset and output-copy helpers now use checked arithmetic
+  for malformed parameter streams.
+  Incremental LZF parity added: literal and back-reference runs now fail
+  immediately when they would exceed the expected output size, and malformed
+  literal/back-reference input offsets are range-checked explicitly.
+  Incremental Shuffle parity added: the decoder now honors the filter's
+  encoded element byte size when present and rejects a zero-sized encoded
+  element; shuffle/unshuffle index arithmetic now fails explicitly on
+  overflow. `MutableFile::write_chunk` can now encode Fletcher32 checksums
+  when replacing chunks in Fletcher32-filtered datasets, matching the
+  existing read-side verification path. `DatasetBuilder::fletcher32()` now
+  writes Fletcher32-filtered chunked datasets using the same forward filter
+  ordering as chunk mutation.
 - [ ] Add broader datatype-conversion parity if user-facing conversion scope
   expands beyond the current exact-size / limited-recursive model:
   more of the `H5T__conv_*` engine families, packing helpers, and
-  conversion-path selection behavior.
+  conversion-path selection behavior. Incremental parity added: typed reads
+  now expose `i128` / `u128`, handle 128-bit integer clamp/sign-extension
+  without shift overflow, and route same-size signed/unsigned integer reads
+  through conversion instead of raw reinterpretation. Writer dtype inference
+  now emits 16-byte fixed-point datatypes for `i128` / `u128`, including
+  direct datasets, scalar attributes, and compound fields; recursive
+  `H5Value` field decoding also handles signed 128-bit integer payloads
+  safely. Datatype array dimension decoding now advances through dimension
+  entries with checked cursor arithmetic, and string/VLEN readers reject
+  non-record-aligned raw buffers instead of silently dropping trailing bytes;
+  attribute VLEN string reads now reject address widths beyond 64-bit support
+  before descriptor shift arithmetic. High-level numeric conversion now uses
+  checked output-size and per-record output-window helpers instead of raw
+  `idx * dst_size..(idx + 1) * dst_size` slice arithmetic, and float decoding
+  no longer depends on unreachable `unwrap()` conversions. VDS raw reads now
+  convert source dataset numeric bytes into the virtual destination datatype
+  before selection placement. VDS regular
+  hyperslabs with unlimited counts/blocks now reject starts past the dataspace
+  extent instead of hiding them behind saturating subtraction. Mutable v2
+  B-tree chunk-index header checksum rewrites now compute relative field
+  offsets and header mutation windows through checked helpers instead of
+  unchecked conversions and slice ranges. Writable fixed-string attribute
+  payload construction now rejects capacity overflow, and extensible-array
+  fill/unread-element helpers now reject overfilled state or impossible read
+  counts instead of saturating them to zero. Chunked writer splitting now uses
+  checked chunk-count, total-chunk, compressed-size, chunk-extraction, and
+  VLEN descriptor payload arithmetic instead of unchecked products, casts, and
+  offset ranges. Dataset-builder fixed-string dataset and attribute paths now
+  use checked shape/product and payload-capacity arithmetic, and `Dataspace::size`
+  no longer wraps on huge dimension products. Superblock v2 checksum spans and
+  extensible-array index-block geometry now use checked arithmetic instead of
+  raw `12 + 4 * sizeof_addr` / doubled pointer-count expressions. Selection
+  hyperslab dimensions now expose a checked output-count helper, while the
+  legacy infallible count saturates explicitly; contiguous-selection checking
+  no longer uses an unreachable `expect()`. Writer chunk B-tree node sizing,
+  minimal fractal-heap header sizing, managed-heap block growth, and the
+  initial superblock placeholder now use checked arithmetic. Attribute VLEN
+  string descriptors now decode through a checked helper, VDS point-selection
+  span calculation avoids unreachable unwraps, and Fletcher32 word processing
+  no longer uses manual `pos + 1` indexing. `Superblock::checked_size()` now
+  exposes fallible checked size computation, while the legacy infallible
+  `size()` helper saturates explicitly on overflow. Attribute-info,
+  data-layout, and filter-pipeline message integer helpers now read from
+  checked slices and checked variable-width spans instead of direct `pos + n`
+  indexing. Dense writer B-tree record hash extraction and external-link object
+  payload slicing now use checked windows instead of direct offset arithmetic.
+  Datatype array and legacy compound inline-array dimension reads now use a
+  checked little-endian helper, and compound member offset-width calculation
+  now rejects underflow explicitly instead of using saturating subtraction.
+  NBit nested array/compound filter decoding now computes recursive output
+  offsets with checked multiplication and addition instead of unchecked
+  `base + idx * size` arithmetic; top-level NBit atomic/array/compound element
+  offsets now use the same checked helper, and NBit byte-copy writes through a
+  checked output window. Chunk copy and virtual-dataset source-copy
+  byte windows now use checked slice helpers at the final copy boundary instead
+  of repeating unchecked `offset..offset + len` ranges. External raw-storage
+  reads now use the same checked output-window pattern before `read_exact`.
+  ScaleOffset and Fletcher32 filter headers now read checksum/minimum-bit and
+  minimum-value windows through checked helpers, and Fletcher32 batching no
+  longer constructs manual `pos..pos + byte_count` slices.
+  Fill-value and attribute message decoders now read little-endian size fields
+  and value/name/datatype/dataspace payload windows through checked helpers
+  instead of direct fixed-index arrays.
+  Symbol-table, link-info, dataspace, and link message variable-width integer
+  readers now decode from checked windows instead of indexing `pos + i` or
+  `offset + i` in their decode loops.
+  Attribute-info, data-layout, filter-pipeline, Fletcher32, and ScaleOffset
+  fixed-width integer helpers now convert checked windows with `try_into`
+  instead of indexing helper-local byte arrays.
+  Datatype, fill-value, attribute, attribute VLEN, dataset VLEN, compact
+  attribute mutation, filtered huge-heap, and dense-writer record decoders now
+  use the same checked-window plus `try_into` pattern.
+  Filter-pipeline v1/v2 filter-name decoding now slices both padded name
+  fields and null-terminated text through checked windows.
+  Attribute and dataset VLEN descriptor readers now decode sequence length,
+  heap address, and heap index fields through checked windows; compact
+  attribute mutation now reads encoded name sizes through the same checked
+  helper pattern.
+  Mutable extensible-array header checksum recomputation now patches count
+  fields through a checked helper instead of direct `offset..offset + ss`
+  slices.
+  Datatype message header/property validation now reads class bits, size,
+  fixed-point precision/offset, and floating-point precision/offset through
+  checked helpers, including the tracehash instrumentation path.
+  The enum writer now rejects non-integer and
+  wider-than-8-byte base datatypes explicitly instead of silently truncating
+  member values to the existing `u64` representation. Malformed zero-sized
+  float and integer-to-float conversion sources are now rejected explicitly
+  instead of reaching modulo-by-zero conversion paths. Compound field value
+  extraction now uses checked field-offset and array-payload arithmetic for
+  malformed nested datatypes.
 - [ ] Add broader attribute mutation/iteration parity if the public writer/API
   surface expands:
-  more of `H5A__dense_*` and broader `H5A*` mutation/iteration families.
+  current public APIs expose `attrs()`, `attr_names()`, and `attr(name)` for
+  files, groups, and datasets across compact and dense storage, plus
+  `attrs_by_creation_order()` and `attr_exists(name)`; writer paths now reject
+  duplicate attribute creates by name. `MutableFile` can delete compact
+  attributes on root, group, and dataset objects by marking the compact
+  object-header message as NIL and recomputing the header checksum, and can
+  rename compact attributes in-place when the new UTF-8 name fits in the
+  existing encoded name field and does not collide with another attribute.
+  `MutableFile` can also delete and same-size rename dense attributes for the
+  crate's own writer-created layout: an unfiltered root-direct fractal heap
+  plus a depth-0 v2 name B-tree. The mutation rewrites the B-tree leaf/header
+  record counts and checksums, updates dense-name hashes on rename, and
+  recomputes the direct-block checksum after heap payload edits. Remaining
+  work is dense mutation for indirect/filtered heaps, non-leaf name indexes,
+  or creation-order indexes, growing compact/dense rename that requires metadata
+  repacking, and broader mutation APIs.
 
 ### Explicitly Out Of Scope
 - [x] Do not chase MPI / parallel-HDF5 / distributed selection paths

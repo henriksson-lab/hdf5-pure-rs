@@ -8,6 +8,35 @@ use crate::io::reader::HdfReader;
 
 use super::{heap_object_len, read_le_uint, FractalHeapHeader};
 
+fn checked_huge_len(parts: &[usize], context: &str) -> Result<usize> {
+    let mut len = 0usize;
+    for part in parts {
+        len = len.checked_add(*part).ok_or_else(|| {
+            Error::InvalidFormat(format!("{context} length overflows address space"))
+        })?;
+    }
+    Ok(len)
+}
+
+fn take_huge_field<'a>(
+    bytes: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+    context: &str,
+) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} field offset overflows")))?;
+    let field = bytes.get(*pos..end).ok_or_else(|| {
+        Error::InvalidFormat(format!(
+            "{context} is truncated at byte range {}..{}",
+            *pos, end
+        ))
+    })?;
+    *pos = end;
+    Ok(field)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HugeRecord {
     pub(super) addr: u64,
@@ -26,11 +55,21 @@ impl FractalHeapHeader {
         let addr_size = self.sizeof_addr as usize;
         let len_size = self.sizeof_size as usize;
 
-        if self.io_filter_len == 0 && heap_id.len() >= 1 + addr_size + len_size {
+        let direct_id_len = checked_huge_len(&[1, addr_size, len_size], "direct huge heap ID")?;
+        if self.io_filter_len == 0 && heap_id.len() >= direct_id_len {
             let mut p = 1usize;
-            let addr = read_le_uint(&heap_id[p..p + addr_size]);
-            p += addr_size;
-            let len = read_le_uint(&heap_id[p..p + len_size]);
+            let addr = read_le_uint(take_huge_field(
+                heap_id,
+                &mut p,
+                addr_size,
+                "direct huge heap ID address",
+            )?);
+            let len = read_le_uint(take_huge_field(
+                heap_id,
+                &mut p,
+                len_size,
+                "direct huge heap ID length",
+            )?);
             if crate::io::reader::is_undef_addr(addr) {
                 return Err(Error::InvalidFormat(
                     "huge heap object has undefined address".into(),
@@ -42,16 +81,36 @@ impl FractalHeapHeader {
             return Ok(data);
         }
 
-        if self.io_filter_len > 0 && heap_id.len() >= 1 + addr_size + len_size + 4 + len_size {
+        let filtered_id_len = checked_huge_len(
+            &[1, addr_size, len_size, 4, len_size],
+            "filtered huge heap ID",
+        )?;
+        if self.io_filter_len > 0 && heap_id.len() >= filtered_id_len {
             let mut p = 1usize;
-            let addr = read_le_uint(&heap_id[p..p + addr_size]);
-            p += addr_size;
-            let len = read_le_uint(&heap_id[p..p + len_size]);
-            p += len_size;
-            let filter_mask =
-                u32::from_le_bytes([heap_id[p], heap_id[p + 1], heap_id[p + 2], heap_id[p + 3]]);
-            p += 4;
-            let obj_size = read_le_uint(&heap_id[p..p + len_size]);
+            let addr = read_le_uint(take_huge_field(
+                heap_id,
+                &mut p,
+                addr_size,
+                "filtered huge heap ID address",
+            )?);
+            let len = read_le_uint(take_huge_field(
+                heap_id,
+                &mut p,
+                len_size,
+                "filtered huge heap ID length",
+            )?);
+            let filter_mask = read_u32_le(take_huge_field(
+                heap_id,
+                &mut p,
+                4,
+                "filtered huge heap ID filter mask",
+            )?)?;
+            let obj_size = read_le_uint(take_huge_field(
+                heap_id,
+                &mut p,
+                len_size,
+                "filtered huge heap ID object size",
+            )?);
             if crate::io::reader::is_undef_addr(addr) {
                 return Err(Error::InvalidFormat(
                     "huge heap object has undefined address".into(),
@@ -113,42 +172,131 @@ impl FractalHeapHeader {
     pub(super) fn decode_huge_record(&self, record: &[u8]) -> Result<HugeRecord> {
         let sa = self.sizeof_addr as usize;
         let ss = self.sizeof_size as usize;
-        if record.len() == sa + ss {
+
+        let unfiltered_direct = checked_huge_len(&[sa, ss], "unfiltered direct huge record")?;
+        if record.len() == unfiltered_direct {
+            let mut p = 0usize;
+            let addr = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                sa,
+                "unfiltered direct huge record address",
+            )?);
+            let len = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "unfiltered direct huge record length",
+            )?);
             return Ok(HugeRecord {
-                addr: read_le_uint(&record[..sa]),
-                len: read_le_uint(&record[sa..sa + ss]),
+                addr,
+                len,
                 filtered: false,
                 obj_size: None,
                 id: None,
             });
         }
-        if record.len() == sa + ss + ss {
+        let unfiltered_indirect =
+            checked_huge_len(&[sa, ss, ss], "unfiltered indirect huge record")?;
+        if record.len() == unfiltered_indirect {
+            let mut p = 0usize;
+            let addr = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                sa,
+                "unfiltered indirect huge record address",
+            )?);
+            let len = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "unfiltered indirect huge record length",
+            )?);
+            let id = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "unfiltered indirect huge record ID",
+            )?);
             return Ok(HugeRecord {
-                addr: read_le_uint(&record[..sa]),
-                len: read_le_uint(&record[sa..sa + ss]),
+                addr,
+                len,
                 filtered: false,
                 obj_size: None,
-                id: Some(read_le_uint(&record[sa + ss..sa + ss + ss])),
+                id: Some(id),
             });
         }
-        if record.len() == sa + ss + 4 + ss {
+        let filtered_direct = checked_huge_len(&[sa, ss, 4, ss], "filtered direct huge record")?;
+        if record.len() == filtered_direct {
+            let mut p = 0usize;
+            let addr = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                sa,
+                "filtered direct huge record address",
+            )?);
+            let len = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "filtered direct huge record length",
+            )?);
+            let _filter_mask =
+                take_huge_field(record, &mut p, 4, "filtered direct huge record filter mask")?;
+            let obj_size = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "filtered direct huge record object size",
+            )?);
             return Ok(HugeRecord {
-                addr: read_le_uint(&record[..sa]),
-                len: read_le_uint(&record[sa..sa + ss]),
+                addr,
+                len,
                 filtered: true,
-                obj_size: Some(read_le_uint(&record[sa + ss + 4..sa + ss + 4 + ss])),
+                obj_size: Some(obj_size),
                 id: None,
             });
         }
-        if record.len() == sa + ss + 4 + ss + ss {
+        let filtered_indirect =
+            checked_huge_len(&[sa, ss, 4, ss, ss], "filtered indirect huge record")?;
+        if record.len() == filtered_indirect {
+            let mut p = 0usize;
+            let addr = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                sa,
+                "filtered indirect huge record address",
+            )?);
+            let len = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "filtered indirect huge record length",
+            )?);
+            let _filter_mask = take_huge_field(
+                record,
+                &mut p,
+                4,
+                "filtered indirect huge record filter mask",
+            )?;
+            let obj_size = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "filtered indirect huge record object size",
+            )?);
+            let id = read_le_uint(take_huge_field(
+                record,
+                &mut p,
+                ss,
+                "filtered indirect huge record ID",
+            )?);
             return Ok(HugeRecord {
-                addr: read_le_uint(&record[..sa]),
-                len: read_le_uint(&record[sa..sa + ss]),
+                addr,
+                len,
                 filtered: true,
-                obj_size: Some(read_le_uint(&record[sa + ss + 4..sa + ss + 4 + ss])),
-                id: Some(read_le_uint(
-                    &record[sa + ss + 4 + ss..sa + ss + 4 + ss + ss],
-                )),
+                obj_size: Some(obj_size),
+                id: Some(id),
             });
         }
 
@@ -156,5 +304,40 @@ impl FractalHeapHeader {
             "unsupported huge fractal heap B-tree record size {}",
             record.len()
         )))
+    }
+}
+
+fn read_u32_le(bytes: &[u8]) -> Result<u32> {
+    let bytes = bytes
+        .get(..4)
+        .ok_or_else(|| Error::InvalidFormat("u32 field is truncated".into()))?;
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidFormat("u32 field is truncated".into()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checked_huge_len, read_u32_le, take_huge_field};
+
+    #[test]
+    fn huge_record_length_rejects_overflow() {
+        let err = checked_huge_len(&[usize::MAX, 1], "huge record").unwrap_err();
+        assert!(err.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn huge_field_take_rejects_offset_overflow() {
+        let bytes = [0u8; 4];
+        let mut pos = usize::MAX;
+        let err = take_huge_field(&bytes, &mut pos, 1, "huge field").unwrap_err();
+        assert!(err.to_string().contains("overflows"));
+    }
+
+    #[test]
+    fn huge_u32_reader_rejects_truncated_field() {
+        let err = read_u32_le(&[0; 3]).unwrap_err();
+        assert!(err.to_string().contains("u32 field is truncated"));
     }
 }

@@ -96,7 +96,7 @@ fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Resul
 fn read_u8(data: &[u8], pos: &mut usize, context: &str) -> Result<u8> {
     ensure_available(data, *pos, 1, context)?;
     let value = data[*pos];
-    *pos += 1;
+    advance_pos(pos, 1, context)?;
     Ok(value)
 }
 
@@ -106,11 +106,26 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
             "{context} has invalid byte width {size}"
         )));
     }
-    ensure_available(data, *pos, size, context)?;
+    let bytes = checked_window(data, *pos, size, context)?;
     let mut val = 0u64;
-    for i in 0..size {
-        val |= (data[*pos + i] as u64) << (i * 8);
+    for (i, byte) in bytes.iter().enumerate() {
+        val |= u64::from(*byte) << (i * 8);
     }
-    *pos += size;
+    advance_pos(pos, size, context)?;
     Ok(val)
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
+    *pos = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    Ok(())
 }

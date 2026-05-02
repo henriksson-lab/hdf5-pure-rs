@@ -22,6 +22,7 @@ fn test_write_chunked_no_compression() {
             &DatasetSpec {
                 name: "chunked",
                 shape: &[100],
+                max_shape: None,
                 dtype: DtypeSpec::F32,
                 data: &data_bytes,
             },
@@ -53,6 +54,34 @@ fn test_write_chunked_no_compression() {
 }
 
 #[test]
+fn test_engine_writer_rejects_chunked_data_length_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("written_chunked_bad_len.h5");
+
+    let f = fs::File::create(&path).unwrap();
+    let mut w = HdfFileWriter::new(f);
+    w.begin().unwrap();
+    w.create_root_group().unwrap();
+
+    let err = w
+        .create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "bad",
+                shape: &[4],
+                max_shape: None,
+                dtype: DtypeSpec::I32,
+                data: &[1, 2, 3, 4],
+            },
+            &[2],
+            None,
+            false,
+        )
+        .expect_err("chunked data byte length should match shape * dtype size");
+    assert!(err.to_string().contains("dataset byte length"));
+}
+
+#[test]
 fn test_write_chunked_with_deflate() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("written_chunked_deflate.h5");
@@ -71,6 +100,7 @@ fn test_write_chunked_with_deflate() {
             &DatasetSpec {
                 name: "compressed",
                 shape: &[100],
+                max_shape: None,
                 dtype: DtypeSpec::F32,
                 data: &data_bytes,
             },
@@ -136,6 +166,7 @@ fn test_write_chunked_with_shuffle_and_deflate() {
             &DatasetSpec {
                 name: "shuf_def",
                 shape: &[50],
+                max_shape: None,
                 dtype: DtypeSpec::I32,
                 data: &data_bytes,
             },

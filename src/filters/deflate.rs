@@ -60,3 +60,12 @@ pub fn compress(data: &[u8], level: u32) -> Result<Vec<u8>> {
         .finish()
         .map_err(|e| Error::InvalidFormat(format!("deflate compression finish failed: {e}")))
 }
+
+/// HDF5 deflate filter entry point: reverse decodes, forward encodes.
+pub fn filter_deflate(data: &[u8], level: u32, reverse: bool) -> Result<Vec<u8>> {
+    if reverse {
+        decompress(data)
+    } else {
+        compress(data, level)
+    }
+}

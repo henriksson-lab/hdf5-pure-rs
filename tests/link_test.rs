@@ -1,5 +1,16 @@
 use hdf5_pure_rust::format::messages::link::{LinkMessage, LinkType};
-use hdf5_pure_rust::{Error, File, WritableFile};
+use hdf5_pure_rust::{Error, File, LinkAccess, WritableFile};
+
+#[test]
+fn test_link_access_defaults() {
+    let access = LinkAccess::new();
+    assert_eq!(access.nlinks(), 40);
+    assert_eq!(access.elink_prefix(), None);
+    assert_eq!(access.elink_fapl().driver(), "sec2");
+    assert_eq!(access.elink_acc_flags(), 0);
+    assert_eq!(access.elink_cb(), None);
+    assert_eq!(access.elink_file_cache_size(), 0);
+}
 
 #[test]
 fn test_write_and_read_soft_link() {
@@ -11,7 +22,7 @@ fn test_write_and_read_soft_link() {
         wf.new_dataset_builder("real_data")
             .write::<f64>(&[1.0, 2.0, 3.0])
             .unwrap();
-        wf.link_soft("alias", "/real_data");
+        wf.link_soft("alias", "/real_data").unwrap();
         wf.flush().unwrap();
     }
 
@@ -22,12 +33,59 @@ fn test_write_and_read_soft_link() {
         assert!(names.contains(&"alias".to_string()));
 
         let root = f.root_group().unwrap();
+        let links = root.links().unwrap();
+        assert!(links
+            .iter()
+            .any(|link| link.name == "alias" && link.link_type == LinkType::Soft));
+
         let lt = root.link_type("alias").unwrap();
         assert_eq!(lt, LinkType::Soft);
 
         let target = root.soft_link_target("alias").unwrap();
         assert_eq!(target, "/real_data");
     }
+}
+
+#[test]
+fn test_write_and_read_hard_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hard_link_test.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("real_data")
+            .write::<i32>(&[7, 8, 9])
+            .unwrap();
+        let mut group = wf.create_group("aliases").unwrap();
+        group.link_hard("nested_data", "/real_data").unwrap();
+        wf.link_hard("alias_data", "/real_data").unwrap();
+        wf.link_hard("alias_group", "/aliases").unwrap();
+        assert!(wf.link_hard("missing", "/does_not_exist").is_err());
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("alias_data").unwrap().read::<i32>().unwrap(),
+        vec![7, 8, 9]
+    );
+    assert_eq!(
+        f.dataset("aliases/nested_data")
+            .unwrap()
+            .read::<i32>()
+            .unwrap(),
+        vec![7, 8, 9]
+    );
+    assert_eq!(f.group("alias_group").unwrap().name(), "/alias_group");
+
+    let root = f.root_group().unwrap();
+    let links = root.links().unwrap();
+    assert!(links
+        .iter()
+        .any(|link| link.name == "alias_data" && link.link_type == LinkType::Hard));
+    assert!(links
+        .iter()
+        .any(|link| link.name == "alias_group" && link.link_type == LinkType::Hard));
 }
 
 #[test]
@@ -41,10 +99,10 @@ fn test_soft_link_resolution_and_cycle_limit() {
             .write::<i32>(&[10, 20, 30])
             .unwrap();
         wf.create_group("real_group").unwrap();
-        wf.link_soft("alias_data", "/real_data");
-        wf.link_soft("alias_group", "/real_group");
-        wf.link_soft("cycle_a", "/cycle_b");
-        wf.link_soft("cycle_b", "/cycle_a");
+        wf.link_soft("alias_data", "/real_data").unwrap();
+        wf.link_soft("alias_group", "/real_group").unwrap();
+        wf.link_soft("cycle_a", "/cycle_b").unwrap();
+        wf.link_soft("cycle_b", "/cycle_a").unwrap();
         wf.flush().unwrap();
     }
 
@@ -58,7 +116,59 @@ fn test_soft_link_resolution_and_cycle_limit() {
         Err(err) => err,
     };
     assert!(matches!(err, Error::InvalidFormat(_)));
-    assert!(err.to_string().contains("soft link traversal limit"));
+    assert!(err.to_string().contains("soft link cycle"));
+}
+
+#[test]
+fn test_soft_link_resolution_normalizes_relative_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("soft_link_relative_resolution.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut real = wf.create_group("real").unwrap();
+        real.new_dataset_builder("data")
+            .write::<i32>(&[11, 22])
+            .unwrap();
+        let mut aliases = wf.create_group("aliases").unwrap();
+        aliases
+            .link_soft("relative_data", "../real/./data")
+            .unwrap();
+        aliases.link_soft("relative_group", "../real").unwrap();
+        wf.link_soft("through_alias", "/aliases/relative_data")
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("aliases/relative_data")
+            .unwrap()
+            .read::<i32>()
+            .unwrap(),
+        vec![11, 22]
+    );
+    assert_eq!(
+        f.dataset("through_alias").unwrap().read::<i32>().unwrap(),
+        vec![11, 22]
+    );
+    let aliases = f.group("aliases").unwrap();
+    assert_eq!(
+        aliases
+            .open_dataset("relative_data")
+            .unwrap()
+            .read::<i32>()
+            .unwrap(),
+        vec![11, 22]
+    );
+    assert_eq!(
+        aliases.member_type("relative_group").unwrap(),
+        hdf5_pure_rust::hl::file::ObjectType::Group
+    );
+    assert_eq!(
+        aliases.open_group("relative_group").unwrap().name(),
+        "/real"
+    );
 }
 
 #[test]
@@ -77,7 +187,8 @@ fn test_write_external_link() {
 
     {
         let mut wf = WritableFile::create(&path).unwrap();
-        wf.link_external("remote", "other_file.h5", "/some/dataset");
+        wf.link_external("remote", "other_file.h5", "/some/dataset")
+            .unwrap();
         wf.flush().unwrap();
     }
 
@@ -87,6 +198,11 @@ fn test_write_external_link() {
         assert!(names.contains(&"remote".to_string()));
 
         let root = f.root_group().unwrap();
+        let links = root.links().unwrap();
+        assert!(links
+            .iter()
+            .any(|link| link.name == "remote" && link.link_type == LinkType::External));
+
         let lt = root.link_type("remote").unwrap();
         assert_eq!(lt, LinkType::External);
 
@@ -94,6 +210,25 @@ fn test_write_external_link() {
         assert_eq!(filename, "other_file.h5");
         assert_eq!(obj_path, "/some/dataset");
     }
+}
+
+#[test]
+fn test_write_links_reject_oversized_link_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized_link_values.h5");
+
+    let mut wf = WritableFile::create(&path).unwrap();
+    let long_target = format!("/{}", "x".repeat(u16::MAX as usize + 1));
+    let err = wf
+        .link_soft("too_long", &long_target)
+        .expect_err("soft link target should fit u16 length field");
+    assert!(err.to_string().contains("soft link target"));
+
+    let long_filename = "x".repeat(u16::MAX as usize + 1);
+    let err = wf
+        .link_external("too_long_external", &long_filename, "/data")
+        .expect_err("external link info should fit u16 length field");
+    assert!(err.to_string().contains("external link info"));
 }
 
 #[test]
@@ -122,11 +257,21 @@ fn test_external_link_traversal_missing_relative_absolute_and_same_directory() {
         nested.flush().unwrap();
 
         let mut source = WritableFile::create(&source_path).unwrap();
-        source.link_external("same_dir", "target.h5", "/data");
-        source.link_external("relative", "nested/nested_target.h5", "/data");
-        source.link_external("absolute", target_path.to_str().unwrap(), "/data");
-        source.link_external("remote_group", "target.h5", "/group");
-        source.link_external("missing", "missing.h5", "/data");
+        source
+            .link_external("same_dir", "target.h5", "/data")
+            .unwrap();
+        source
+            .link_external("relative", "nested/nested_target.h5", "/data")
+            .unwrap();
+        source
+            .link_external("absolute", target_path.to_str().unwrap(), "/data")
+            .unwrap();
+        source
+            .link_external("remote_group", "target.h5", "/group")
+            .unwrap();
+        source
+            .link_external("missing", "missing.h5", "/data")
+            .unwrap();
         source.flush().unwrap();
     }
 

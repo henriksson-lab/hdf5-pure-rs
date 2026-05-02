@@ -3,6 +3,8 @@
 //! Includes the spillover descent (the post-iblock walk into super-blocks
 //! and data-blocks) that `H5EA_iterate` performs after `H5EA__iblock_protect`.
 
+#![allow(dead_code)]
+
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -25,6 +27,92 @@ pub(super) struct ExtArrayIndexBlock {
     /// Addresses of the super-blocks owned by the index block.
     pub(super) super_block_addrs: Vec<u64>,
 }
+
+pub(super) fn iblock_debug(block: &ExtArrayIndexBlock) -> String {
+    format!(
+        "ExtArrayIndexBlock(elements={}, data_block_addrs={}, super_block_addrs={})",
+        block.elements.len(),
+        block.data_block_addrs.len(),
+        block.super_block_addrs.len()
+    )
+}
+
+pub(super) fn cache_iblock_get_initial_load_size() -> usize {
+    4 + 1
+}
+
+pub(super) fn cache_iblock_verify_chksum(data: &[u8]) -> Result<()> {
+    verify_trailing_checksum(data, "extensible array index block")
+}
+
+pub(super) fn cache_iblock_image_len(
+    header: &ExtensibleArrayHeader,
+    addr_size: usize,
+) -> Result<usize> {
+    let element_bytes = super::checked_usize_mul(
+        header.index_block_elements as usize,
+        header.raw_element_size,
+        "extensible array index block image length",
+    )?;
+    let data_addr_bytes = super::checked_usize_mul(
+        header.index_block_data_block_addrs,
+        addr_size,
+        "extensible array index block image length",
+    )?;
+    let super_addr_bytes = super::checked_usize_mul(
+        header.index_block_super_block_addrs,
+        addr_size,
+        "extensible array index block image length",
+    )?;
+    4usize
+        .checked_add(1)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(addr_size))
+        .and_then(|value| value.checked_add(element_bytes))
+        .and_then(|value| value.checked_add(data_addr_bytes))
+        .and_then(|value| value.checked_add(super_addr_bytes))
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array index block image length overflow".into())
+        })
+}
+
+pub(super) fn cache_iblock_serialize(prefix_and_payload: &[u8]) -> Vec<u8> {
+    let mut out = prefix_and_payload.to_vec();
+    let checksum = crate::format::checksum::checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+pub(super) fn cache_iblock_notify(_block: &ExtArrayIndexBlock) {}
+
+pub(super) fn cache_iblock_free_icr(_block: ExtArrayIndexBlock) {}
+
+pub(super) fn iblock_alloc() -> ExtArrayIndexBlock {
+    ExtArrayIndexBlock {
+        elements: Vec::new(),
+        data_block_addrs: Vec::new(),
+        super_block_addrs: Vec::new(),
+    }
+}
+
+pub(super) fn iblock_create(elements: Vec<FixedArrayElement>) -> ExtArrayIndexBlock {
+    ExtArrayIndexBlock {
+        elements,
+        data_block_addrs: Vec::new(),
+        super_block_addrs: Vec::new(),
+    }
+}
+
+pub(super) fn iblock_unprotect(_block: ExtArrayIndexBlock) {}
+
+pub(super) fn iblock_delete(block: &mut ExtArrayIndexBlock) {
+    block.elements.clear();
+    block.data_block_addrs.clear();
+    block.super_block_addrs.clear();
+}
+
+pub(super) fn iblock_dest(_block: ExtArrayIndexBlock) {}
 
 /// Pure deserializer for the extensible-array index block.
 pub(super) fn decode_index_block<R: Read + Seek>(
@@ -103,6 +191,25 @@ pub(super) fn decode_index_block<R: Read + Seek>(
     })
 }
 
+fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
+    if data.len() < 4 {
+        return Err(Error::InvalidFormat(format!("{context} image too short")));
+    }
+    let split = data.len() - 4;
+    let stored = u32::from_le_bytes(
+        data[split..]
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} checksum is truncated")))?,
+    );
+    let computed = crate::format::checksum::checksum_metadata(&data[..split]);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    Ok(())
+}
+
 /// Drive the decoded index block to materialize the full element vector
 /// — descends into spillover data/super blocks. Composition mirrors
 /// the C-side `H5EA_iterate` after `H5EA__iblock_protect` returns.
@@ -154,7 +261,17 @@ fn read_spillover_blocks<R: Read + Seek>(
                     break;
                 }
 
-                let data_block_index = info.start_data_block as usize + local_data_block;
+                let data_block_index = super::usize_from_u64(
+                    info.start_data_block,
+                    "extensible array data block start index",
+                )
+                .and_then(|start| {
+                    super::checked_usize_add(
+                        start,
+                        local_data_block,
+                        "extensible array data block address index",
+                    )
+                })?;
                 let Some(&data_block_addr) = data_block_addrs.get(data_block_index) else {
                     return Err(Error::InvalidFormat(
                         "extensible array data block address index out of bounds".into(),

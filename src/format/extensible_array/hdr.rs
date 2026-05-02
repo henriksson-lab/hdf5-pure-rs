@@ -1,6 +1,8 @@
 //! Extensible array header — mirrors libhdf5's `H5EAhdr.c` plus the
 //! header-half of `H5EAcache.c` (`H5EA__cache_hdr_deserialize`).
 
+#![allow(dead_code)]
+
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -15,7 +17,6 @@ pub(crate) struct ParsedExtensibleArrayHeader {
     pub(crate) raw_element_size: usize,
     pub(crate) index_block_elements: u8,
     pub(crate) data_block_min_elements: usize,
-    pub(crate) super_block_min_data_ptrs: usize,
     pub(crate) super_block_count: u64,
     pub(crate) super_block_size: u64,
     pub(crate) data_block_count: u64,
@@ -82,6 +83,145 @@ pub(super) fn read_header<R: Read + Seek>(
     })
 }
 
+pub(super) fn hdr_debug(header: &ExtensibleArrayHeader) -> String {
+    format!(
+        "ExtensibleArrayHeader(class_id={}, raw_element_size={}, index_block_elements={}, max_index_set={}, index_block_addr={:#x})",
+        header.class_id,
+        header.raw_element_size,
+        header.index_block_elements,
+        header.max_index_set,
+        header.index_block_addr
+    )
+}
+
+pub(super) fn cache_hdr_get_initial_load_size() -> usize {
+    4 + 1
+}
+
+pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Result<usize> {
+    let fixed = 4usize
+        .checked_add(8)
+        .and_then(|value| value.checked_add(6usize.checked_mul(length_size)?))
+        .and_then(|value| value.checked_add(addr_size))
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array header image length overflow".into())
+        })?;
+    Ok(fixed)
+}
+
+pub(super) fn cache_hdr_serialize(
+    header: &ParsedExtensibleArrayHeader,
+    addr_size: usize,
+    length_size: usize,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    out.extend_from_slice(b"EAHD");
+    out.push(0);
+    out.push(header.class_id);
+    out.push(u8::try_from(header.raw_element_size).map_err(|_| {
+        Error::InvalidFormat("extensible array raw element size does not fit in u8".into())
+    })?);
+    let max_bits = 64 - header.max_index_set.max(1).leading_zeros() as u8;
+    out.push(max_bits);
+    out.push(header.index_block_elements);
+    out.push(u8::try_from(header.data_block_min_elements).map_err(|_| {
+        Error::InvalidFormat("extensible array minimum data block elements do not fit in u8".into())
+    })?);
+    out.push(1);
+    out.push(
+        header
+            .data_block_page_elements
+            .checked_ilog2()
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| Error::InvalidFormat("extensible array page bits overflow".into()))?,
+    );
+    encode_var(&mut out, header.super_block_count, length_size)?;
+    encode_var(&mut out, header.super_block_size, length_size)?;
+    encode_var(&mut out, header.data_block_count, length_size)?;
+    encode_var(&mut out, header.data_block_size, length_size)?;
+    encode_var(&mut out, header.max_index_set, length_size)?;
+    encode_var(&mut out, header.realized_elements, length_size)?;
+    encode_var(&mut out, header.index_block_addr, addr_size)?;
+    let checksum = checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    Ok(out)
+}
+
+pub(super) fn cache_hdr_notify(_header: &ExtensibleArrayHeader) {}
+
+pub(super) fn cache_hdr_free_icr(_header: ExtensibleArrayHeader) {}
+
+pub(super) fn hdr_alloc(parsed: ParsedExtensibleArrayHeader) -> ParsedExtensibleArrayHeader {
+    parsed
+}
+
+pub(super) fn hdr_init(header: &mut ParsedExtensibleArrayHeader) {
+    header.realized_elements = 0;
+    header.max_index_set = 0;
+}
+
+pub(super) fn hdr_alloc_elmts(count: usize) -> Vec<crate::format::fixed_array::FixedArrayElement> {
+    vec![
+        crate::format::fixed_array::FixedArrayElement {
+            addr: crate::io::reader::UNDEF_ADDR,
+            nbytes: None,
+            filter_mask: 0,
+        };
+        count
+    ]
+}
+
+pub(super) fn hdr_free_elmts(elements: &mut Vec<crate::format::fixed_array::FixedArrayElement>) {
+    elements.clear();
+}
+
+pub(super) fn hdr_create(parsed: ParsedExtensibleArrayHeader) -> ParsedExtensibleArrayHeader {
+    parsed
+}
+
+pub(super) fn hdr_incr(ref_count: &mut usize) {
+    *ref_count = ref_count.saturating_add(1);
+}
+
+pub(super) fn hdr_decr(ref_count: &mut usize) -> Result<()> {
+    if *ref_count == 0 {
+        return Err(Error::InvalidFormat(
+            "extensible array header reference underflow".into(),
+        ));
+    }
+    *ref_count -= 1;
+    Ok(())
+}
+
+pub(super) fn hdr_fuse_incr(ref_count: &mut usize) {
+    hdr_incr(ref_count);
+}
+
+pub(super) fn hdr_fuse_decr(ref_count: &mut usize) -> Result<()> {
+    hdr_decr(ref_count)
+}
+
+pub(super) fn hdr_modified(_header: &mut ParsedExtensibleArrayHeader) {}
+
+pub(super) fn hdr_protect<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    addr: u64,
+) -> Result<ParsedExtensibleArrayHeader> {
+    read_header_core(reader, addr)
+}
+
+pub(super) fn hdr_unprotect(_header: ParsedExtensibleArrayHeader) {}
+
+pub(super) fn hdr_delete(header: &mut ParsedExtensibleArrayHeader) {
+    header.index_block_addr = crate::io::reader::UNDEF_ADDR;
+    header.max_index_set = 0;
+    header.realized_elements = 0;
+}
+
+pub(super) fn hdr_dest(_header: ParsedExtensibleArrayHeader) {}
+
 pub(crate) fn read_header_core<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,
@@ -147,14 +287,21 @@ pub(crate) fn read_header_core<R: Read + Seek>(
         .ok_or_else(|| {
             Error::InvalidFormat("extensible array page element count overflow".into())
         })?;
-    let derived_super_block_count = 1usize
-        + (max_elements_bits as usize)
-            .checked_sub(super::log2_power2(data_block_min_elements as u64)?)
-            .ok_or_else(|| {
-                Error::InvalidFormat("invalid extensible array block parameters".into())
-            })?;
-    let index_block_super_blocks = 2 * super::log2_power2(super_block_min_data_ptrs as u64)?;
-    let index_block_data_block_addrs = 2 * (super_block_min_data_ptrs as usize - 1);
+    let derived_super_block_count = (max_elements_bits as usize)
+        .checked_sub(super::log2_power2(data_block_min_elements as u64)?)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| Error::InvalidFormat("invalid extensible array block parameters".into()))?;
+    let index_block_super_blocks = super::log2_power2(super_block_min_data_ptrs as u64)?
+        .checked_mul(2)
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array index block sizing overflow".into())
+        })?;
+    let index_block_data_block_addrs = (super_block_min_data_ptrs as usize)
+        .checked_sub(1)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array index block sizing overflow".into())
+        })?;
     let index_block_super_block_addrs = derived_super_block_count
         .checked_sub(index_block_super_blocks)
         .ok_or_else(|| {
@@ -168,7 +315,6 @@ pub(crate) fn read_header_core<R: Read + Seek>(
         raw_element_size,
         index_block_elements,
         data_block_min_elements: data_block_min_elements as usize,
-        super_block_min_data_ptrs: super_block_min_data_ptrs as usize,
         super_block_count: stored_super_block_count,
         super_block_size,
         data_block_count,
@@ -210,7 +356,9 @@ pub(super) fn verify_checksum<R: Read + Seek>(
             "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
         )));
     }
-    reader.seek(checksum_pos + 4)?;
+    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
+    })?)?;
     Ok(())
 }
 
@@ -243,8 +391,11 @@ fn build_super_block_info(
             data_block_elements,
             start_data_block,
         });
+        let index_span = (data_blocks as u64)
+            .checked_mul(data_block_elements as u64)
+            .ok_or_else(|| Error::InvalidFormat("extensible array start index overflow".into()))?;
         start_index = start_index
-            .checked_add((data_blocks as u64) * (data_block_elements as u64))
+            .checked_add(index_span)
             .ok_or_else(|| Error::InvalidFormat("extensible array start index overflow".into()))?;
         start_data_block = start_data_block
             .checked_add(data_blocks as u64)
@@ -253,4 +404,26 @@ fn build_super_block_info(
             })?;
     }
     Ok(infos)
+}
+
+fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
+    if size > 8 {
+        return Err(Error::InvalidFormat(
+            "extensible array encoded integer size exceeds u64".into(),
+        ));
+    }
+    let bytes = value.to_le_bytes();
+    out.extend_from_slice(&bytes[..size]);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_super_block_info;
+
+    #[test]
+    fn build_super_block_info_rejects_start_index_product_overflow() {
+        let err = build_super_block_info(3, usize::MAX / 4 + 1).unwrap_err();
+        assert!(err.to_string().contains("start index overflow"));
+    }
 }

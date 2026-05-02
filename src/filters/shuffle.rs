@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Unshuffle bytes (reverse the shuffle filter).
 ///
@@ -68,7 +68,9 @@ pub fn unshuffle_into(data: &[u8], element_size: usize, out: &mut [u8]) -> Resul
         _ => {
             for i in 0..n_elements {
                 for j in 0..element_size {
-                    out[i * element_size + j] = data[j * n_elements + i];
+                    let dst = shuffle_index(i, element_size, j)?;
+                    let src = shuffle_index(j, n_elements, i)?;
+                    out[dst] = data[src];
                 }
             }
         }
@@ -88,13 +90,41 @@ pub fn shuffle(data: &[u8], element_size: usize) -> Result<Vec<u8>> {
 
     for i in 0..n_elements {
         for j in 0..element_size {
-            out[j * n_elements + i] = data[i * element_size + j];
+            let dst = shuffle_index(j, n_elements, i)?;
+            let src = shuffle_index(i, element_size, j)?;
+            out[dst] = data[src];
         }
     }
     let grouped = n_elements * element_size;
     out[grouped..].copy_from_slice(&data[grouped..]);
 
     Ok(out)
+}
+
+/// Validate and return the shuffle element size for local filter setup.
+pub fn set_local_shuffle(element_size: usize) -> Result<usize> {
+    if element_size == 0 {
+        return Err(Error::InvalidFormat(
+            "shuffle filter element size is zero".into(),
+        ));
+    }
+    Ok(element_size)
+}
+
+/// HDF5 shuffle filter entry point: reverse unshuffles, forward shuffles.
+pub fn filter_shuffle(data: &[u8], element_size: usize, reverse: bool) -> Result<Vec<u8>> {
+    let element_size = set_local_shuffle(element_size)?;
+    if reverse {
+        unshuffle(data, element_size)
+    } else {
+        shuffle(data, element_size)
+    }
+}
+
+fn shuffle_index(base: usize, stride: usize, offset: usize) -> Result<usize> {
+    base.checked_mul(stride)
+        .and_then(|value| value.checked_add(offset))
+        .ok_or_else(|| Error::InvalidFormat("shuffle index overflow".into()))
 }
 
 #[cfg(test)]
@@ -115,5 +145,14 @@ mod tests {
         let shuffled = shuffle(&data, 4).unwrap();
         let unshuffled = unshuffle(&shuffled, 4).unwrap();
         assert_eq!(unshuffled, data);
+    }
+
+    #[test]
+    fn shuffle_index_rejects_overflow() {
+        let err = shuffle_index(usize::MAX, 2, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("shuffle index overflow"),
+            "unexpected error: {err}"
+        );
     }
 }

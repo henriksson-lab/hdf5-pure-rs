@@ -127,11 +127,7 @@ impl FractalHeapHeader {
                 .ok_or_else(|| Error::InvalidFormat("fractal heap entry count overflow".into()))?,
         );
         for row in 0..nrows {
-            let block_size = if row < 2 {
-                self.start_block_size
-            } else {
-                self.start_block_size * (1u64 << (row - 1))
-            };
+            let block_size = self.checked_row_block_size(row)?;
             let direct = block_size <= self.max_direct_block_size;
             for _ in 0..width {
                 let addr = reader.read_addr()?;

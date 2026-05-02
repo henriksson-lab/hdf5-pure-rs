@@ -87,14 +87,22 @@ fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Resul
 fn read_u8(data: &[u8], pos: &mut usize, context: &str) -> Result<u8> {
     ensure_available(data, *pos, 1, context)?;
     let value = data[*pos];
-    *pos += 1;
+    advance_pos(pos, 1, context)?;
     Ok(value)
 }
 
 fn read_u16_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u16> {
     ensure_available(data, *pos, 2, context)?;
-    let value = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
+    let end = checked_add_pos(*pos, 2, context)?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    let value = u16::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?,
+    );
+    advance_pos(pos, 2, context)?;
     Ok(value)
 }
 
@@ -105,10 +113,21 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
         )));
     }
     ensure_available(data, *pos, size, context)?;
+    let end = checked_add_pos(*pos, size, context)?;
     let mut val = 0u64;
-    for i in 0..size {
-        val |= (data[*pos + i] as u64) << (i * 8);
+    for (i, byte) in data[*pos..end].iter().enumerate() {
+        val |= (*byte as u64) << (i * 8);
     }
-    *pos += size;
+    advance_pos(pos, size, context)?;
     Ok(val)
+}
+
+fn checked_add_pos(pos: usize, len: usize, context: &str) -> Result<usize> {
+    pos.checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
+}
+
+fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
+    *pos = checked_add_pos(*pos, len, context)?;
+    Ok(())
 }

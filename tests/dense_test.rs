@@ -1,3 +1,4 @@
+use hdf5_pure_rust::format::messages::link::LinkType;
 use hdf5_pure_rust::File;
 
 #[test]
@@ -10,9 +11,14 @@ fn test_read_dense_links() {
     }
 
     assert_eq!(names.len(), 20);
+    let links = f.root_group().unwrap().links().unwrap();
+    assert_eq!(links.len(), 20);
     for i in 0..20 {
         let expected = format!("group_{i:02}");
         assert!(names.contains(&expected), "missing {expected}");
+        assert!(links
+            .iter()
+            .any(|link| link.name == expected && link.link_type == LinkType::Hard));
     }
 }
 
@@ -62,6 +68,17 @@ fn test_dense_group_creation_order_indexing_enabled_and_disabled() {
     assert_eq!(tracked_names.len(), 64);
     assert!(tracked_names.contains(&"tracked_00".to_string()));
     assert!(tracked_names.contains(&"tracked_63".to_string()));
+    let tracked_links = tracked.links_by_creation_order().unwrap();
+    assert_eq!(tracked_links.len(), 64);
+    assert_eq!(
+        tracked_links
+            .iter()
+            .map(|link| link.creation_order.unwrap())
+            .collect::<Vec<_>>(),
+        (0..64).collect::<Vec<_>>()
+    );
+    assert!(tracked_links.iter().any(|link| link.name == "tracked_00"));
+    assert!(tracked_links.iter().any(|link| link.name == "tracked_63"));
     assert_eq!(
         tracked.member_type("tracked_42").unwrap(),
         hdf5_pure_rust::hl::file::ObjectType::Dataset
@@ -72,6 +89,7 @@ fn test_dense_group_creation_order_indexing_enabled_and_disabled() {
     assert_eq!(untracked_names.len(), 64);
     assert!(untracked_names.contains(&"untracked_00".to_string()));
     assert!(untracked_names.contains(&"untracked_63".to_string()));
+    assert!(untracked.links_by_creation_order().is_err());
     assert_eq!(
         untracked.member_type("untracked_42").unwrap(),
         hdf5_pure_rust::hl::file::ObjectType::Dataset

@@ -1,4 +1,5 @@
 pub mod attribute;
+pub mod context;
 pub(crate) mod conversion;
 pub mod dataset;
 pub mod dataset_builder;
@@ -6,6 +7,7 @@ pub mod dataspace;
 pub mod datatype;
 pub mod file;
 pub mod group;
+pub mod link;
 pub mod location;
 pub mod mutable_file;
 pub mod plist;

@@ -11,7 +11,7 @@ pub enum DataspaceType {
 }
 
 /// Parsed Dataspace message (type 0x0001).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataspaceMessage {
     pub version: u8,
     pub space_type: DataspaceType,
@@ -196,11 +196,26 @@ fn read_le_u64(data: &[u8], pos: &mut usize, size: usize, context: &str) -> Resu
             "{context} has invalid byte width {size}"
         )));
     }
-    ensure_available(data, *pos, size, context)?;
+    let bytes = checked_window(data, *pos, size, context)?;
     let mut val = 0u64;
-    for i in 0..size {
-        val |= (data[*pos + i] as u64) << (i * 8);
+    for (i, byte) in bytes.iter().enumerate() {
+        val |= u64::from(*byte) << (i * 8);
     }
-    *pos += size;
+    advance_pos(pos, size, context)?;
     Ok(val)
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
+}
+
+fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
+    *pos = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))?;
+    Ok(())
 }

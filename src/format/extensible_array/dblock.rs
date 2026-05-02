@@ -3,6 +3,8 @@
 //! in libhdf5's `H5EAdblkpage.c` is folded in here because the Rust port
 //! doesn't model pages as a separate cache entry.
 
+#![allow(dead_code)]
+
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -21,6 +23,127 @@ pub(super) struct ExtArrayDataBlockPrefix {
     /// Total prefix size on disk (used to compute per-page offsets).
     pub(super) prefix_size: usize,
 }
+
+pub(super) fn dblock_debug(prefix: &ExtArrayDataBlockPrefix) -> String {
+    format!(
+        "ExtArrayDataBlockPrefix(pages={}, prefix_size={})",
+        prefix.pages, prefix.prefix_size
+    )
+}
+
+pub(super) fn cache_dblock_verify_chksum(data: &[u8]) -> Result<()> {
+    verify_trailing_checksum(data, "extensible array data block")
+}
+
+pub(super) fn cache_dblock_image_len(
+    prefix: &ExtArrayDataBlockPrefix,
+    payload_len: usize,
+) -> Result<usize> {
+    prefix
+        .prefix_size
+        .checked_add(payload_len)
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| {
+            Error::InvalidFormat("extensible array data block image length overflow".into())
+        })
+}
+
+pub(super) fn cache_dblock_serialize(prefix: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + payload.len() + 4);
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(payload);
+    let checksum = crate::format::checksum::checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+pub(super) fn cache_dblock_notify(_prefix: &ExtArrayDataBlockPrefix) {}
+
+pub(super) fn cache_dblock_free_icr(_prefix: ExtArrayDataBlockPrefix) {}
+
+pub(super) fn cache_dblock_fsf_size(prefix: &ExtArrayDataBlockPrefix) -> usize {
+    prefix.prefix_size
+}
+
+pub(super) fn cache_dblk_page_get_initial_load_size() -> usize {
+    4
+}
+
+pub(super) fn cache_dblk_page_verify_chksum(data: &[u8]) -> Result<()> {
+    verify_trailing_checksum(data, "extensible array data block page")
+}
+
+pub(super) fn cache_dblk_page_image_len(payload_len: usize) -> Result<usize> {
+    payload_len.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat("extensible array data block page image length overflow".into())
+    })
+}
+
+pub(super) fn cache_dblk_page_serialize(payload: &[u8]) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    let checksum = crate::format::checksum::checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+pub(super) fn cache_dblk_page_notify(_page_index: usize) {}
+
+pub(super) fn cache_dblk_page_free_icr(_payload: Vec<u8>) {}
+
+pub(super) fn dblk_page_alloc(size: usize) -> Vec<u8> {
+    vec![0; size]
+}
+
+pub(super) fn dblk_page_create(payload: Vec<u8>) -> Vec<u8> {
+    payload
+}
+
+pub(super) fn dblk_page_protect(payload: &[u8]) -> &[u8] {
+    payload
+}
+
+pub(super) fn dblk_page_unprotect(_payload: &[u8]) {}
+
+pub(super) fn dblk_page_dest(_payload: Vec<u8>) {}
+
+pub(super) fn dblock_alloc(pages: usize, prefix_size: usize) -> ExtArrayDataBlockPrefix {
+    ExtArrayDataBlockPrefix { pages, prefix_size }
+}
+
+pub(super) fn dblock_sblk_idx(
+    header: &ExtensibleArrayHeader,
+    data_block_elements: usize,
+) -> Option<usize> {
+    header
+        .super_block_info
+        .iter()
+        .position(|info| info.data_block_elements == data_block_elements)
+}
+
+pub(super) fn dblock_protect<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    header_addr: u64,
+    header: &ExtensibleArrayHeader,
+    data_block_addr: u64,
+    data_block_elements: usize,
+) -> Result<ExtArrayDataBlockPrefix> {
+    decode_data_block_prefix(
+        reader,
+        header_addr,
+        header,
+        data_block_addr,
+        data_block_elements,
+    )
+}
+
+pub(super) fn dblock_unprotect(_prefix: ExtArrayDataBlockPrefix) {}
+
+pub(super) fn dblock_delete(prefix: &mut ExtArrayDataBlockPrefix) {
+    prefix.pages = 0;
+    prefix.prefix_size = 0;
+}
+
+pub(super) fn dblock_dest(_prefix: ExtArrayDataBlockPrefix) {}
 
 /// Pure prefix decode for an extensible-array data block.
 pub(super) fn decode_data_block_prefix<R: Read + Seek>(
@@ -61,9 +184,41 @@ pub(super) fn decode_data_block_prefix<R: Read + Seek>(
 
     let _block_offset = reader.read_uint(header.array_offset_size)?;
     let pages = super::data_block_pages(header, data_block_elements);
-    let prefix_size =
-        4 + 1 + 1 + reader.sizeof_addr() as usize + header.array_offset_size as usize + 4;
+    let prefix_size = super::checked_usize_add(
+        4 + 1 + 1,
+        reader.sizeof_addr() as usize,
+        "extensible array data block prefix size",
+    )
+    .and_then(|value| {
+        super::checked_usize_add(
+            value,
+            header.array_offset_size as usize,
+            "extensible array data block prefix size",
+        )
+    })
+    .and_then(|value| {
+        super::checked_usize_add(value, 4, "extensible array data block prefix size")
+    })?;
     Ok(ExtArrayDataBlockPrefix { pages, prefix_size })
+}
+
+fn verify_trailing_checksum(data: &[u8], context: &str) -> Result<()> {
+    if data.len() < 4 {
+        return Err(Error::InvalidFormat(format!("{context} image too short")));
+    }
+    let split = data.len() - 4;
+    let stored = u32::from_le_bytes(
+        data[split..]
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} checksum is truncated")))?,
+    );
+    let computed = crate::format::checksum::checksum_metadata(&data[..split]);
+    if stored != computed {
+        return Err(Error::InvalidFormat(format!(
+            "{context} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}"
+        )));
+    }
+    Ok(())
 }
 
 /// Drive a decoded data-block prefix to push `count` elements onto the
@@ -101,21 +256,57 @@ pub(super) fn append_data_block_elements<R: Read + Seek>(
         for _ in 0..count {
             elements.push(read_element(reader, filtered, chunk_size_len)?);
         }
-        let unread = data_block_elements.saturating_sub(count);
+        let unread = data_block_elements.checked_sub(count).ok_or_else(|| {
+            Error::InvalidFormat(
+                "extensible array data block read count exceeds data block elements".into(),
+            )
+        })?;
         if unread > 0 {
-            reader.skip((unread * header.raw_element_size) as u64)?;
+            let skip_bytes = super::checked_usize_mul(
+                unread,
+                header.raw_element_size,
+                "extensible array unread data block span",
+            )?;
+            reader.skip(super::u64_from_usize(
+                skip_bytes,
+                "extensible array unread data block span",
+            )?)?;
         }
         let _checksum = reader.read_u32()?;
     } else {
-        let page_size = header.data_block_page_elements * header.raw_element_size + 4;
+        let page_payload = super::checked_usize_mul(
+            header.data_block_page_elements,
+            header.raw_element_size,
+            "extensible array data block page size",
+        )?;
+        let page_size =
+            super::checked_usize_add(page_payload, 4, "extensible array data block page size")?;
         let mut remaining = count;
         for page_index in 0..prefix.pages {
             if remaining == 0 {
                 break;
             }
             let page_elements = header.data_block_page_elements.min(remaining);
-            let page_addr =
-                data_block_addr + prefix.prefix_size as u64 + (page_index * page_size) as u64;
+            let page_offset = super::checked_usize_mul(
+                page_index,
+                page_size,
+                "extensible array data block page offset",
+            )?;
+            let page_addr = super::checked_u64_add(
+                data_block_addr,
+                super::u64_from_usize(
+                    prefix.prefix_size,
+                    "extensible array data block prefix size",
+                )?,
+                "extensible array data block page address",
+            )
+            .and_then(|value| {
+                super::checked_u64_add(
+                    value,
+                    super::u64_from_usize(page_offset, "extensible array data block page offset")?,
+                    "extensible array data block page address",
+                )
+            })?;
             let page_initialized = page_init
                 .map(|bits| super::bit_is_set(bits, page_index))
                 .unwrap_or(true);

@@ -486,6 +486,7 @@ fn test_message_size_arithmetic_overflow_returns_format_error() {
     let attribute = AttributeMessage {
         version: 3,
         name: "overflow".to_string(),
+        char_encoding: 0,
         datatype: DatatypeMessage {
             version: 1,
             class: DatatypeClass::FixedPoint,

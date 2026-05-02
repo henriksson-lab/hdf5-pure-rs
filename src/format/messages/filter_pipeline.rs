@@ -99,16 +99,19 @@ impl FilterPipelineMessage {
             // Name (null-terminated, padded to 8-byte boundary)
             let name = if name_len > 0 {
                 ensure_available(data, pos, name_len, "filter pipeline v1 name")?;
-                let name_end = pos + name_len;
-                let null_pos = data[pos..name_end]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(name_len);
-                let n = String::from_utf8_lossy(&data[pos..pos + null_pos]).to_string();
+                let name_bytes = checked_window(data, pos, name_len, "filter pipeline v1 name")?;
+                let null_pos = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
+                let n = String::from_utf8_lossy(checked_window(
+                    name_bytes,
+                    0,
+                    null_pos,
+                    "filter pipeline v1 name text",
+                )?)
+                .to_string();
                 // Pad to 8-byte boundary
-                let padded = (name_len + 7) & !7;
+                let padded = align8(name_len, "filter pipeline v1 name")?;
                 ensure_available(data, pos, padded, "filter pipeline v1 padded name")?;
-                pos += padded;
+                advance_pos(&mut pos, padded, "filter pipeline v1 padded name")?;
                 Some(n)
             } else {
                 None
@@ -124,7 +127,7 @@ impl FilterPipelineMessage {
             // Pad cd_nelmts to even number in v1
             if cd_nelmts % 2 != 0 {
                 ensure_available(data, pos, 4, "filter pipeline v1 client data padding")?;
-                pos += 4;
+                advance_pos(&mut pos, 4, "filter pipeline v1 client data padding")?;
             }
 
             filters.push(FilterDesc {
@@ -155,12 +158,17 @@ impl FilterPipelineMessage {
                     read_u16_le(data, &mut pos, "filter pipeline v2 name length")? as usize;
                 if name_len > 0 {
                     ensure_available(data, pos, name_len, "filter pipeline v2 name")?;
-                    let null_pos = data[pos..pos + name_len]
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(name_len);
-                    let n = String::from_utf8_lossy(&data[pos..pos + null_pos]).to_string();
-                    pos += name_len;
+                    let name_bytes =
+                        checked_window(data, pos, name_len, "filter pipeline v2 name")?;
+                    let null_pos = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
+                    let n = String::from_utf8_lossy(checked_window(
+                        name_bytes,
+                        0,
+                        null_pos,
+                        "filter pipeline v2 name text",
+                    )?)
+                    .to_string();
+                    advance_pos(&mut pos, name_len, "filter pipeline v2 name")?;
                     Some(n)
                 } else {
                     None
@@ -211,14 +219,76 @@ fn ensure_available(data: &[u8], pos: usize, len: usize, context: &str) -> Resul
 
 fn read_u16_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u16> {
     ensure_available(data, *pos, 2, context)?;
-    let value = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
+    let end = checked_add_pos(*pos, 2, context)?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    let value = u16::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?,
+    );
+    advance_pos(pos, 2, context)?;
     Ok(value)
+}
+
+fn checked_window<'a>(data: &'a [u8], pos: usize, len: usize, context: &str) -> Result<&'a [u8]> {
+    let end = checked_add_pos(pos, len, context)?;
+    data.get(pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))
 }
 
 fn read_u32_le(data: &[u8], pos: &mut usize, context: &str) -> Result<u32> {
     ensure_available(data, *pos, 4, context)?;
-    let value = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos += 4;
+    let end = checked_add_pos(*pos, 4, context)?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    let value = u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| Error::InvalidFormat(format!("{context} is truncated")))?,
+    );
+    advance_pos(pos, 4, context)?;
     Ok(value)
+}
+
+fn checked_add_pos(pos: usize, len: usize, context: &str) -> Result<usize> {
+    pos.checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
+}
+
+fn advance_pos(pos: &mut usize, len: usize, context: &str) -> Result<()> {
+    *pos = checked_add_pos(*pos, len, context)?;
+    Ok(())
+}
+
+fn align8(len: usize, context: &str) -> Result<usize> {
+    len.checked_add(7)
+        .map(|value| value & !7)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} padded size overflow")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{advance_pos, align8, checked_window};
+
+    #[test]
+    fn filter_pipeline_padding_rejects_overflow() {
+        let err = align8(usize::MAX, "filter name").unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn filter_pipeline_cursor_advance_rejects_overflow() {
+        let mut pos = usize::MAX;
+        let err = advance_pos(&mut pos, 1, "filter cursor").unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn filter_pipeline_checked_window_rejects_overflow() {
+        let err = checked_window(&[], usize::MAX, 1, "filter window").unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
 }

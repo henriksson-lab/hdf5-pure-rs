@@ -28,7 +28,8 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
 ) -> Result<()> {
     while reader.position()? < chunk_end {
         let pos = reader.position()?;
-        if pos + 8 > chunk_end {
+        let header_end = checked_u64_add(pos, 8, "object header v1 message header")?;
+        if header_end > chunk_end {
             let remaining = (chunk_end - pos) as usize;
             let padding = reader.read_bytes(remaining)?;
             if padding.iter().all(|&b| b == 0) {
@@ -50,7 +51,7 @@ pub(super) fn read_v1_messages<R: Read + Seek>(
             .checked_add(7)
             .map(|n| n & !7)
             .ok_or_else(|| Error::InvalidFormat("object header message size overflow".into()))?;
-        let data_start = pos + 8;
+        let data_start = checked_u64_add(pos, 8, "object header v1 message data start")?;
         let data_end = data_start
             .checked_add(aligned_size)
             .ok_or_else(|| Error::InvalidFormat("object header message range overflow".into()))?;
@@ -123,7 +124,8 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
     while reader.position()? < chunk_data_end {
         let pos = reader.position()?;
         // Minimum message header size: 4 bytes (type:1, size:2, flags:1)
-        if pos + 4 > chunk_data_end {
+        let header_end = checked_u64_add(pos, 4, "object header v2 message header")?;
+        if header_end > chunk_data_end {
             let remaining = (chunk_data_end - pos) as usize;
             let padding = reader.read_bytes(remaining)?;
             if padding.iter().all(|&b| b == 0) {
@@ -139,7 +141,12 @@ pub(super) fn read_v2_messages<R: Read + Seek>(
         let msg_flags = reader.read_u8()?;
 
         let creation_index = if has_crt_order {
-            if reader.position()? + 2 > chunk_data_end {
+            let creation_order_end = checked_u64_add(
+                reader.position()?,
+                2,
+                "object header v2 message creation order",
+            )?;
+            if creation_order_end > chunk_data_end {
                 return Err(Error::InvalidFormat(
                     "object header v2 message creation order is truncated".into(),
                 ));
@@ -233,7 +240,7 @@ fn validate_shared_message_table(data: &[u8], sizeof_addr: u8) -> Result<()> {
             "unsupported shared message table version: {version}"
         )));
     }
-    let addr_end = 1 + sizeof_addr as usize;
+    let addr_end = checked_usize_add(1, sizeof_addr as usize, "shared message table address")?;
     let table_addr = read_le_uint(&data[1..addr_end])?;
     if is_undefined_addr(table_addr, sizeof_addr)? {
         return Err(Error::InvalidFormat(
@@ -271,7 +278,11 @@ fn validate_shared_message_reference(data: &[u8], sizeof_addr: u8, sizeof_size: 
                     "shared object-header message v1 reference has invalid length".into(),
                 ));
             }
-            let addr_start = 2 + 6 + sizeof_size as usize;
+            let addr_start = checked_usize_add(
+                checked_usize_add(2, 6, "shared message v1 reference prefix")?,
+                sizeof_size as usize,
+                "shared message v1 reference address",
+            )?;
             let addr = read_le_uint(&data[addr_start..])?;
             if is_undefined_addr(addr, sizeof_addr)? {
                 return Err(Error::InvalidFormat(
@@ -297,7 +308,9 @@ fn validate_shared_message_reference(data: &[u8], sizeof_addr: u8, sizeof_size: 
         }
         SHARED_REFERENCE_VERSION_3 => match data[1] {
             SHARED_TYPE_SOHM => {
-                if data.len() != 2 + SHARED_HEAP_ID_LEN {
+                let expected_len =
+                    checked_usize_add(2, SHARED_HEAP_ID_LEN, "shared SOHM reference")?;
+                if data.len() != expected_len {
                     return Err(Error::InvalidFormat(
                         "shared object-header message SOHM reference has invalid length".into(),
                     ));
@@ -334,4 +347,31 @@ fn validate_shared_message_reference(data: &[u8], sizeof_addr: u8, sizeof_size: 
     }
 
     Ok(())
+}
+
+fn checked_u64_add(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} offset overflow")))
+}
+
+fn checked_usize_add(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} size overflow")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checked_u64_add, checked_usize_add};
+
+    #[test]
+    fn object_header_checked_u64_add_rejects_overflow() {
+        let err = checked_u64_add(u64::MAX, 1, "message header").unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn object_header_checked_usize_add_rejects_overflow() {
+        let err = checked_usize_add(usize::MAX, 1, "message size").unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
 }

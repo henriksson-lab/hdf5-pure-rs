@@ -1,6 +1,6 @@
 //! Phase T3: Datatype tests -- read all primitive, compound, enum, string types.
 
-use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
+use hdf5_pure_rust::format::messages::datatype::{DatatypeClass, FloatFields};
 use hdf5_pure_rust::Error;
 use hdf5_pure_rust::File;
 
@@ -62,6 +62,18 @@ fn t3a_uint64() {
 }
 
 #[test]
+fn t3a_integer_datatype_precision_and_offset() {
+    let dtype = open().dataset("int32").unwrap().dtype().unwrap();
+
+    assert_eq!(dtype.bit_offset(), Some(0));
+    assert_eq!(dtype.precision(), Some(32));
+    assert_eq!(dtype.create_plist().low_pad(), 0);
+    assert_eq!(dtype.create_plist().high_pad(), 0);
+    assert_eq!(dtype.pad(), Some((0, 0)));
+    assert_eq!(dtype.native_type().size(), dtype.size());
+}
+
+#[test]
 fn t3a_integer_signed_widening_and_narrowing() {
     let f = File::open("tests/data/hdf5_ref/integer_conversion_vectors.h5").unwrap();
     let ds = f.dataset("i16_conversion").unwrap();
@@ -95,6 +107,28 @@ fn t3a_integer_unsigned_widening_and_narrowing() {
 fn t3a_float32() {
     let vals: Vec<f32> = open().dataset("float32").unwrap().read::<f32>().unwrap();
     assert_eq!(vals, vec![1.5, 2.5, 3.5]);
+}
+
+#[test]
+fn t3a_float32_field_metadata() {
+    let dtype = open().dataset("float32").unwrap().dtype().unwrap();
+
+    assert_eq!(dtype.bit_offset(), Some(0));
+    assert_eq!(dtype.precision(), Some(32));
+    assert_eq!(
+        dtype.float_fields(),
+        Some(FloatFields {
+            sign_position: 31,
+            exponent_position: 23,
+            exponent_size: 8,
+            mantissa_position: 0,
+            mantissa_size: 23,
+        })
+    );
+    assert_eq!(dtype.exponent_bias(), Some(127));
+    assert_eq!(dtype.mantissa_normalization(), Some(2));
+    assert_eq!(dtype.internal_padding(), Some(0));
+    assert_eq!(dtype.pad(), Some((0, 0)));
 }
 
 #[test]
@@ -234,11 +268,27 @@ fn t3a_be_uint16() {
 #[test]
 fn t3b_compound_fields() {
     let ds = open().dataset("compound").unwrap();
+    let dtype = ds.dtype().unwrap();
     let fields = ds.compound_fields().unwrap();
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0].name, "x");
     assert_eq!(fields[1].name, "y");
     assert_eq!(fields[2].name, "flag");
+    assert_eq!(dtype.member_index("x"), Some(0));
+    assert_eq!(dtype.member_index("y"), Some(1));
+    assert_eq!(dtype.member_index("flag"), Some(2));
+    assert_eq!(dtype.member_index("missing"), None);
+    for (index, field) in fields.iter().enumerate() {
+        assert_eq!(dtype.member_offset(index), Some(field.byte_offset));
+        assert_eq!(dtype.member_class(index), Some(field.class));
+        assert_eq!(
+            dtype.member_type(index).map(|member| member.size()),
+            Some(field.size)
+        );
+    }
+    assert_eq!(dtype.member_offset(fields.len()), None);
+    assert_eq!(dtype.member_class(fields.len()), None);
+    assert!(dtype.member_type(fields.len()).is_none());
 }
 
 #[test]

@@ -1,2 +1,9 @@
+pub mod attribute_create;
+pub mod data_transfer;
 pub mod dataset_create;
+pub mod datatype_create;
+pub mod file_access;
 pub mod file_create;
+pub mod link_access;
+pub mod object_copy;
+pub mod object_create;

@@ -1,6 +1,8 @@
 //! Fixed array header — mirrors libhdf5's `H5FAhdr.c` + the header-half
 //! of `H5FAcache.c` (`H5FA__cache_hdr_deserialize`).
 
+#![allow(dead_code)]
+
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
@@ -17,6 +19,121 @@ pub(super) struct FixedArrayHeader {
     pub(super) elements: u64,
     pub(super) data_block_addr: u64,
 }
+
+pub(super) fn hdr_debug(header: &FixedArrayHeader) -> String {
+    format!(
+        "FixedArrayHeader(class_id={}, raw_element_size={}, max_page_elements_bits={}, elements={}, data_block_addr={:#x})",
+        header.class_id,
+        header.raw_element_size,
+        header.max_page_elements_bits,
+        header.elements,
+        header.data_block_addr
+    )
+}
+
+pub(super) fn cache_hdr_get_initial_load_size() -> usize {
+    4 + 1
+}
+
+pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Result<usize> {
+    4usize
+        .checked_add(1)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(length_size))
+        .and_then(|value| value.checked_add(addr_size))
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| Error::InvalidFormat("fixed array header image length overflow".into()))
+}
+
+pub(super) fn cache_hdr_serialize(
+    header: &FixedArrayHeader,
+    addr_size: usize,
+    length_size: usize,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    out.extend_from_slice(b"FAHD");
+    out.push(0);
+    out.push(header.class_id);
+    out.push(u8::try_from(header.raw_element_size).map_err(|_| {
+        Error::InvalidFormat("fixed array raw element size does not fit in u8".into())
+    })?);
+    out.push(header.max_page_elements_bits);
+    encode_var(&mut out, header.elements, length_size)?;
+    encode_var(&mut out, header.data_block_addr, addr_size)?;
+    let checksum = checksum_metadata(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    Ok(out)
+}
+
+pub(super) fn cache_hdr_notify(_header: &FixedArrayHeader) {}
+
+pub(super) fn cache_hdr_free_icr(_header: FixedArrayHeader) {}
+
+pub(super) fn hdr_alloc(
+    class_id: u8,
+    raw_element_size: usize,
+    max_page_elements_bits: u8,
+    elements: u64,
+) -> FixedArrayHeader {
+    FixedArrayHeader {
+        class_id,
+        raw_element_size,
+        max_page_elements_bits,
+        elements,
+        data_block_addr: crate::io::reader::UNDEF_ADDR,
+    }
+}
+
+pub(super) fn hdr_init(header: &mut FixedArrayHeader) {
+    header.elements = 0;
+    header.data_block_addr = crate::io::reader::UNDEF_ADDR;
+}
+
+pub(super) fn hdr_create(header: FixedArrayHeader) -> FixedArrayHeader {
+    header
+}
+
+pub(super) fn hdr_incr(ref_count: &mut usize) {
+    *ref_count = ref_count.saturating_add(1);
+}
+
+pub(super) fn hdr_decr(ref_count: &mut usize) -> Result<()> {
+    if *ref_count == 0 {
+        return Err(Error::InvalidFormat(
+            "fixed array header reference underflow".into(),
+        ));
+    }
+    *ref_count -= 1;
+    Ok(())
+}
+
+pub(super) fn hdr_fuse_incr(ref_count: &mut usize) {
+    hdr_incr(ref_count);
+}
+
+pub(super) fn hdr_fuse_decr(ref_count: &mut usize) -> Result<()> {
+    hdr_decr(ref_count)
+}
+
+pub(super) fn hdr_modified(_header: &mut FixedArrayHeader) {}
+
+pub(super) fn hdr_protect<R: Read + Seek>(
+    reader: &mut HdfReader<R>,
+    addr: u64,
+) -> Result<FixedArrayHeader> {
+    read_header(reader, addr)
+}
+
+pub(super) fn hdr_unprotect(_header: FixedArrayHeader) {}
+
+pub(super) fn hdr_delete(header: &mut FixedArrayHeader) {
+    header.elements = 0;
+    header.data_block_addr = crate::io::reader::UNDEF_ADDR;
+}
+
+pub(super) fn hdr_dest(_header: FixedArrayHeader) {}
 
 pub(super) fn read_header<R: Read + Seek>(
     reader: &mut HdfReader<R>,
@@ -59,6 +176,17 @@ pub(super) fn read_header<R: Read + Seek>(
     })
 }
 
+fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
+    if size > 8 {
+        return Err(Error::InvalidFormat(
+            "fixed array encoded integer size exceeds u64".into(),
+        ));
+    }
+    let bytes = value.to_le_bytes();
+    out.extend_from_slice(&bytes[..size]);
+    Ok(())
+}
+
 pub(super) fn verify_checksum<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     start: u64,
@@ -76,6 +204,8 @@ pub(super) fn verify_checksum<R: Read + Seek>(
             "{context} checksum mismatch: stored={stored_checksum:#010x}, computed={computed:#010x}"
         )));
     }
-    reader.seek(checksum_pos + 4)?;
+    reader.seek(checksum_pos.checked_add(4).ok_or_else(|| {
+        Error::InvalidFormat(format!("{context} checksum end offset overflow"))
+    })?)?;
     Ok(())
 }

@@ -1,4 +1,6 @@
-use crate::format::messages::datatype::{ByteOrder, CompoundField, DatatypeClass, DatatypeMessage};
+use crate::format::messages::datatype::{
+    ByteOrder, CompoundField, DatatypeClass, DatatypeMessage, FloatFields,
+};
 
 /// High-level datatype descriptor.
 #[derive(Debug, Clone)]
@@ -11,9 +13,44 @@ impl Datatype {
         Self { msg }
     }
 
+    pub fn enum_create(base: &Datatype) -> crate::Result<Self> {
+        Ok(Self {
+            msg: DatatypeMessage::enum_create(base.msg.clone())?,
+        })
+    }
+
+    pub fn enum_insert(&mut self, name: &str, value: u64) -> crate::Result<()> {
+        self.msg.enum_insert(name, value)
+    }
+
     /// Return the parsed low-level datatype message.
     pub fn raw_message(&self) -> DatatypeMessage {
         self.msg.clone()
+    }
+
+    /// Get datatype creation properties.
+    pub fn create_plist(&self) -> crate::hl::plist::datatype_create::DatatypeCreate {
+        crate::hl::plist::datatype_create::DatatypeCreate::from_datatype(self)
+    }
+
+    /// Return the native-memory representation of this datatype.
+    ///
+    /// This pure-Rust layer already normalizes reads into Rust-native values,
+    /// so the metadata-level native type is represented by the same datatype
+    /// descriptor.
+    pub fn native_type(&self) -> Datatype {
+        self.clone()
+    }
+
+    /// Return low/high bit padding policies for numeric datatypes.
+    pub fn pad(&self) -> Option<(u8, u8)> {
+        match self.msg.class {
+            DatatypeClass::FixedPoint | DatatypeClass::BitField | DatatypeClass::FloatingPoint => {
+                let plist = self.create_plist();
+                Some((plist.low_pad(), plist.high_pad()))
+            }
+            _ => None,
+        }
     }
 
     /// Total size of one element in bytes.
@@ -36,9 +73,42 @@ impl Datatype {
         self.msg.is_signed()
     }
 
+    /// Bit offset of the significant payload for integer, bitfield,
+    /// floating-point, or enum-base datatypes.
+    pub fn bit_offset(&self) -> Option<u16> {
+        self.msg.bit_offset()
+    }
+
+    /// Number of significant bits for integer, bitfield, floating-point,
+    /// or enum-base datatypes.
+    pub fn precision(&self) -> Option<u16> {
+        self.msg.precision()
+    }
+
     /// Whether this is a floating-point type.
     pub fn is_float(&self) -> bool {
         self.msg.class == DatatypeClass::FloatingPoint
+    }
+
+    /// Floating-point sign/exponent/mantissa field locations and sizes.
+    pub fn float_fields(&self) -> Option<FloatFields> {
+        self.msg.float_fields()
+    }
+
+    /// Floating-point exponent bias.
+    pub fn exponent_bias(&self) -> Option<u32> {
+        self.msg.exponent_bias()
+    }
+
+    /// Floating-point mantissa normalization code:
+    /// 0=none, 1=MSB-set, 2=implied.
+    pub fn mantissa_normalization(&self) -> Option<u8> {
+        self.msg.mantissa_normalization()
+    }
+
+    /// Floating-point internal padding code: 0=zero, 1=one.
+    pub fn internal_padding(&self) -> Option<u8> {
+        self.msg.internal_padding()
     }
 
     /// Whether this is an integer type.
@@ -96,9 +166,44 @@ impl Datatype {
         self.msg.compound_nmembers()
     }
 
+    /// Return the zero-based index of a named compound member.
+    pub fn member_index(&self, name: &str) -> Option<usize> {
+        self.compound_fields()
+            .and_then(|fields| fields.iter().position(|field| field.name == name))
+    }
+
+    /// Return the byte offset of a compound member by index.
+    pub fn member_offset(&self, index: usize) -> Option<usize> {
+        self.compound_fields()
+            .and_then(|fields| fields.get(index).map(|field| field.byte_offset))
+    }
+
+    /// Return the datatype class of a compound member by index.
+    pub fn member_class(&self, index: usize) -> Option<DatatypeClass> {
+        self.compound_fields()
+            .and_then(|fields| fields.get(index).map(|field| field.class))
+    }
+
+    /// Return the datatype of a compound member by index.
+    pub fn member_type(&self, index: usize) -> Option<Datatype> {
+        self.compound_fields().and_then(|fields| {
+            fields
+                .get(index)
+                .map(|field| Datatype::from_message((*field.datatype).clone()))
+        })
+    }
+
     /// Get enum members as (name, value) pairs.
     pub fn enum_members(&self) -> Option<Vec<(String, u64)>> {
         self.msg.enum_members().ok()
+    }
+
+    pub fn enum_nameof(&self, value: u64) -> crate::Result<Option<String>> {
+        self.msg.enum_nameof(value)
+    }
+
+    pub fn enum_valueof(&self, name: &str) -> crate::Result<Option<u64>> {
+        self.msg.enum_valueof(name)
     }
 
     /// Get array dimensions and base datatype for array types.

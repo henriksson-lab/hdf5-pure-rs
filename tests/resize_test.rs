@@ -65,6 +65,256 @@ fn test_resize_chunked_dataset() {
 }
 
 #[test]
+fn test_resize_respects_writer_max_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resize_max_shape.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.new_dataset_builder("data")
+            .shape(&[4])
+            .max_shape(&[6])
+            .chunk(&[2])
+            .write::<i32>(&[1, 2, 3, 4])
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("data").unwrap();
+        assert_eq!(ds.space().unwrap().maxdims().unwrap(), &[6]);
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.resize_dataset("data", &[6]).unwrap();
+        let err = mf
+            .resize_dataset("data", &[7])
+            .expect_err("resize beyond writer max_shape should fail");
+        assert!(err.to_string().contains("exceeds max 6"));
+    }
+}
+
+#[test]
+fn test_mutable_file_deletes_compact_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delete_compact_attrs.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.add_attr("root_keep", 1i32).unwrap();
+        wf.add_attr("root_drop", 2i32).unwrap();
+        let mut group = wf.create_group("metadata").unwrap();
+        group.add_attr("group_keep", 3i32).unwrap();
+        group.add_attr("group_drop", 4i32).unwrap();
+        group
+            .new_dataset_builder("values")
+            .attr("dataset_keep", 5i32)
+            .unwrap()
+            .attr("dataset_drop", 6i32)
+            .unwrap()
+            .write::<i32>(&[10, 20])
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.delete_root_attr("root_drop").unwrap();
+        mf.delete_group_attr("metadata", "group_drop").unwrap();
+        mf.delete_dataset_attr("metadata/values", "dataset_drop")
+            .unwrap();
+        let err = mf
+            .delete_root_attr("missing")
+            .expect_err("missing compact attribute should fail");
+        assert!(err.to_string().contains("attribute 'missing' not found"));
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        assert!(f.attr_exists("root_keep").unwrap());
+        assert!(!f.attr_exists("root_drop").unwrap());
+        let group = f.group("metadata").unwrap();
+        assert!(group.attr_exists("group_keep").unwrap());
+        assert!(!group.attr_exists("group_drop").unwrap());
+        let ds = f.dataset("metadata/values").unwrap();
+        assert!(ds.attr_exists("dataset_keep").unwrap());
+        assert!(!ds.attr_exists("dataset_drop").unwrap());
+        assert_eq!(ds.read::<i32>().unwrap(), vec![10, 20]);
+    }
+}
+
+#[test]
+fn test_mutable_file_deletes_dense_attribute() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delete_dense_attr.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for idx in 0..12 {
+            wf.add_attr(&format!("attr_{idx:02}"), idx as i32).unwrap();
+        }
+        wf.flush().unwrap();
+    }
+
+    let mut mf = MutableFile::open_rw(&path).unwrap();
+    mf.delete_root_attr("attr_03").unwrap();
+    drop(mf);
+
+    let f = File::open(&path).unwrap();
+    assert!(!f.attr_exists("attr_03").unwrap());
+    assert_eq!(f.attr("attr_04").unwrap().read_scalar::<i32>().unwrap(), 4);
+}
+
+#[test]
+fn test_mutable_file_renames_dense_attribute_same_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rename_dense_attr.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        for idx in 0..12 {
+            wf.add_attr(&format!("attr_{idx:02}"), idx as i32).unwrap();
+        }
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.rename_root_attr("attr_03", "renm_03").unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert!(!f.attr_exists("attr_03").unwrap());
+    assert!(f.attr_exists("renm_03").unwrap());
+    assert_eq!(f.attr("renm_03").unwrap().read_scalar::<i32>().unwrap(), 3);
+}
+
+#[test]
+fn test_mutable_file_mutates_group_and_dataset_dense_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mutate_nested_dense_attrs.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        let mut group = wf.create_group("metadata").unwrap();
+        for idx in 0..12 {
+            group
+                .add_attr(&format!("gattr_{idx:02}"), idx as i32)
+                .unwrap();
+        }
+        let mut builder = group.new_dataset_builder("values");
+        for idx in 0..12 {
+            builder = builder
+                .attr(&format!("dattr_{idx:02}"), (idx as i32) * 10)
+                .unwrap();
+        }
+        builder.write::<i32>(&[1, 2, 3]).unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.delete_group_attr("metadata", "gattr_03").unwrap();
+        mf.rename_group_attr("metadata", "gattr_04", "grnam_04")
+            .unwrap();
+        mf.delete_dataset_attr("metadata/values", "dattr_03")
+            .unwrap();
+        mf.rename_dataset_attr("metadata/values", "dattr_04", "drnam_04")
+            .unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let group = f.group("metadata").unwrap();
+    assert!(!group.attr_exists("gattr_03").unwrap());
+    assert!(!group.attr_exists("gattr_04").unwrap());
+    assert_eq!(
+        group
+            .attr("grnam_04")
+            .unwrap()
+            .read_scalar::<i32>()
+            .unwrap(),
+        4
+    );
+    let dataset = f.dataset("metadata/values").unwrap();
+    assert!(!dataset.attr_exists("dattr_03").unwrap());
+    assert!(!dataset.attr_exists("dattr_04").unwrap());
+    assert_eq!(
+        dataset
+            .attr("drnam_04")
+            .unwrap()
+            .read_scalar::<i32>()
+            .unwrap(),
+        40
+    );
+    assert_eq!(dataset.read::<i32>().unwrap(), vec![1, 2, 3]);
+}
+
+#[test]
+fn test_mutable_file_renames_compact_attributes_same_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rename_compact_attrs.h5");
+
+    {
+        let mut wf = WritableFile::create(&path).unwrap();
+        wf.add_attr("alpha", 11i32).unwrap();
+        wf.add_attr("taken", 12i32).unwrap();
+        let mut group = wf.create_group("metadata").unwrap();
+        group.add_attr("g_old", 13i32).unwrap();
+        group
+            .new_dataset_builder("values")
+            .attr("dsold", 14i32)
+            .unwrap()
+            .write::<i32>(&[10, 20])
+            .unwrap();
+        wf.flush().unwrap();
+    }
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        mf.rename_root_attr("alpha", "omega").unwrap();
+        mf.rename_group_attr("metadata", "g_old", "g_new").unwrap();
+        mf.rename_dataset_attr("metadata/values", "dsold", "dsnew")
+            .unwrap();
+        mf.rename_root_attr("omega", "om").unwrap();
+
+        let err = mf
+            .rename_root_attr("om", "longer")
+            .expect_err("growing compact rename should be rejected");
+        assert!(err.to_string().contains("cannot grow"));
+
+        let err = mf
+            .rename_root_attr("om", "taken")
+            .expect_err("duplicate compact rename target should be rejected");
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        assert!(!f.attr_exists("alpha").unwrap());
+        assert!(!f.attr_exists("omega").unwrap());
+        assert!(f.attr_exists("om").unwrap());
+        assert_eq!(f.attr("om").unwrap().read_scalar::<i32>().unwrap(), 11);
+        assert!(f.attr_exists("taken").unwrap());
+
+        let group = f.group("metadata").unwrap();
+        assert!(!group.attr_exists("g_old").unwrap());
+        assert!(group.attr_exists("g_new").unwrap());
+        assert_eq!(
+            group.attr("g_new").unwrap().read_scalar::<i32>().unwrap(),
+            13
+        );
+
+        let ds = f.dataset("metadata/values").unwrap();
+        assert!(!ds.attr_exists("dsold").unwrap());
+        assert!(ds.attr_exists("dsnew").unwrap());
+        assert_eq!(ds.attr("dsnew").unwrap().read_scalar::<i32>().unwrap(), 14);
+        assert_eq!(ds.read::<i32>().unwrap(), vec![10, 20]);
+    }
+}
+
+#[test]
 fn test_resize_then_write_appended_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resize_write_chunk.h5");
@@ -440,6 +690,38 @@ fn test_write_chunk_replaces_filtered_chunk() {
         let vals: Vec<i32> = f.dataset("data").unwrap().read::<i32>().unwrap();
         let mut expected: Vec<i32> = (0..20).collect();
         expected[5..10].copy_from_slice(&(1000..1005).collect::<Vec<_>>());
+        assert_eq!(vals, expected);
+    }
+}
+
+#[test]
+fn test_write_chunk_replaces_fletcher32_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replace_fletcher32_chunk.h5");
+    std::fs::copy("tests/data/hdf5_ref/layouts_and_filters.h5", &path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<f32> = (1000..1025).map(|value| value as f32).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        mf.write_chunk("chunked_fletcher", &[25], bytes).unwrap();
+    }
+
+    {
+        let f = File::open(&path).unwrap();
+        let vals: Vec<f32> = f
+            .dataset("chunked_fletcher")
+            .unwrap()
+            .read::<f32>()
+            .unwrap();
+        let mut expected: Vec<f32> = (0..100).map(|value| value as f32).collect();
+        expected[25..50]
+            .copy_from_slice(&(1000..1025).map(|value| value as f32).collect::<Vec<_>>());
         assert_eq!(vals, expected);
     }
 }

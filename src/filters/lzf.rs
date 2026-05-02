@@ -20,13 +20,25 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
         if ctrl < 32 {
             // Literal run: copy (ctrl + 1) bytes
             let count = ctrl + 1;
-            if ip + count > data.len() {
+            let literal_end = ip.checked_add(count).ok_or_else(|| {
+                Error::InvalidFormat("lzf: literal run input offset overflow".into())
+            })?;
+            if literal_end > data.len() {
                 return Err(Error::InvalidFormat(
                     "lzf: literal run exceeds input".into(),
                 ));
             }
-            output.extend_from_slice(&data[ip..ip + count]);
-            ip += count;
+            if output
+                .len()
+                .checked_add(count)
+                .is_none_or(|len| len > expected_size)
+            {
+                return Err(Error::InvalidFormat(format!(
+                    "lzf: literal run exceeds expected output size {expected_size}"
+                )));
+            }
+            output.extend_from_slice(&data[ip..literal_end]);
+            ip = literal_end;
         } else {
             // Back-reference
             let mut length = (ctrl >> 5) as usize;
@@ -59,10 +71,24 @@ pub fn decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                     output.len()
                 )));
             }
+            if output
+                .len()
+                .checked_add(length)
+                .is_none_or(|len| len > expected_size)
+            {
+                return Err(Error::InvalidFormat(format!(
+                    "lzf: back-reference exceeds expected output size {expected_size}"
+                )));
+            }
 
             let start = output.len() - offset;
             for i in 0..length {
-                let byte = output[start + i];
+                let src = start.checked_add(i).ok_or_else(|| {
+                    Error::InvalidFormat("lzf: back-reference source offset overflow".into())
+                })?;
+                let byte = *output.get(src).ok_or_else(|| {
+                    Error::InvalidFormat("lzf: back-reference source out of range".into())
+                })?;
                 output.push(byte);
             }
         }
@@ -106,7 +132,29 @@ mod tests {
         let compressed = vec![0x04, b'H', b'e', b'l', b'l', b'o'];
         let err = decompress(&compressed, 4).unwrap_err();
         assert!(
-            err.to_string().contains("lzf: output length mismatch"),
+            err.to_string()
+                .contains("lzf: literal run exceeds expected output size 4"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lzf_rejects_backref_past_expected_output_size() {
+        let compressed = vec![0x00, b'a', 0x20, 0x00];
+        let err = decompress(&compressed, 2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lzf: back-reference exceeds expected output size 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lzf_rejects_literal_run_past_input() {
+        let compressed = vec![0x04, b'H', b'e'];
+        let err = decompress(&compressed, 5).unwrap_err();
+        assert!(
+            err.to_string().contains("lzf: literal run exceeds input"),
             "unexpected error: {err}"
         );
     }

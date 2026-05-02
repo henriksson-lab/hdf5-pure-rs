@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::engine::allocator::FileAllocator;
@@ -7,6 +7,8 @@ use crate::format::checksum::checksum_metadata;
 use crate::format::object_header::*;
 use crate::format::superblock::Superblock;
 use crate::io::reader::UNDEF_ADDR;
+
+const MAX_DATASPACE_RANK: usize = 32;
 
 /// A writable HDF5 file under construction.
 pub struct HdfFileWriter<W: Write + Seek> {
@@ -18,12 +20,16 @@ pub struct HdfFileWriter<W: Write + Seek> {
     groups: HashMap<String, u64>,
     /// Pending links: (parent_path, child_name, child_addr).
     links: Vec<(String, String, u64)>,
+    /// Pending hard-link aliases: (parent_path, link_name, target_path).
+    hard_links: Vec<(String, String, String)>,
     /// Pending pre-encoded attribute messages for the root group.
     pending_root_attrs: Vec<(u16, Vec<u8>)>,
     /// Pending root attributes added through the typed writer API.
     pending_root_attr_specs: Vec<OwnedAttrSpec>,
-    /// Pre-encoded link messages (for soft/external links): (parent_path, encoded_link_msg).
-    special_links: Vec<(String, Vec<u8>)>,
+    /// Pending group attributes added through the typed writer API.
+    pending_group_attr_specs: HashMap<String, Vec<OwnedAttrSpec>>,
+    /// Pre-encoded link messages (for soft/external links): (parent_path, child_name, encoded_link_msg).
+    special_links: Vec<(String, String, Vec<u8>)>,
 }
 
 /// Describes an attribute to attach.
@@ -57,6 +63,7 @@ impl OwnedAttrSpec {
 pub struct DatasetSpec<'a> {
     pub name: &'a str,
     pub shape: &'a [u64],
+    pub max_shape: Option<&'a [u64]>,
     pub dtype: DtypeSpec,
     pub data: &'a [u8],
 }
@@ -108,10 +115,12 @@ pub struct CompoundFieldSpec {
 pub enum DtypeSpec {
     F64,
     F32,
+    I128,
     I64,
     I32,
     I16,
     I8,
+    U128,
     U64,
     U32,
     U16,
@@ -146,6 +155,7 @@ pub enum DtypeSpec {
 impl DtypeSpec {
     pub fn size(&self) -> u32 {
         match self {
+            DtypeSpec::I128 | DtypeSpec::U128 => 16,
             DtypeSpec::F64 | DtypeSpec::I64 | DtypeSpec::U64 => 8,
             DtypeSpec::F32 | DtypeSpec::I32 | DtypeSpec::U32 => 4,
             DtypeSpec::I16 | DtypeSpec::U16 => 2,
@@ -367,7 +377,7 @@ impl DtypeSpec {
         let size = self.size();
         let is_signed = matches!(
             self,
-            DtypeSpec::I8 | DtypeSpec::I16 | DtypeSpec::I32 | DtypeSpec::I64
+            DtypeSpec::I8 | DtypeSpec::I16 | DtypeSpec::I32 | DtypeSpec::I64 | DtypeSpec::I128
         );
         let bf0 = if is_signed { 0x08u8 } else { 0x00u8 };
         buf.push(0x10u8);
@@ -390,7 +400,43 @@ impl DtypeSpec {
 }
 
 /// Encode a dataspace message.
-fn encode_dataspace(shape: &[u64]) -> Vec<u8> {
+fn encode_dataspace(shape: &[u64]) -> Result<Vec<u8>> {
+    if shape.len() > MAX_DATASPACE_RANK {
+        return Err(Error::InvalidFormat(format!(
+            "dataspace rank {} exceeds supported maximum {MAX_DATASPACE_RANK}",
+            shape.len()
+        )));
+    }
+    Ok(encode_dataspace_impl(shape, None))
+}
+
+fn encode_dataspace_for_spec(spec: &DatasetSpec<'_>) -> Result<Vec<u8>> {
+    if spec.shape.len() > MAX_DATASPACE_RANK {
+        return Err(Error::InvalidFormat(format!(
+            "dataspace rank {} exceeds supported maximum {MAX_DATASPACE_RANK}",
+            spec.shape.len()
+        )));
+    }
+    if let Some(max_shape) = spec.max_shape {
+        if max_shape.len() != spec.shape.len() {
+            return Err(Error::InvalidFormat(format!(
+                "max shape rank {} does not match dataset rank {}",
+                max_shape.len(),
+                spec.shape.len()
+            )));
+        }
+        for (idx, (&dim, &max_dim)) in spec.shape.iter().zip(max_shape.iter()).enumerate() {
+            if max_dim != u64::MAX && dim > max_dim {
+                return Err(Error::InvalidFormat(format!(
+                    "dataset dimension {idx} size {dim} exceeds max dimension {max_dim}"
+                )));
+            }
+        }
+    }
+    Ok(encode_dataspace_impl(spec.shape, spec.max_shape))
+}
+
+fn encode_dataspace_impl(shape: &[u64], max_shape: Option<&[u64]>) -> Vec<u8> {
     let mut buf = Vec::new();
 
     if shape.is_empty() {
@@ -402,10 +448,15 @@ fn encode_dataspace(shape: &[u64]) -> Vec<u8> {
     } else {
         buf.push(2); // version 2
         buf.push(shape.len() as u8); // ndims
-        buf.push(0); // flags (no max dims)
+        buf.push(if max_shape.is_some() { 0x01 } else { 0 }); // flags
         buf.push(1); // type = simple
         for &d in shape {
             buf.extend_from_slice(&d.to_le_bytes());
+        }
+        if let Some(max_shape) = max_shape {
+            for &d in max_shape {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
         }
     }
 
@@ -483,11 +534,18 @@ fn encode_link_message(name: &str, target_addr: u64, sizeof_addr: u8) -> Vec<u8>
 }
 
 /// Encode a soft link message (v1).
-fn encode_soft_link_message(name: &str, target_path: &str) -> Vec<u8> {
+fn encode_soft_link_message(name: &str, target_path: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len();
     let target_bytes = target_path.as_bytes();
+    let target_len = u16::try_from(target_bytes.len()).map_err(|_| {
+        Error::InvalidFormat(format!(
+            "soft link target is {} bytes, maximum is {}",
+            target_bytes.len(),
+            u16::MAX
+        ))
+    })?;
 
     let (size_flag, len_bytes) = if name_len < 256 {
         (0u8, 1)
@@ -512,14 +570,14 @@ fn encode_soft_link_message(name: &str, target_path: &str) -> Vec<u8> {
     buf.extend_from_slice(name_bytes);
 
     // Soft link value: target_length(2) + target_path
-    buf.extend_from_slice(&(target_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&target_len.to_le_bytes());
     buf.extend_from_slice(target_bytes);
 
-    buf
+    Ok(buf)
 }
 
 /// Encode an external link message (v1).
-fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> Vec<u8> {
+fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len();
@@ -548,15 +606,26 @@ fn encode_external_link_message(name: &str, filename: &str, obj_path: &str) -> V
 
     // External link value: info_length(2) + version(1) + filename(null-term) + obj_path(null-term)
     // Version 0: no flags byte
-    let info_len = 1 + filename.len() + 1 + obj_path.len() + 1;
-    buf.extend_from_slice(&(info_len as u16).to_le_bytes());
+    let info_len = 1usize
+        .checked_add(filename.len())
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| len.checked_add(obj_path.len()))
+        .and_then(|len| len.checked_add(1))
+        .ok_or_else(|| Error::InvalidFormat("external link info length overflow".into()))?;
+    let info_len = u16::try_from(info_len).map_err(|_| {
+        Error::InvalidFormat(format!(
+            "external link info is {info_len} bytes, maximum is {}",
+            u16::MAX
+        ))
+    })?;
+    buf.extend_from_slice(&info_len.to_le_bytes());
     buf.push(0); // ext version = 0 (no flags byte)
     buf.extend_from_slice(filename.as_bytes());
     buf.push(0); // null terminator
     buf.extend_from_slice(obj_path.as_bytes());
     buf.push(0); // null terminator
 
-    buf
+    Ok(buf)
 }
 
 /// Encode a data layout message (v3, contiguous).
@@ -608,7 +677,11 @@ fn encode_chunked_layout_v3(
 }
 
 /// Encode a filter pipeline message.
-fn encode_filter_pipeline(compression_level: Option<u32>, shuffle: bool) -> Vec<u8> {
+fn encode_filter_pipeline(
+    compression_level: Option<u32>,
+    shuffle: bool,
+    fletcher32: bool,
+) -> Vec<u8> {
     let mut filters = Vec::new();
 
     if shuffle {
@@ -616,6 +689,9 @@ fn encode_filter_pipeline(compression_level: Option<u32>, shuffle: bool) -> Vec<
     }
     if let Some(level) = compression_level {
         filters.push((1u16, vec![level])); // DEFLATE, 1 param = level
+    }
+    if fletcher32 {
+        filters.push((3u16, Vec::<u32>::new())); // FLETCHER32, no params
     }
 
     if filters.is_empty() {
@@ -640,19 +716,46 @@ fn encode_filter_pipeline(compression_level: Option<u32>, shuffle: bool) -> Vec<
 }
 
 /// Encode an attribute message (v3).
-fn encode_attribute_message(name: &str, dtype: &DtypeSpec, shape: &[u64], data: &[u8]) -> Vec<u8> {
+fn encode_attribute_message(
+    name: &str,
+    dtype: &DtypeSpec,
+    shape: &[u64],
+    data: &[u8],
+) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
 
+    validate_attr_payload(name, dtype, shape, data)?;
     let dtype_bytes = dtype.encode();
-    let ds_bytes = encode_dataspace(shape);
+    let ds_bytes = encode_dataspace(shape)?;
     let name_bytes = name.as_bytes();
     let name_with_null = name_bytes.len() + 1; // include null terminator
+    let name_with_null = u16::try_from(name_with_null).map_err(|_| {
+        Error::InvalidFormat(format!(
+            "attribute name encodes to {} bytes, maximum is {}",
+            name_bytes.len() + 1,
+            u16::MAX
+        ))
+    })?;
+    let dtype_len = u16::try_from(dtype_bytes.len()).map_err(|_| {
+        Error::InvalidFormat(format!(
+            "attribute datatype message is {} bytes, maximum is {}",
+            dtype_bytes.len(),
+            u16::MAX
+        ))
+    })?;
+    let ds_len = u16::try_from(ds_bytes.len()).map_err(|_| {
+        Error::InvalidFormat(format!(
+            "attribute dataspace message is {} bytes, maximum is {}",
+            ds_bytes.len(),
+            u16::MAX
+        ))
+    })?;
 
     buf.push(3); // version 3
     buf.push(0); // flags
-    buf.extend_from_slice(&(name_with_null as u16).to_le_bytes());
-    buf.extend_from_slice(&(dtype_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&(ds_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&name_with_null.to_le_bytes());
+    buf.extend_from_slice(&dtype_len.to_le_bytes());
+    buf.extend_from_slice(&ds_len.to_le_bytes());
     buf.push(0); // character encoding: ASCII
 
     buf.extend_from_slice(name_bytes);
@@ -662,7 +765,7 @@ fn encode_attribute_message(name: &str, dtype: &DtypeSpec, shape: &[u64], data: 
     buf.extend_from_slice(&ds_bytes);
     buf.extend_from_slice(data);
 
-    buf
+    Ok(buf)
 }
 
 fn encode_link_info_message(heap_addr: u64, name_btree_addr: u64, sizeof_addr: u8) -> Vec<u8> {
@@ -688,12 +791,33 @@ fn dense_name_hash(name: &str) -> u32 {
 }
 
 /// Build a v2 object header from a list of messages.
-fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Vec<u8> {
+fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Result<Vec<u8>> {
     // Calculate chunk 0 data size
     let mut chunk_data_size: usize = 0;
-    for (_, data) in messages {
+    for (msg_type, data) in messages {
+        if *msg_type > u8::MAX as u16 {
+            return Err(Error::InvalidFormat(format!(
+                "object-header message type {msg_type:#06x} exceeds v2 compact encoding"
+            )));
+        }
+        if data.len() > u16::MAX as usize {
+            return Err(Error::InvalidFormat(format!(
+                "object-header message {msg_type:#06x} is {} bytes, maximum is {}",
+                data.len(),
+                u16::MAX
+            )));
+        }
         // Message header: type(1) + size(2) + flags(1) = 4
-        chunk_data_size += 4 + data.len();
+        chunk_data_size = chunk_data_size
+            .checked_add(4)
+            .and_then(|size| size.checked_add(data.len()))
+            .ok_or_else(|| Error::InvalidFormat("object-header chunk size overflow".into()))?;
+    }
+    if chunk_data_size > u32::MAX as usize {
+        return Err(Error::InvalidFormat(format!(
+            "object-header chunk is {chunk_data_size} bytes, maximum is {}",
+            u32::MAX
+        )));
     }
 
     // Determine chunk0 size encoding
@@ -746,7 +870,7 @@ fn build_v2_object_header(messages: &[(u16, &[u8])], flags: u8) -> Vec<u8> {
     let checksum = checksum_metadata(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
 
-    buf
+    Ok(buf)
 }
 
 fn encode_fill_value_message(fill: Option<FillValueSpec<'_>>) -> Result<Vec<u8>> {
@@ -854,6 +978,282 @@ fn shape_element_count(shape: &[u64]) -> Result<u64> {
     })
 }
 
+fn ceil_div_nonzero_u64(value: u64, divisor: u64, context: &str) -> Result<u64> {
+    if divisor == 0 {
+        return Err(Error::InvalidFormat(format!("{context} divisor is zero")));
+    }
+    if value == 0 {
+        return Ok(0);
+    }
+    value
+        .checked_sub(1)
+        .and_then(|v| v.checked_div(divisor))
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
+}
+
+fn usize_from_u64_writer(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidFormat(format!("{context} does not fit in usize")))
+}
+
+fn checked_next_power_of_two(value: usize, context: &str) -> Result<usize> {
+    value
+        .checked_next_power_of_two()
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} overflow")))
+}
+
+fn dense_record_hash(record: &[u8]) -> Result<u32> {
+    let bytes = record
+        .get(..4)
+        .ok_or_else(|| Error::InvalidFormat("dense B-tree record hash is truncated".into()))?;
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidFormat("dense B-tree record hash is truncated".into()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn validate_chunked_dataset_spec(spec: &DatasetSpec<'_>, chunk_dims: &[u64]) -> Result<usize> {
+    let ndims = spec.shape.len();
+    if ndims == 0 {
+        return Err(Error::InvalidFormat(
+            "chunked scalar datasets are not supported".into(),
+        ));
+    }
+    if chunk_dims.len() != ndims {
+        return Err(Error::InvalidFormat(format!(
+            "chunk dimension rank {} does not match dataset rank {}",
+            chunk_dims.len(),
+            ndims
+        )));
+    }
+    if chunk_dims.len() + 1 > u8::MAX as usize {
+        return Err(Error::InvalidFormat(format!(
+            "chunked layout rank {} exceeds encoded maximum {}",
+            chunk_dims.len() + 1,
+            u8::MAX
+        )));
+    }
+    for (idx, &dim) in chunk_dims.iter().enumerate() {
+        if dim == 0 {
+            return Err(Error::InvalidFormat(format!(
+                "chunk dimension {idx} is zero"
+            )));
+        }
+        if dim > u32::MAX as u64 {
+            return Err(Error::InvalidFormat(format!(
+                "chunk dimension {idx} exceeds 32-bit layout field"
+            )));
+        }
+        if dim > usize::MAX as u64 {
+            return Err(Error::InvalidFormat(format!(
+                "chunk dimension {idx} does not fit in usize"
+            )));
+        }
+    }
+    for (idx, &dim) in spec.shape.iter().enumerate() {
+        if dim > usize::MAX as u64 {
+            return Err(Error::InvalidFormat(format!(
+                "dataset dimension {idx} does not fit in usize"
+            )));
+        }
+    }
+    let chunk_elements_u64 = shape_element_count(chunk_dims)?;
+    let chunk_elements = usize::try_from(chunk_elements_u64)
+        .map_err(|_| Error::InvalidFormat("chunk element count exceeds usize".into()))?;
+    let element_size = spec.dtype.size() as usize;
+    if element_size > u32::MAX as usize {
+        return Err(Error::InvalidFormat(
+            "dataset element size exceeds 32-bit chunk-layout field".into(),
+        ));
+    }
+    let chunk_raw_bytes = chunk_elements
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::InvalidFormat("chunk byte size overflow".into()))?;
+    Ok(chunk_raw_bytes)
+}
+
+fn validate_deflate_level(compression_level: Option<u32>) -> Result<()> {
+    if let Some(level) = compression_level {
+        if level > 9 {
+            return Err(Error::InvalidFormat(format!(
+                "deflate compression level {level} exceeds maximum 9"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dataset_data_len(spec: &DatasetSpec<'_>) -> Result<()> {
+    validate_dtype_spec(&spec.dtype)?;
+    let dtype_size = spec.dtype.size() as usize;
+    if dtype_size == 0 {
+        return Err(Error::InvalidFormat(
+            "dataset datatype size must be nonzero".into(),
+        ));
+    }
+    let expected_count = shape_element_count(spec.shape)?;
+    let expected_bytes = usize::try_from(expected_count)
+        .map_err(|_| Error::InvalidFormat("dataset element count exceeds usize".into()))?
+        .checked_mul(dtype_size)
+        .ok_or_else(|| Error::InvalidFormat("dataset byte size overflow".into()))?;
+    if expected_bytes != spec.data.len() {
+        return Err(Error::InvalidFormat(format!(
+            "dataset byte length {} does not match shape element count {expected_count} * datatype size {dtype_size}",
+            spec.data.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_child_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidFormat("link name must not be empty".into()));
+    }
+    if name.contains('/') {
+        return Err(Error::InvalidFormat(format!(
+            "link name '{name}' must not contain '/'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_attr_payload(name: &str, dtype: &DtypeSpec, shape: &[u64], data: &[u8]) -> Result<()> {
+    validate_dtype_spec(dtype)?;
+    if name.as_bytes().len() == usize::MAX {
+        return Err(Error::InvalidFormat(
+            "attribute name length overflow".into(),
+        ));
+    }
+    let dtype_size = dtype.size() as usize;
+    if dtype_size == 0 {
+        return Err(Error::InvalidFormat(
+            "attribute datatype size must be nonzero".into(),
+        ));
+    }
+    let expected_count = shape_element_count(shape)?;
+    let expected_bytes = usize::try_from(expected_count)
+        .map_err(|_| Error::InvalidFormat("attribute element count exceeds usize".into()))?
+        .checked_mul(dtype_size)
+        .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
+    if expected_bytes != data.len() {
+        return Err(Error::InvalidFormat(format!(
+            "attribute byte length {} does not match shape element count {expected_count} * datatype size {dtype_size}",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unique_attr_names(attrs: &[AttrSpec<'_>]) -> Result<()> {
+    let mut names = HashSet::with_capacity(attrs.len());
+    for attr in attrs {
+        if !names.insert(attr.name) {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' already exists",
+                attr.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dtype_spec(dtype: &DtypeSpec) -> Result<()> {
+    match dtype {
+        DtypeSpec::Compound { size, fields } => {
+            if fields.len() > u16::MAX as usize {
+                return Err(Error::InvalidFormat(format!(
+                    "compound datatype has {} fields, maximum is {}",
+                    fields.len(),
+                    u16::MAX
+                )));
+            }
+            for field in fields {
+                let field_end = field
+                    .offset
+                    .checked_add(field.dtype.size())
+                    .ok_or_else(|| Error::InvalidFormat("compound field offset overflow".into()))?;
+                if field_end > *size {
+                    return Err(Error::InvalidFormat(format!(
+                        "compound field '{}' ends at byte {field_end}, beyond compound size {size}",
+                        field.name
+                    )));
+                }
+                validate_dtype_spec(&field.dtype)?;
+            }
+        }
+        DtypeSpec::Enum { base, members } => {
+            if members.len() > u16::MAX as usize {
+                return Err(Error::InvalidFormat(format!(
+                    "enum datatype has {} members, maximum is {}",
+                    members.len(),
+                    u16::MAX
+                )));
+            }
+            validate_dtype_spec(base)?;
+            if !matches!(
+                base.as_ref(),
+                DtypeSpec::I8
+                    | DtypeSpec::I16
+                    | DtypeSpec::I32
+                    | DtypeSpec::I64
+                    | DtypeSpec::U8
+                    | DtypeSpec::U16
+                    | DtypeSpec::U32
+                    | DtypeSpec::U64
+            ) {
+                return Err(Error::Unsupported(
+                    "enum writer supports only integer base datatypes up to 8 bytes".into(),
+                ));
+            }
+        }
+        DtypeSpec::Opaque { tag, .. } => {
+            let padded_tag_len = tag
+                .len()
+                .checked_add(1)
+                .and_then(|len| len.checked_add(7))
+                .map(|len| len & !7)
+                .ok_or_else(|| Error::InvalidFormat("opaque tag length overflow".into()))?;
+            if padded_tag_len > u8::MAX as usize {
+                return Err(Error::InvalidFormat(format!(
+                    "opaque tag encodes to {padded_tag_len} bytes, maximum is {}",
+                    u8::MAX
+                )));
+            }
+        }
+        DtypeSpec::Array { dims, base } => {
+            if dims.is_empty() {
+                return Err(Error::InvalidFormat(
+                    "array datatype must have at least one dimension".into(),
+                ));
+            }
+            if dims.len() > u8::MAX as usize {
+                return Err(Error::InvalidFormat(format!(
+                    "array datatype rank {} exceeds maximum {}",
+                    dims.len(),
+                    u8::MAX
+                )));
+            }
+            for (idx, &dim) in dims.iter().enumerate() {
+                if dim == 0 {
+                    return Err(Error::InvalidFormat(format!(
+                        "array datatype dimension {idx} is zero"
+                    )));
+                }
+            }
+            let mut size = base.size();
+            for &dim in dims {
+                size = size.checked_mul(dim).ok_or_else(|| {
+                    Error::InvalidFormat("array datatype byte size overflow".into())
+                })?;
+            }
+            validate_dtype_spec(base)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl<W: Write + Seek> HdfFileWriter<W> {
     /// Create a new HDF5 file writer.
     pub fn new(writer: W) -> Self {
@@ -864,8 +1264,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             sizeof_size: 8,
             groups: HashMap::new(),
             links: Vec::new(),
+            hard_links: Vec::new(),
             pending_root_attrs: Vec::new(),
             pending_root_attr_specs: Vec::new(),
+            pending_group_attr_specs: HashMap::new(),
             special_links: Vec::new(),
         }
     }
@@ -874,20 +1276,55 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     /// Call finalize() when done to write the superblock with correct EOF.
     pub fn begin(&mut self) -> Result<()> {
         // Reserve space for superblock (v2 with 8-byte addresses: 48 bytes)
-        let sb_size = 12 + 4 * self.sizeof_addr as u64 + 4;
+        let sb_size = 4u64
+            .checked_mul(self.sizeof_addr as u64)
+            .and_then(|value| value.checked_add(16))
+            .ok_or_else(|| Error::InvalidFormat("superblock placeholder size overflow".into()))?;
         self.allocator = FileAllocator::new(sb_size);
 
         // Write placeholder bytes for superblock
-        let zeros = vec![0u8; sb_size as usize];
+        let zeros = vec![
+            0u8;
+            usize::try_from(sb_size).map_err(|_| {
+                Error::InvalidFormat("superblock placeholder size exceeds usize".into())
+            })?
+        ];
         self.write_at(0, &zeros)?;
 
         Ok(())
     }
 
+    fn ensure_child_name_available(&self, parent: &str, name: &str) -> Result<()> {
+        validate_child_name(name)?;
+        if self.child_name_exists(parent, name) {
+            return Err(Error::InvalidFormat(format!(
+                "link '{name}' already exists in group '{parent}'"
+            )));
+        }
+        Ok(())
+    }
+
+    fn child_name_exists(&self, parent: &str, name: &str) -> bool {
+        let path = child_path(parent, name);
+        self.groups.contains_key(&path)
+            || self
+                .links
+                .iter()
+                .any(|(link_parent, link_name, _)| link_parent == parent && link_name == name)
+            || self
+                .hard_links
+                .iter()
+                .any(|(link_parent, link_name, _)| link_parent == parent && link_name == name)
+            || self
+                .special_links
+                .iter()
+                .any(|(link_parent, link_name, _)| link_parent == parent && link_name == name)
+    }
+
     /// Write an empty group object header (will be rewritten with links in finalize).
     fn write_group_object_header(&mut self, extra_messages: &[(u16, &[u8])]) -> Result<u64> {
         let messages: Vec<(u16, &[u8])> = extra_messages.to_vec();
-        let oh_bytes = build_v2_object_header(&messages, 0);
+        let oh_bytes = build_v2_object_header(&messages, 0)?;
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
         Ok(oh_addr)
@@ -902,6 +1339,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
     /// Create a sub-group.
     pub fn create_group(&mut self, parent: &str, name: &str) -> Result<u64> {
+        self.ensure_child_name_available(parent, name)?;
         let addr = self.write_group_object_header(&[])?;
         let full_path = if parent == "/" {
             format!("/{name}")
@@ -915,9 +1353,12 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     }
 
     /// Create a soft link in a group.
-    pub fn create_soft_link(&mut self, parent: &str, name: &str, target_path: &str) {
-        let msg = encode_soft_link_message(name, target_path);
-        self.special_links.push((parent.to_string(), msg));
+    pub fn create_soft_link(&mut self, parent: &str, name: &str, target_path: &str) -> Result<()> {
+        self.ensure_child_name_available(parent, name)?;
+        let msg = encode_soft_link_message(name, target_path)?;
+        self.special_links
+            .push((parent.to_string(), name.to_string(), msg));
+        Ok(())
     }
 
     /// Create an external link in a group.
@@ -927,9 +1368,26 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         name: &str,
         filename: &str,
         obj_path: &str,
-    ) {
-        let msg = encode_external_link_message(name, filename, obj_path);
-        self.special_links.push((parent.to_string(), msg));
+    ) -> Result<()> {
+        self.ensure_child_name_available(parent, name)?;
+        let msg = encode_external_link_message(name, filename, obj_path)?;
+        self.special_links
+            .push((parent.to_string(), name.to_string(), msg));
+        Ok(())
+    }
+
+    /// Create a hard-link alias in a group.
+    pub fn create_hard_link(&mut self, parent: &str, name: &str, target_path: &str) -> Result<()> {
+        self.ensure_child_name_available(parent, name)?;
+        self.object_addr_for_path(target_path).ok_or_else(|| {
+            Error::InvalidFormat(format!("hard link target '{target_path}' not found"))
+        })?;
+        self.hard_links.push((
+            parent.to_string(),
+            name.to_string(),
+            normalize_object_path(target_path),
+        ));
+        Ok(())
     }
 
     /// Create a dataset with compact storage (data embedded in the object header).
@@ -938,20 +1396,100 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         self.create_compact_dataset_with_fill(parent, spec, None)
     }
 
+    /// Create a compact dataset with attributes.
+    pub fn create_compact_dataset_with_attrs(
+        &mut self,
+        parent: &str,
+        spec: &DatasetSpec,
+        attrs: &[AttrSpec],
+    ) -> Result<u64> {
+        self.create_compact_dataset_with_attrs_and_fill(parent, spec, attrs, None)
+    }
+
+    pub fn create_compact_dataset_with_attrs_and_fill(
+        &mut self,
+        parent: &str,
+        spec: &DatasetSpec,
+        attrs: &[AttrSpec],
+        fill: Option<FillValueSpec<'_>>,
+    ) -> Result<u64> {
+        self.ensure_child_name_available(parent, spec.name)?;
+        validate_unique_attr_names(attrs)?;
+        validate_dataset_data_len(spec)?;
+        let dtype_bytes = spec.dtype.encode();
+        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let compact_data_len = u16::try_from(spec.data.len()).map_err(|_| {
+            Error::InvalidFormat(format!(
+                "compact dataset payload is {} bytes, maximum is {}",
+                spec.data.len(),
+                u16::MAX
+            ))
+        })?;
+
+        let mut layout_bytes = Vec::new();
+        layout_bytes.push(3);
+        layout_bytes.push(0);
+        layout_bytes.extend_from_slice(&compact_data_len.to_le_bytes());
+        layout_bytes.extend_from_slice(spec.data);
+
+        let fill_value_bytes = encode_fill_value_message(fill)?;
+        let mut messages: Vec<(u16, Vec<u8>)> = vec![
+            (MSG_DATASPACE, ds_bytes),
+            (MSG_DATATYPE, dtype_bytes),
+            (MSG_FILL_VALUE, fill_value_bytes),
+            (MSG_LAYOUT, layout_bytes),
+        ];
+
+        if attrs.len() > 8 {
+            let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
+            messages.push((
+                MSG_ATTR_INFO,
+                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr),
+            ));
+        } else {
+            for attr in attrs {
+                messages.push((
+                    MSG_ATTRIBUTE,
+                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?,
+                ));
+            }
+        }
+
+        let msg_refs: Vec<(u16, &[u8])> =
+            messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
+        let oh_bytes = build_v2_object_header(&msg_refs, 0)?;
+        let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
+        self.write_at(oh_addr, &oh_bytes)?;
+
+        self.links
+            .push((parent.to_string(), spec.name.to_string(), oh_addr));
+
+        Ok(oh_addr)
+    }
+
     pub fn create_compact_dataset_with_fill(
         &mut self,
         parent: &str,
         spec: &DatasetSpec,
         fill: Option<FillValueSpec<'_>>,
     ) -> Result<u64> {
+        self.ensure_child_name_available(parent, spec.name)?;
+        validate_dataset_data_len(spec)?;
         let dtype_bytes = spec.dtype.encode();
-        let ds_bytes = encode_dataspace(spec.shape);
+        let ds_bytes = encode_dataspace_for_spec(spec)?;
+        let compact_data_len = u16::try_from(spec.data.len()).map_err(|_| {
+            Error::InvalidFormat(format!(
+                "compact dataset payload is {} bytes, maximum is {}",
+                spec.data.len(),
+                u16::MAX
+            ))
+        })?;
 
         // Compact layout: version 3, class 0, size(2) + data
         let mut layout_bytes = Vec::new();
         layout_bytes.push(3); // version 3
         layout_bytes.push(0); // class = compact
-        layout_bytes.extend_from_slice(&(spec.data.len() as u16).to_le_bytes());
+        layout_bytes.extend_from_slice(&compact_data_len.to_le_bytes());
         layout_bytes.extend_from_slice(spec.data);
 
         let fill_value_bytes = encode_fill_value_message(fill)?;
@@ -963,7 +1501,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             (MSG_LAYOUT, &layout_bytes),
         ];
 
-        let oh_bytes = build_v2_object_header(&messages, 0);
+        let oh_bytes = build_v2_object_header(&messages, 0)?;
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
@@ -984,8 +1522,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         spec: &DatasetSpec,
         fill: Option<FillValueSpec<'_>>,
     ) -> Result<u64> {
+        self.ensure_child_name_available(parent, spec.name)?;
+        validate_dataset_data_len(spec)?;
         let dtype_bytes = spec.dtype.encode();
-        let ds_bytes = encode_dataspace(spec.shape);
+        let ds_bytes = encode_dataspace_for_spec(spec)?;
 
         // Allocate space for the data
         let data_size = spec.data.len() as u64;
@@ -1009,7 +1549,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             (MSG_LAYOUT, &layout_bytes),
         ];
 
-        let oh_bytes = build_v2_object_header(&messages, 0);
+        let oh_bytes = build_v2_object_header(&messages, 0)?;
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
@@ -1026,6 +1566,18 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         name: &str,
         shape: &[u64],
         strings: &[&str],
+    ) -> Result<u64> {
+        self.create_vlen_utf8_string_dataset_with_attrs(parent, name, shape, strings, None, &[])
+    }
+
+    pub fn create_vlen_utf8_string_dataset_with_attrs(
+        &mut self,
+        parent: &str,
+        name: &str,
+        shape: &[u64],
+        strings: &[&str],
+        max_shape: Option<&[u64]>,
+        attrs: &[AttrSpec],
     ) -> Result<u64> {
         let expected_count = shape_element_count(shape)?;
         if expected_count != strings.len() as u64 {
@@ -1057,8 +1609,15 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             addr
         };
 
-        let mut data =
-            Vec::with_capacity(strings.len() * DtypeSpec::VarLenUtf8String.size() as usize);
+        let vlen_descriptor_size = DtypeSpec::VarLenUtf8String.size() as usize;
+        let vlen_payload_size =
+            strings
+                .len()
+                .checked_mul(vlen_descriptor_size)
+                .ok_or_else(|| {
+                    Error::InvalidFormat("vlen string descriptor payload size overflow".into())
+                })?;
+        let mut data = Vec::with_capacity(vlen_payload_size);
         for (value, heap_index) in strings.iter().zip(heap_indices) {
             if let Some(index) = heap_index {
                 let len = u32::try_from(value.len() + 1)
@@ -1076,10 +1635,15 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         let spec = DatasetSpec {
             name,
             shape,
+            max_shape,
             dtype: DtypeSpec::VarLenUtf8String,
             data: &data,
         };
-        self.create_dataset(parent, &spec)
+        if attrs.is_empty() {
+            self.create_dataset(parent, &spec)
+        } else {
+            self.create_dataset_with_attrs(parent, &spec, attrs)
+        }
     }
 
     /// Create a dataset with attributes.
@@ -1089,8 +1653,21 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         spec: &DatasetSpec,
         attrs: &[AttrSpec],
     ) -> Result<u64> {
+        self.create_dataset_with_attrs_and_fill(parent, spec, attrs, None)
+    }
+
+    pub fn create_dataset_with_attrs_and_fill(
+        &mut self,
+        parent: &str,
+        spec: &DatasetSpec,
+        attrs: &[AttrSpec],
+        fill: Option<FillValueSpec<'_>>,
+    ) -> Result<u64> {
+        self.ensure_child_name_available(parent, spec.name)?;
+        validate_unique_attr_names(attrs)?;
+        validate_dataset_data_len(spec)?;
         let dtype_bytes = spec.dtype.encode();
-        let ds_bytes = encode_dataspace(spec.shape);
+        let ds_bytes = encode_dataspace_for_spec(spec)?;
 
         let data_size = spec.data.len() as u64;
         let data_addr = if data_size > 0 {
@@ -1103,7 +1680,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
         let layout_bytes =
             encode_contiguous_layout(data_addr, data_size, self.sizeof_addr, self.sizeof_size);
-        let fill_value_bytes = encode_fill_value_message(None)?;
+        let fill_value_bytes = encode_fill_value_message(fill)?;
 
         let mut messages: Vec<(u16, Vec<u8>)> = vec![
             (MSG_DATASPACE, ds_bytes),
@@ -1121,14 +1698,14 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         } else {
             for attr in attrs {
                 let attr_bytes =
-                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
+                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?;
                 messages.push((MSG_ATTRIBUTE, attr_bytes));
             }
         }
 
         let msg_refs: Vec<(u16, &[u8])> =
             messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
-        let oh_bytes = build_v2_object_header(&msg_refs, 0);
+        let oh_bytes = build_v2_object_header(&msg_refs, 0)?;
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
@@ -1148,13 +1725,45 @@ impl<W: Write + Seek> HdfFileWriter<W> {
     }
 
     /// Create a root group attribute from spec.
-    pub fn add_root_attr(&mut self, attr: &AttrSpec) {
+    pub fn add_root_attr(&mut self, attr: &AttrSpec) -> Result<()> {
+        if self
+            .pending_root_attr_specs
+            .iter()
+            .any(|existing| existing.name == attr.name)
+        {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' already exists",
+                attr.name
+            )));
+        }
         self.pending_root_attr_specs.push(OwnedAttrSpec {
             name: attr.name.to_string(),
             shape: attr.shape.to_vec(),
             dtype: attr.dtype.clone(),
             data: attr.data.to_vec(),
         });
+        Ok(())
+    }
+
+    /// Create a group attribute from spec.
+    pub fn add_group_attr(&mut self, group_path: &str, attr: &AttrSpec) -> Result<()> {
+        let attrs = self
+            .pending_group_attr_specs
+            .entry(group_path.to_string())
+            .or_default();
+        if attrs.iter().any(|existing| existing.name == attr.name) {
+            return Err(Error::InvalidFormat(format!(
+                "attribute '{}' already exists",
+                attr.name
+            )));
+        }
+        attrs.push(OwnedAttrSpec {
+            name: attr.name.to_string(),
+            shape: attr.shape.to_vec(),
+            dtype: attr.dtype.clone(),
+            data: attr.data.to_vec(),
+        });
+        Ok(())
     }
 
     /// Create a chunked dataset with optional compression.
@@ -1166,12 +1775,33 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         compression_level: Option<u32>,
         shuffle: bool,
     ) -> Result<u64> {
-        self.create_chunked_dataset_with_fill(
+        self.create_chunked_dataset_with_filters(
             parent,
             spec,
             chunk_dims,
             compression_level,
             shuffle,
+            false,
+        )
+    }
+
+    /// Create a chunked dataset with optional deflate/shuffle/Fletcher32 filters.
+    pub fn create_chunked_dataset_with_filters(
+        &mut self,
+        parent: &str,
+        spec: &DatasetSpec,
+        chunk_dims: &[u64],
+        compression_level: Option<u32>,
+        shuffle: bool,
+        fletcher32: bool,
+    ) -> Result<u64> {
+        self.create_chunked_dataset_with_filters_and_fill(
+            parent,
+            spec,
+            chunk_dims,
+            compression_level,
+            shuffle,
+            fletcher32,
             None,
         )
     }
@@ -1185,23 +1815,76 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         shuffle: bool,
         fill: Option<FillValueSpec<'_>>,
     ) -> Result<u64> {
+        self.create_chunked_dataset_with_filters_and_fill(
+            parent,
+            spec,
+            chunk_dims,
+            compression_level,
+            shuffle,
+            false,
+            fill,
+        )
+    }
+
+    pub fn create_chunked_dataset_with_filters_and_fill(
+        &mut self,
+        parent: &str,
+        spec: &DatasetSpec,
+        chunk_dims: &[u64],
+        compression_level: Option<u32>,
+        shuffle: bool,
+        fletcher32: bool,
+        fill: Option<FillValueSpec<'_>>,
+    ) -> Result<u64> {
+        self.create_chunked_dataset_with_attrs_and_fill(
+            parent,
+            spec,
+            chunk_dims,
+            compression_level,
+            shuffle,
+            fletcher32,
+            fill,
+            &[],
+        )
+    }
+
+    pub fn create_chunked_dataset_with_attrs_and_fill(
+        &mut self,
+        parent: &str,
+        spec: &DatasetSpec,
+        chunk_dims: &[u64],
+        compression_level: Option<u32>,
+        shuffle: bool,
+        fletcher32: bool,
+        fill: Option<FillValueSpec<'_>>,
+        attrs: &[AttrSpec],
+    ) -> Result<u64> {
+        self.ensure_child_name_available(parent, spec.name)?;
+        validate_unique_attr_names(attrs)?;
+        validate_dataset_data_len(spec)?;
         let dtype_bytes = spec.dtype.encode();
-        let ds_bytes = encode_dataspace(spec.shape);
+        let ds_bytes = encode_dataspace_for_spec(spec)?;
         let element_size = spec.dtype.size() as usize;
         let ndims = spec.shape.len();
+        validate_deflate_level(compression_level)?;
+        let chunk_raw_bytes = validate_chunked_dataset_spec(spec, chunk_dims)?;
 
         // Split data into chunks, apply filters, write each chunk
-        let chunk_elements: usize = chunk_dims.iter().map(|&d| d as usize).product();
-        let chunk_raw_bytes = chunk_elements * element_size;
 
         // Calculate number of chunks per dimension
         let mut n_chunks_per_dim = Vec::with_capacity(ndims);
         for i in 0..ndims {
+            let chunks = ceil_div_nonzero_u64(spec.shape[i], chunk_dims[i], "chunk count")?;
             n_chunks_per_dim.push(
-                ((spec.shape[i] as usize) + chunk_dims[i] as usize - 1) / chunk_dims[i] as usize,
+                usize::try_from(chunks).map_err(|_| {
+                    Error::InvalidFormat("chunk count does not fit in usize".into())
+                })?,
             );
         }
-        let total_chunks: usize = n_chunks_per_dim.iter().product();
+        let total_chunks = n_chunks_per_dim.iter().try_fold(1usize, |acc, &count| {
+            acc.checked_mul(count)
+                .ok_or_else(|| Error::InvalidFormat("total chunk count overflow".into()))
+        })?;
 
         // Write each chunk and collect (coords, addr, compressed_size)
         let mut chunk_entries: Vec<(Vec<u64>, u64, u32)> = Vec::new();
@@ -1224,7 +1907,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 chunk_dims,
                 element_size,
                 &mut chunk_buf,
-            );
+            )?;
 
             // Apply filters in forward order
             let mut filtered = chunk_buf;
@@ -1234,9 +1917,18 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             if let Some(level) = compression_level {
                 filtered = crate::filters::deflate::compress(&filtered, level)?;
             }
+            if fletcher32 {
+                filtered = crate::filters::fletcher32::append_checksum(&filtered)?;
+            }
 
-            let compressed_size = filtered.len() as u32;
-            let addr = self.allocator.allocate(filtered.len() as u64, 1);
+            let compressed_size = u32::try_from(filtered.len())
+                .map_err(|_| Error::InvalidFormat("compressed chunk size exceeds u32".into()))?;
+            let addr = self.allocator.allocate(
+                u64::try_from(filtered.len()).map_err(|_| {
+                    Error::InvalidFormat("compressed chunk size exceeds u64".into())
+                })?,
+                1,
+            );
             self.write_at(addr, &filtered)?;
 
             chunk_entries.push((coords, addr, compressed_size));
@@ -1254,21 +1946,38 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         );
 
         // Encode filter pipeline message
-        let pipeline_bytes = encode_filter_pipeline(compression_level, shuffle);
+        let pipeline_bytes = encode_filter_pipeline(compression_level, shuffle, fletcher32);
 
         let fill_value_bytes = encode_fill_value_message(fill)?;
 
-        let mut messages: Vec<(u16, &[u8])> = vec![
-            (MSG_DATASPACE, &ds_bytes),
-            (MSG_DATATYPE, &dtype_bytes),
-            (MSG_FILL_VALUE, &fill_value_bytes),
-            (MSG_LAYOUT, &layout_bytes),
+        let mut messages: Vec<(u16, Vec<u8>)> = vec![
+            (MSG_DATASPACE, ds_bytes),
+            (MSG_DATATYPE, dtype_bytes),
+            (MSG_FILL_VALUE, fill_value_bytes),
+            (MSG_LAYOUT, layout_bytes),
         ];
         if !pipeline_bytes.is_empty() {
-            messages.push((MSG_FILTER_PIPELINE, &pipeline_bytes));
+            messages.push((MSG_FILTER_PIPELINE, pipeline_bytes));
         }
 
-        let oh_bytes = build_v2_object_header(&messages, 0);
+        if attrs.len() > 8 {
+            let (heap_addr, btree_addr) = self.write_dense_attribute_storage(attrs)?;
+            messages.push((
+                MSG_ATTR_INFO,
+                encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr),
+            ));
+        } else {
+            for attr in attrs {
+                messages.push((
+                    MSG_ATTRIBUTE,
+                    encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?,
+                ));
+            }
+        }
+
+        let msg_refs: Vec<(u16, &[u8])> =
+            messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
+        let oh_bytes = build_v2_object_header(&msg_refs, 0)?;
         let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
         self.write_at(oh_addr, &oh_bytes)?;
 
@@ -1287,28 +1996,67 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         chunk_dims: &[u64],
         element_size: usize,
         out: &mut [u8],
-    ) {
+    ) -> Result<()> {
         let ndims = shape.len();
+        if chunk_start.len() != ndims || chunk_dims.len() != ndims {
+            return Err(Error::InvalidFormat(
+                "chunk rank does not match dataset rank".into(),
+            ));
+        }
+        if element_size == 0 {
+            return Err(Error::InvalidFormat("chunk element size is zero".into()));
+        }
         if ndims == 1 {
             // Fast path for 1D
-            let start = chunk_start[0] as usize;
-            let chunk_len = chunk_dims[0] as usize;
-            let data_len = shape[0] as usize;
-            let copy_len = chunk_len.min(data_len - start);
-            let src_start = start * element_size;
-            let src_end = src_start + copy_len * element_size;
-            out[..copy_len * element_size].copy_from_slice(&data[src_start..src_end]);
+            let start = usize_from_u64_writer(chunk_start[0], "chunk start")?;
+            let chunk_len = usize_from_u64_writer(chunk_dims[0], "chunk dimension")?;
+            let data_len = usize_from_u64_writer(shape[0], "dataset dimension")?;
+            let remaining = data_len.checked_sub(start).ok_or_else(|| {
+                Error::InvalidFormat("chunk start exceeds dataset dimension".into())
+            })?;
+            let copy_len = chunk_len.min(remaining);
+            let copy_bytes = copy_len
+                .checked_mul(element_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk copy byte count overflow".into()))?;
+            let src_start = start
+                .checked_mul(element_size)
+                .ok_or_else(|| Error::InvalidFormat("chunk source offset overflow".into()))?;
+            let src_end = src_start
+                .checked_add(copy_bytes)
+                .ok_or_else(|| Error::InvalidFormat("chunk source offset overflow".into()))?;
+            let src = data
+                .get(src_start..src_end)
+                .ok_or_else(|| Error::InvalidFormat("chunk source range exceeds data".into()))?;
+            let dst = out.get_mut(..copy_bytes).ok_or_else(|| {
+                Error::InvalidFormat("chunk destination range exceeds output".into())
+            })?;
+            dst.copy_from_slice(src);
         } else {
             // General N-D: iterate over elements
-            let chunk_elements: usize = chunk_dims.iter().map(|&d| d as usize).product();
+            let chunk_dim_usizes = chunk_dims
+                .iter()
+                .map(|&dim| usize_from_u64_writer(dim, "chunk dimension"))
+                .collect::<Result<Vec<_>>>()?;
+            let shape_usizes = shape
+                .iter()
+                .map(|&dim| usize_from_u64_writer(dim, "dataset dimension"))
+                .collect::<Result<Vec<_>>>()?;
+            let chunk_start_usizes = chunk_start
+                .iter()
+                .map(|&dim| usize_from_u64_writer(dim, "chunk start"))
+                .collect::<Result<Vec<_>>>()?;
+            let chunk_elements = chunk_dim_usizes.iter().try_fold(1usize, |acc, &dim| {
+                acc.checked_mul(dim)
+                    .ok_or_else(|| Error::InvalidFormat("chunk element count overflow".into()))
+            })?;
             let mut idx = vec![0usize; ndims];
 
             for elem in 0..chunk_elements {
                 // Convert linear index within chunk to N-D
                 let mut rem = elem;
                 for d in (0..ndims).rev() {
-                    idx[d] = rem % chunk_dims[d] as usize;
-                    rem /= chunk_dims[d] as usize;
+                    idx[d] = rem % chunk_dim_usizes[d];
+                    rem /= chunk_dim_usizes[d];
                 }
 
                 // Global position
@@ -1316,27 +2064,48 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 let mut src_linear = 0usize;
                 let mut stride = 1usize;
                 for d in (0..ndims).rev() {
-                    let global = chunk_start[d] as usize + idx[d];
-                    if global >= shape[d] as usize {
+                    let global = chunk_start_usizes[d].checked_add(idx[d]).ok_or_else(|| {
+                        Error::InvalidFormat("chunk global coordinate overflow".into())
+                    })?;
+                    if global >= shape_usizes[d] {
                         in_bounds = false;
                         break;
                     }
-                    src_linear += global * stride;
-                    stride *= shape[d] as usize;
+                    let contribution = global.checked_mul(stride).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source linear offset overflow".into())
+                    })?;
+                    src_linear = src_linear.checked_add(contribution).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source linear offset overflow".into())
+                    })?;
+                    stride = stride.checked_mul(shape_usizes[d]).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source stride overflow".into())
+                    })?;
                 }
 
                 if in_bounds {
-                    let src_offset = src_linear * element_size;
-                    let dst_offset = elem * element_size;
-                    if src_offset + element_size <= data.len()
-                        && dst_offset + element_size <= out.len()
-                    {
-                        out[dst_offset..dst_offset + element_size]
-                            .copy_from_slice(&data[src_offset..src_offset + element_size]);
-                    }
+                    let src_offset = src_linear.checked_mul(element_size).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source byte offset overflow".into())
+                    })?;
+                    let dst_offset = elem.checked_mul(element_size).ok_or_else(|| {
+                        Error::InvalidFormat("chunk destination byte offset overflow".into())
+                    })?;
+                    let src_end = src_offset.checked_add(element_size).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source byte offset overflow".into())
+                    })?;
+                    let dst_end = dst_offset.checked_add(element_size).ok_or_else(|| {
+                        Error::InvalidFormat("chunk destination byte offset overflow".into())
+                    })?;
+                    let src = data.get(src_offset..src_end).ok_or_else(|| {
+                        Error::InvalidFormat("chunk source range exceeds data".into())
+                    })?;
+                    let dst = out.get_mut(dst_offset..dst_end).ok_or_else(|| {
+                        Error::InvalidFormat("chunk destination range exceeds output".into())
+                    })?;
+                    dst.copy_from_slice(src);
                 }
             }
         }
+        Ok(())
     }
 
     /// Write a v1 B-tree leaf node for chunk index.
@@ -1364,7 +2133,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         ndims: usize,
         element_size: u32,
     ) -> Result<u64> {
-        let node_size = Self::chunk_btree_node_size(ndims, self.sizeof_addr as usize);
+        let node_size = Self::chunk_btree_node_size(ndims, self.sizeof_addr as usize)?;
         let root_addr = self.allocator.allocate(node_size as u64, 8);
         let final_coords = entries[entries.len() - 1].coords.clone();
 
@@ -1408,11 +2177,28 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok(root_addr)
     }
 
-    fn chunk_btree_node_size(ndims: usize, sizeof_addr: usize) -> usize {
-        let key_size = 4 + 4 + (ndims + 1) * 8;
+    fn chunk_btree_node_size(ndims: usize, sizeof_addr: usize) -> Result<usize> {
+        let key_size = ndims
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(8))
+            .and_then(|value| value.checked_add(8))
+            .ok_or_else(|| Error::InvalidFormat("chunk B-tree key size overflow".into()))?;
         let max_entries = 64usize;
-        let header_size = 4 + 1 + 1 + 2 + sizeof_addr * 2;
-        header_size + (max_entries + 1) * key_size + max_entries * sizeof_addr
+        let header_size = sizeof_addr
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(8))
+            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))?;
+        let key_bytes = max_entries
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(key_size))
+            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))?;
+        let child_bytes = max_entries
+            .checked_mul(sizeof_addr)
+            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))?;
+        header_size
+            .checked_add(key_bytes)
+            .and_then(|value| value.checked_add(child_bytes))
+            .ok_or_else(|| Error::InvalidFormat("chunk B-tree node size overflow".into()))
     }
 
     fn encode_chunk_btree_node_v1(
@@ -1435,7 +2221,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         }
 
         let sa = self.sizeof_addr as usize;
-        let node_size = Self::chunk_btree_node_size(ndims, sa);
+        let node_size = Self::chunk_btree_node_size(ndims, sa)?;
         let mut buf = Vec::with_capacity(node_size);
         let undef = UNDEF_ADDR.to_le_bytes();
 
@@ -1485,18 +2271,18 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             record.extend_from_slice(&heap_id);
             records.push(record);
         }
-        records
-            .sort_by_key(|record| u32::from_le_bytes([record[0], record[1], record[2], record[3]]));
+        records.sort_by_key(|record| dense_record_hash(record).unwrap_or(u32::MAX));
 
         let btree_addr = self.write_dense_name_btree(5, &records)?;
         Ok((heap_addr, btree_addr))
     }
 
     fn write_dense_attribute_storage(&mut self, attrs: &[AttrSpec<'_>]) -> Result<(u64, u64)> {
+        validate_unique_attr_names(attrs)?;
         let mut payloads = Vec::with_capacity(attrs.len());
         for attr in attrs {
             let attr_bytes =
-                encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data);
+                encode_attribute_message(attr.name, &attr.dtype, attr.shape, attr.data)?;
             payloads.push((attr.name, attr_bytes));
         }
 
@@ -1511,13 +2297,11 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             records.push(record);
         }
         records.sort_by_key(|record| {
-            let hash_pos = record.len() - 4;
-            u32::from_le_bytes([
-                record[hash_pos],
-                record[hash_pos + 1],
-                record[hash_pos + 2],
-                record[hash_pos + 3],
-            ])
+            record
+                .len()
+                .checked_sub(4)
+                .and_then(|hash_pos| dense_record_hash(&record[hash_pos..]).ok())
+                .unwrap_or(u32::MAX)
         });
 
         let btree_addr = self.write_dense_name_btree(8, &records)?;
@@ -1539,13 +2323,16 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 "managed heap ID length {heap_id_len} leaves unsupported length byte count {length_bytes}"
             )));
         }
-        let needed_block_size = 25
-            + payloads
-                .iter()
-                .map(|(_, payload)| payload.len())
-                .sum::<usize>();
-        let block_size = 512usize.max(needed_block_size.next_power_of_two());
-        let heap_header_len = self.minimal_fractal_heap_header_len();
+        let payload_bytes = payloads.iter().try_fold(0usize, |acc, (_, payload)| {
+            acc.checked_add(payload.len())
+                .ok_or_else(|| Error::InvalidFormat("managed heap payload size overflow".into()))
+        })?;
+        let needed_block_size = 25usize
+            .checked_add(payload_bytes)
+            .ok_or_else(|| Error::InvalidFormat("managed heap block size overflow".into()))?;
+        let block_size =
+            checked_next_power_of_two(needed_block_size, "managed heap block size")?.max(512);
+        let heap_header_len = self.minimal_fractal_heap_header_len()?;
         let heap_addr = self.allocator.allocate(heap_header_len as u64, 8);
         let direct_addr = self.allocator.allocate(block_size as u64, 8);
 
@@ -1596,24 +2383,20 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         Ok((heap_addr, heap_ids))
     }
 
-    fn minimal_fractal_heap_header_len(&self) -> usize {
-        4 + 1
-            + 2
-            + 2
-            + 1
-            + 4
-            + self.sizeof_size as usize
-            + self.sizeof_addr as usize
-            + self.sizeof_size as usize
-            + self.sizeof_addr as usize
-            + self.sizeof_size as usize * 8
-            + 2
-            + self.sizeof_size as usize * 2
-            + 2
-            + 2
-            + self.sizeof_addr as usize
-            + 2
-            + 4
+    fn minimal_fractal_heap_header_len(&self) -> Result<usize> {
+        let sa = self.sizeof_addr as usize;
+        let ss = self.sizeof_size as usize;
+        let fixed = 4usize + 1 + 2 + 2 + 1 + 4 + 2 + 2 + 2 + 2 + 4;
+        let size_fields = ss
+            .checked_mul(12)
+            .ok_or_else(|| Error::InvalidFormat("fractal heap header size overflow".into()))?;
+        let addr_fields = sa
+            .checked_mul(3)
+            .ok_or_else(|| Error::InvalidFormat("fractal heap header size overflow".into()))?;
+        fixed
+            .checked_add(size_fields)
+            .and_then(|value| value.checked_add(addr_fields))
+            .ok_or_else(|| Error::InvalidFormat("fractal heap header size overflow".into()))
     }
 
     fn encode_minimal_fractal_heap(
@@ -1738,7 +2521,22 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 })
                 .collect();
 
-            if group_links.is_empty() && path != "/" {
+            let has_special_links = self
+                .special_links
+                .iter()
+                .any(|(parent, _, _)| *parent == path);
+            let has_hard_links = self.hard_links.iter().any(|(parent, _, _)| *parent == path);
+            let has_group_attrs = self
+                .pending_group_attr_specs
+                .get(&path)
+                .is_some_and(|attrs| !attrs.is_empty());
+
+            if group_links.is_empty()
+                && !has_special_links
+                && !has_hard_links
+                && !has_group_attrs
+                && path != "/"
+            {
                 continue;
             }
 
@@ -1766,9 +2564,24 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             }
 
             // Add special links (soft/external) for this group
-            for (parent, link_data) in &self.special_links {
+            for (parent, _, link_data) in &self.special_links {
                 if *parent == path {
                     messages.push((MSG_LINK, link_data.clone()));
+                }
+            }
+
+            // Add explicit hard-link aliases after resolving final group
+            // addresses. Dataset addresses are stable; group object headers
+            // may have been rewritten earlier in this finalize pass.
+            for (parent, name, target_path) in &self.hard_links {
+                if *parent == path {
+                    let target_addr = self.object_addr_for_path(target_path).ok_or_else(|| {
+                        Error::InvalidFormat(format!("hard link target '{target_path}' not found"))
+                    })?;
+                    messages.push((
+                        MSG_LINK,
+                        encode_link_message(name, target_addr, self.sizeof_addr),
+                    ));
                 }
             }
 
@@ -1798,7 +2611,32 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                             &attr.dtype,
                             &attr.shape,
                             &attr.data,
-                        );
+                        )?;
+                        messages.push((MSG_ATTRIBUTE, attr_bytes));
+                    }
+                }
+            }
+
+            if let Some(group_attrs) = self.pending_group_attr_specs.get(&path).cloned() {
+                if group_attrs.len() > 8 {
+                    let attr_specs: Vec<AttrSpec<'_>> = group_attrs
+                        .iter()
+                        .map(OwnedAttrSpec::as_attr_spec)
+                        .collect();
+                    let (heap_addr, btree_addr) =
+                        self.write_dense_attribute_storage(&attr_specs)?;
+                    messages.push((
+                        MSG_ATTR_INFO,
+                        encode_attr_info_message(heap_addr, btree_addr, self.sizeof_addr),
+                    ));
+                } else {
+                    for attr in &group_attrs {
+                        let attr_bytes = encode_attribute_message(
+                            &attr.name,
+                            &attr.dtype,
+                            &attr.shape,
+                            &attr.data,
+                        )?;
                         messages.push((MSG_ATTRIBUTE, attr_bytes));
                     }
                 }
@@ -1807,7 +2645,7 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             let msg_refs: Vec<(u16, &[u8])> =
                 messages.iter().map(|(t, d)| (*t, d.as_slice())).collect();
 
-            let oh_bytes = build_v2_object_header(&msg_refs, 0);
+            let oh_bytes = build_v2_object_header(&msg_refs, 0)?;
             let oh_addr = self.allocator.allocate(oh_bytes.len() as u64, 8);
             self.write_at(oh_addr, &oh_bytes)?;
 
@@ -1847,5 +2685,85 @@ impl<W: Write + Seek> HdfFileWriter<W> {
         self.writer.seek(SeekFrom::Start(offset))?;
         self.writer.write_all(data)?;
         Ok(())
+    }
+
+    fn object_addr_for_path(&self, path: &str) -> Option<u64> {
+        let path = normalize_object_path(path);
+        if let Some(addr) = self.groups.get(&path) {
+            return Some(*addr);
+        }
+        self.links
+            .iter()
+            .find(|(parent, name, _)| child_path(parent, name) == path)
+            .map(|(_, _, addr)| *addr)
+    }
+}
+
+fn normalize_object_path(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn child_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ceil_div_nonzero_u64, checked_next_power_of_two, dense_record_hash, HdfFileWriter,
+    };
+    use std::io::Cursor;
+
+    #[test]
+    fn ceil_div_nonzero_u64_rejects_zero_divisor() {
+        let err = ceil_div_nonzero_u64(10, 0, "test ceil-div").unwrap_err();
+        assert!(
+            err.to_string().contains("test ceil-div divisor is zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ceil_div_nonzero_u64_rounds_up_without_overflow() {
+        assert_eq!(ceil_div_nonzero_u64(0, 4, "test ceil-div").unwrap(), 0);
+        assert_eq!(ceil_div_nonzero_u64(1, 4, "test ceil-div").unwrap(), 1);
+        assert_eq!(ceil_div_nonzero_u64(5, 4, "test ceil-div").unwrap(), 2);
+        assert_eq!(
+            ceil_div_nonzero_u64(u64::MAX, u64::MAX, "test ceil-div").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn usize_from_u64_writer_accepts_normal_values() {
+        assert_eq!(super::usize_from_u64_writer(42, "test value").unwrap(), 42);
+    }
+
+    #[test]
+    fn checked_writer_metadata_sizing_rejects_overflow() {
+        assert!(HdfFileWriter::<Cursor<Vec<u8>>>::chunk_btree_node_size(usize::MAX, 8).is_err());
+        assert!(checked_next_power_of_two(usize::MAX, "test power").is_err());
+    }
+
+    #[test]
+    fn dense_record_hash_rejects_truncated_record() {
+        let err = dense_record_hash(&[1, 2, 3]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dense B-tree record hash is truncated"),
+            "unexpected error: {err}"
+        );
     }
 }

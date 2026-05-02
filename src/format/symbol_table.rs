@@ -82,7 +82,16 @@ impl SymbolTableNode {
                 // Group: B-tree addr + name heap addr
                 let btree = reader.read_addr()?;
                 let heap = reader.read_addr()?;
-                let used = reader.sizeof_addr() as u64 * 2;
+                let used = (reader.sizeof_addr() as u64)
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("symbol table scratch-pad size overflow".into())
+                    })?;
+                if used > 16 {
+                    return Err(Error::InvalidFormat(
+                        "symbol table group scratch-pad exceeds fixed size".into(),
+                    ));
+                }
                 if used < 16 {
                     reader.skip(16 - used)?;
                 }

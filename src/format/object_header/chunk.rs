@@ -45,7 +45,7 @@ pub(super) fn read_v1_continuation<R: Read + Seek>(
             cont_len,
             messages,
             chunk_ranges,
-            chunk_index + 1,
+            next_chunk_index(chunk_index)?,
         )?;
     }
 
@@ -112,7 +112,7 @@ pub(super) fn read_v2_continuation<R: Read + Seek>(
             has_crt_order,
             messages,
             chunk_ranges,
-            chunk_index + 1,
+            next_chunk_index(chunk_index)?,
         )?;
     }
 
@@ -150,4 +150,21 @@ pub(super) fn reserve_continuation_range<R: Read + Seek>(
     }
     chunk_ranges.push((addr, end));
     Ok(())
+}
+
+fn next_chunk_index(chunk_index: u16) -> Result<u16> {
+    chunk_index
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidFormat("object header continuation depth overflow".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_chunk_index;
+
+    #[test]
+    fn continuation_chunk_index_rejects_overflow() {
+        let err = next_chunk_index(u16::MAX).unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
 }

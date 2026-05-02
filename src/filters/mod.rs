@@ -3,6 +3,7 @@ pub mod deflate;
 pub mod fletcher32;
 pub mod lzf;
 pub mod nbit;
+pub mod registry;
 pub mod scaleoffset;
 pub mod shuffle;
 pub mod szip;
@@ -93,8 +94,7 @@ fn apply_pipeline_reverse_with_mask_and_expected(
         if filter_mask & (1u32 << index) != 0 {
             continue;
         }
-        let deflate_exact_len =
-            deflate_exact_len_hint(pipeline, filter_mask, index, expected_len);
+        let deflate_exact_len = deflate_exact_len_hint(pipeline, filter_mask, index, expected_len);
         buf = apply_filter_reverse(&buf, filter, element_size, expected_len, deflate_exact_len)?;
     }
 
@@ -133,7 +133,13 @@ fn apply_filter_reverse(
                 deflate::decompress_with_hint(data, expected_len)
             }
         }
-        FILTER_SHUFFLE => shuffle::unshuffle(data, element_size),
+        FILTER_SHUFFLE => {
+            let shuffle_element_size =
+                shuffle_element_size(filter, element_size).ok_or_else(|| {
+                    Error::InvalidFormat("shuffle filter element size is zero".into())
+                })?;
+            shuffle::unshuffle(data, shuffle_element_size)
+        }
         FILTER_FLETCHER32 => fletcher32::verify_and_strip(data),
         FILTER_NBIT => nbit::decompress(data, &filter.client_data),
         FILTER_SCALEOFFSET => scaleoffset::decompress(data, &filter.client_data),
@@ -154,6 +160,16 @@ fn apply_filter_reverse(
             filter.id
         ))),
     }
+}
+
+fn shuffle_element_size(filter: &FilterDesc, dataset_element_size: usize) -> Option<usize> {
+    let Some(&encoded_size) = filter.client_data.first() else {
+        return (dataset_element_size != 0).then_some(dataset_element_size);
+    };
+    if encoded_size == 0 {
+        return None;
+    }
+    usize::try_from(encoded_size).ok()
 }
 
 fn deflate_exact_len_hint(
@@ -206,6 +222,18 @@ mod tests {
         }
     }
 
+    fn shuffle_pipeline(element_size: u32) -> FilterPipelineMessage {
+        FilterPipelineMessage {
+            version: 2,
+            filters: vec![FilterDesc {
+                id: FILTER_SHUFFLE,
+                name: Some("shuffle".into()),
+                flags: 0,
+                client_data: vec![element_size],
+            }],
+        }
+    }
+
     #[test]
     fn expected_length_accepts_exact_filter_output() {
         let compressed = deflate::compress(b"abcd", 4).unwrap();
@@ -222,7 +250,8 @@ mod tests {
             apply_pipeline_reverse_with_mask_expected(&compressed, &deflate_pipeline(), 1, 0, 3)
                 .unwrap_err();
         assert!(
-            err.to_string().contains("filter pipeline output length mismatch")
+            err.to_string()
+                .contains("filter pipeline output length mismatch")
                 || err
                     .to_string()
                     .contains("deflate decompression produced more bytes than expected"),
@@ -238,8 +267,8 @@ mod tests {
 
     #[test]
     fn unmasked_unknown_optional_filter_fails() {
-        let err = apply_pipeline_reverse_with_mask(b"abcd", &unknown_pipeline(1), 1, 0)
-            .unwrap_err();
+        let err =
+            apply_pipeline_reverse_with_mask(b"abcd", &unknown_pipeline(1), 1, 0).unwrap_err();
         assert!(
             err.to_string().contains("filter 32099 not implemented"),
             "unexpected error: {err}"
@@ -254,5 +283,21 @@ mod tests {
             err.to_string().contains("filter 32099 not implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn shuffle_uses_filter_client_element_size() {
+        let data = [1u8, 5, 2, 6, 3, 7, 4, 8];
+        let out = apply_pipeline_reverse_with_mask(&data, &shuffle_pipeline(4), 1, 0).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn shuffle_rejects_zero_client_element_size() {
+        let err = apply_pipeline_reverse_with_mask(b"abcd", &shuffle_pipeline(0), 4, 0)
+            .expect_err("zero-sized shuffle parameter should fail");
+        assert!(err
+            .to_string()
+            .contains("shuffle filter element size is zero"));
     }
 }

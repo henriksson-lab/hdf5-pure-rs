@@ -1,6 +1,7 @@
 //! Phase T6: Group and link tests.
 
-use hdf5_pure_rust::File;
+use hdf5_pure_rust::format::messages::link::LinkType;
+use hdf5_pure_rust::{File, LinkValue};
 
 const FILE: &str = "tests/data/hdf5_ref/groups_and_links.h5";
 fn open() -> File {
@@ -72,6 +73,55 @@ fn t6b_link_exists() {
     assert!(root.link_exists("soft_link").unwrap());
     assert!(root.link_exists("ext_link").unwrap());
     assert!(!root.link_exists("nonexistent").unwrap());
+}
+
+#[test]
+fn t6b_link_info_name_and_value_by_index() {
+    let root = open().root_group().unwrap();
+    let names = root.member_names().unwrap();
+    let soft_idx = names.iter().position(|name| name == "soft_link").unwrap();
+    let ext_idx = names.iter().position(|name| name == "ext_link").unwrap();
+    let hard_idx = names.iter().position(|name| name == "alias_data").unwrap();
+
+    assert_eq!(root.link_name_by_idx(soft_idx).unwrap(), "soft_link");
+    let soft_info = root.link_info("soft_link").unwrap();
+    assert_eq!(soft_info.link_type, LinkType::Soft);
+    assert_eq!(root.link_info_v1("soft_link").unwrap(), soft_info);
+    assert_eq!(root.link_info_by_idx(soft_idx).unwrap(), soft_info);
+    assert_eq!(root.link_info_by_idx_v1(soft_idx).unwrap(), soft_info);
+    assert_eq!(
+        root.link_value_by_idx(soft_idx).unwrap(),
+        Some(LinkValue::Soft("/a/b/c/data".to_string()))
+    );
+
+    assert_eq!(
+        root.link_value_by_idx(ext_idx).unwrap(),
+        Some(LinkValue::External {
+            filename: "other_file.h5".to_string(),
+            object_path: "/some/path".to_string()
+        })
+    );
+
+    let hard_info = root.link_info_by_idx(hard_idx).unwrap();
+    assert_eq!(hard_info.link_type, LinkType::Hard);
+    assert!(hard_info.hard_link_addr.is_some());
+    assert_eq!(root.link_value_by_idx(hard_idx).unwrap(), None);
+
+    assert_eq!(root.object_comment().unwrap(), None);
+    assert_eq!(root.object_comment_by_name("alias_data").unwrap(), None);
+    let root_info = root.native_info().unwrap();
+    assert_eq!(root_info.addr, root.addr());
+    assert!(root_info.message_count > 0);
+    let object_info = root.object_info_by_idx(hard_idx).unwrap();
+    assert_eq!(object_info.addr, hard_info.hard_link_addr.unwrap());
+    assert_eq!(root.object_info_by_idx_v1(hard_idx).unwrap(), object_info);
+    assert_eq!(root.object_info_by_idx_v2(hard_idx).unwrap(), object_info);
+    assert_eq!(root.native_info_by_idx(hard_idx).unwrap(), object_info);
+
+    assert!(root.link_name_by_idx(names.len()).is_err());
+    assert!(root.link_info_by_idx(names.len()).is_err());
+    assert!(root.link_value_by_idx(names.len()).is_err());
+    assert!(root.object_info_by_idx(names.len()).is_err());
 }
 
 // T6c: Many groups (may trigger dense storage)
