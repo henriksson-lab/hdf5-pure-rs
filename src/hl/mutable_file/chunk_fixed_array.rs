@@ -9,6 +9,7 @@ use crate::io::reader::UNDEF_ADDR;
 use super::MutableFile;
 
 impl MutableFile {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn rewrite_fixed_array_chunk(
         &mut self,
         index_addr: u64,
@@ -84,7 +85,7 @@ impl MutableFile {
             sa,
             "fixed array chunk address",
         )?;
-        self.write_handle.write_all(&chunk_addr)?;
+        self.write_handle.write_all(chunk_addr)?;
         if filtered {
             self.write_uint_le(chunk_size, chunk_size_len)?;
             self.write_handle.write_all(&0u32.to_le_bytes())?;

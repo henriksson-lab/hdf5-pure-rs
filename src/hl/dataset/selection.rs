@@ -230,6 +230,7 @@ impl Dataset {
             };
             self.read_raw_into_with_info(&info, &access, raw_out)?;
             conversion.convert_bytes_in_place(raw_out);
+            T::validate_byte_slice(raw_out)?;
             unsafe {
                 values.set_len(total_elements_usize);
             }
@@ -612,7 +613,7 @@ impl Dataset {
 
         let info = self.info()?;
         let conversion = crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
-        if !conversion.is_same_size_bytes() {
+        if !conversion.is_same_size_bytes() || T::requires_validation() {
             return Ok(false);
         }
         let elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;

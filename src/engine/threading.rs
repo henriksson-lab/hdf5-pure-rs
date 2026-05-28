@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
-use std::sync::{Arc, Barrier, Condvar, Mutex, Once, RwLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle, ThreadId};
 
 use crate::error::ErrorStack;
@@ -45,7 +46,12 @@ impl ThreadPackage {
 
 #[derive(Debug, Default)]
 pub struct TsMutex {
-    locked: AtomicBool,
+    state: Mutex<TsMutexState>,
+}
+
+#[derive(Debug, Default)]
+struct TsMutexState {
+    owner: Option<ThreadId>,
 }
 
 impl TsMutex {
@@ -54,9 +60,14 @@ impl TsMutex {
     }
 
     pub fn mutex_trylock(&self) -> bool {
-        self.locked
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        let current = thread::current().id();
+        if let Ok(mut state) = self.state.try_lock() {
+            if state.owner.is_none() {
+                state.owner = Some(current);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn mutex_lock(&self) {
@@ -66,7 +77,13 @@ impl TsMutex {
     }
 
     pub fn mutex_unlock(&self) {
-        self.locked.store(false, Ordering::SeqCst);
+        let current = thread::current().id();
+        let mut state = self.state.lock().expect("mutex poisoned");
+        match state.owner {
+            Some(owner) if owner == current => state.owner = None,
+            Some(_) => panic!("mutex unlocked from a non-owning thread"),
+            None => panic!("mutex unlocked while not locked"),
+        }
     }
 
     pub fn mutex_destroy(self) {}
@@ -194,8 +211,16 @@ impl TsBarrier {
 
 #[derive(Debug, Default)]
 pub struct TsRwLock {
-    lock: RwLock<()>,
+    state: Mutex<RwLockState>,
+    cv: Condvar,
     stats: RwLockStats,
+}
+
+#[derive(Debug, Default)]
+struct RwLockState {
+    readers: HashMap<ThreadId, usize>,
+    writer: Option<ThreadId>,
+    writer_recursion: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -212,24 +237,99 @@ impl TsRwLock {
     }
 
     pub fn rwlock_rdlock(&self) {
-        drop(self.lock.read().expect("rwlock poisoned"));
+        self.rdlock(false);
+    }
+
+    fn rdlock(&self, recursive: bool) {
+        let current = thread::current().id();
+        let mut state = self.state.lock().expect("rwlock poisoned");
+        while state.writer.is_some() && !(recursive && state.writer == Some(current)) {
+            state = self.cv.wait(state).expect("rwlock poisoned");
+        }
+        *state.readers.entry(current).or_insert(0) += 1;
         self.update_stats_rdlock();
     }
 
     pub fn rwlock_rdunlock(&self) {
+        self.rdunlock();
+    }
+
+    fn rdunlock(&self) {
+        let current = thread::current().id();
+        let mut state = self.state.lock().expect("rwlock poisoned");
+        let count = state
+            .readers
+            .get_mut(&current)
+            .expect("rwlock read-unlocked by a thread without a read lock");
+        *count -= 1;
+        if *count == 0 {
+            state.readers.remove(&current);
+        }
+        if state.readers.is_empty() {
+            self.cv.notify_all();
+        }
         self.update_stats_rd_unlock();
     }
 
     pub fn rwlock_wrlock(&self) {
-        drop(self.lock.write().expect("rwlock poisoned"));
+        self.wrlock(false);
+    }
+
+    fn wrlock(&self, recursive: bool) {
+        let current = thread::current().id();
+        let mut state = self.state.lock().expect("rwlock poisoned");
+        if recursive && state.writer == Some(current) {
+            state.writer_recursion += 1;
+            self.update_stats_wr_lock();
+            return;
+        }
+        while state.writer.is_some() || !state.readers.is_empty() {
+            state = self.cv.wait(state).expect("rwlock poisoned");
+        }
+        state.writer = Some(current);
+        state.writer_recursion = 1;
         self.update_stats_wr_lock();
     }
 
     pub fn rwlock_trywrlock(&self) -> bool {
-        self.lock.try_write().is_ok()
+        self.trywrlock(false)
+    }
+
+    fn trywrlock(&self, recursive: bool) -> bool {
+        let current = thread::current().id();
+        if let Ok(mut state) = self.state.try_lock() {
+            if recursive && state.writer == Some(current) {
+                state.writer_recursion += 1;
+                self.update_stats_wr_lock();
+                return true;
+            }
+            if state.writer.is_none() && state.readers.is_empty() {
+                state.writer = Some(current);
+                state.writer_recursion = 1;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn rwlock_wrunlock(&self) {
+        self.wrunlock();
+    }
+
+    fn wrunlock(&self) {
+        let current = thread::current().id();
+        let mut state = self.state.lock().expect("rwlock poisoned");
+        match state.writer {
+            Some(owner) if owner == current => {
+                state.writer_recursion = state.writer_recursion.saturating_sub(1);
+                if state.writer_recursion == 0 {
+                    state.writer = None;
+                    self.cv.notify_all();
+                }
+            }
+            Some(_) => panic!("rwlock write-unlocked from a non-owning thread"),
+            None => panic!("rwlock write-unlocked while not write-locked"),
+        }
         self.update_stats_wr_unlock();
     }
 
@@ -242,19 +342,19 @@ impl TsRwLock {
     pub fn rec_rwlock_destroy(self) {}
 
     pub fn rec_rwlock_rdlock(&self) {
-        self.rwlock_rdlock();
+        self.rdlock(true);
     }
 
     pub fn rec_rwlock_wrlock(&self) {
-        self.rwlock_wrlock();
+        self.wrlock(true);
     }
 
     pub fn rec_rwlock_rdunlock(&self) {
-        self.rwlock_rdunlock();
+        self.rdunlock();
     }
 
     pub fn rec_rwlock_wrunlock(&self) {
-        self.rwlock_wrunlock();
+        self.wrunlock();
     }
 
     pub fn update_stats_rdlock(&self) {
@@ -563,5 +663,52 @@ mod tests {
         lock.rec_rwlock_reset_stats();
         lock.rec_rwlock_print_stats_into(&mut stats);
         assert_eq!(stats, "rdlock=0, wrlock=0, rdunlock=0, wrunlock=0");
+    }
+
+    #[test]
+    fn recursive_rwlock_allows_same_thread_write_reentry() {
+        let lock = TsRwLock::rec_rwlock_init();
+        lock.rec_rwlock_wrlock();
+        lock.rec_rwlock_wrlock();
+        assert!(!lock.rwlock_trywrlock());
+        lock.rec_rwlock_wrunlock();
+        assert!(!lock.rwlock_trywrlock());
+        lock.rec_rwlock_wrunlock();
+        assert!(lock.rwlock_trywrlock());
+        lock.rwlock_wrunlock();
+    }
+
+    #[test]
+    fn rwlock_holds_read_and_write_state_until_unlock() {
+        let lock = TsRwLock::rwlock_init();
+
+        lock.rwlock_rdlock();
+        assert!(!lock.rwlock_trywrlock());
+        lock.rwlock_rdunlock();
+
+        assert!(lock.rwlock_trywrlock());
+        assert!(!lock.rwlock_trywrlock());
+        lock.rwlock_wrunlock();
+
+        assert!(lock.rwlock_trywrlock());
+        lock.rwlock_wrunlock();
+    }
+
+    #[test]
+    #[should_panic(expected = "mutex unlocked while not locked")]
+    fn mutex_unlock_without_lock_panics() {
+        TsMutex::mutex_init().mutex_unlock();
+    }
+
+    #[test]
+    #[should_panic(expected = "rwlock read-unlocked by a thread without a read lock")]
+    fn rwlock_read_unlock_without_lock_panics() {
+        TsRwLock::rwlock_init().rwlock_rdunlock();
+    }
+
+    #[test]
+    #[should_panic(expected = "rwlock write-unlocked while not write-locked")]
+    fn rwlock_write_unlock_without_lock_panics() {
+        TsRwLock::rwlock_init().rwlock_wrunlock();
     }
 }

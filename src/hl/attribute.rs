@@ -1108,7 +1108,7 @@ impl Attribute {
         } else {
             self.msg.data.len() / elem_size
         };
-        if self.msg.data.len() % elem_size != 0 {
+        if !self.msg.data.len().is_multiple_of(elem_size) {
             return Err(Error::InvalidFormat(format!(
                 "attribute '{}' data length {} is not a multiple of element size {}",
                 self.msg.name,
@@ -1124,6 +1124,7 @@ impl Attribute {
             };
             raw_out.copy_from_slice(&self.msg.data);
             conversion.convert_bytes_in_place(raw_out);
+            T::validate_byte_slice(raw_out)?;
             unsafe {
                 values.set_len(count);
             }
@@ -1150,7 +1151,7 @@ impl Attribute {
         } else {
             self.msg.data.len() / elem_size
         };
-        if self.msg.data.len() % elem_size != 0 {
+        if !self.msg.data.len().is_multiple_of(elem_size) {
             return Err(Error::InvalidFormat(format!(
                 "attribute '{}' data length {} is not a multiple of element size {}",
                 self.msg.name,
@@ -1165,10 +1166,19 @@ impl Attribute {
             )));
         }
 
-        if conversion.is_same_size_bytes() {
+        if conversion.is_same_size_bytes() && !T::requires_validation() {
             let raw_out = crate::hl::types::slice_as_bytes_mut(out);
             raw_out.copy_from_slice(&self.msg.data);
             conversion.convert_bytes_in_place(raw_out);
+            return Ok(());
+        }
+
+        if conversion.is_same_size_bytes() {
+            let mut raw = self.msg.data.clone();
+            conversion.convert_bytes_in_place(&mut raw);
+            T::validate_byte_slice(&raw)?;
+            let raw_out = crate::hl::types::slice_as_bytes_mut(out);
+            raw_out.copy_from_slice(&raw);
             return Ok(());
         }
 
@@ -1179,7 +1189,10 @@ impl Attribute {
     pub fn read_scalar<T: crate::hl::types::H5Type>(&self) -> crate::Result<T> {
         let conversion =
             crate::hl::conversion::ReadConversion::for_dataset::<T>(&self.msg.datatype)?;
-        if conversion.is_same_size_bytes() && self.msg.data.len() == T::type_size() {
+        if conversion.is_same_size_bytes()
+            && !T::requires_validation()
+            && self.msg.data.len() == T::type_size()
+        {
             let mut value = std::mem::MaybeUninit::<T>::uninit();
             let raw_out = unsafe {
                 std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, T::type_size())
@@ -1187,6 +1200,11 @@ impl Attribute {
             raw_out.copy_from_slice(&self.msg.data);
             conversion.convert_bytes_in_place(raw_out);
             return Ok(unsafe { value.assume_init() });
+        }
+        if conversion.is_same_size_bytes() && self.msg.data.len() == T::type_size() {
+            let mut raw = self.msg.data.clone();
+            conversion.convert_bytes_in_place(&mut raw);
+            return crate::hl::types::bytes_to_vec::<T>(raw).map(|mut values| values.remove(0));
         }
         conversion.bytes_to_scalar_from_slice(&self.msg.data)
     }
@@ -1221,7 +1239,7 @@ impl Attribute {
                 self.msg.name
             )));
         }
-        if self.msg.data.len() % elem_size != 0 {
+        if !self.msg.data.len().is_multiple_of(elem_size) {
             return Err(Error::InvalidFormat(format!(
                 "attribute '{}' string data length {} is not a multiple of element size {}",
                 self.msg.name,
@@ -1287,7 +1305,7 @@ impl Attribute {
                 self.msg.name
             )));
         }
-        if self.msg.data.len() % elem_size != 0 {
+        if !self.msg.data.len().is_multiple_of(elem_size) {
             return Err(Error::InvalidFormat(format!(
                 "attribute '{}' string data length {} is not a multiple of element size {}",
                 self.msg.name,
@@ -1327,7 +1345,7 @@ impl Attribute {
             .checked_add(sizeof_addr)
             .and_then(|v| v.checked_add(4))
             .ok_or_else(|| Error::InvalidFormat("vlen string reference size overflow".into()))?;
-        if self.msg.data.len() % ref_size != 0 {
+        if !self.msg.data.len().is_multiple_of(ref_size) {
             return Err(Error::InvalidFormat(format!(
                 "attribute '{}' vlen string data length {} is not a multiple of reference size {}",
                 self.msg.name,

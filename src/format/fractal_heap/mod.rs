@@ -599,7 +599,7 @@ impl FractalHeapHeader {
     /// Retrieve the offset encoded in a managed heap ID. Mirrors
     /// `H5HF_get_id_off_test`.
     pub fn get_id_off_test(&self, heap_id: &[u8]) -> Result<u64> {
-        let offset_bytes = (usize::from(self.max_heap_size) + 7) / 8;
+        let offset_bytes = usize::from(self.max_heap_size).div_ceil(8);
         heap_id
             .get(1..1 + offset_bytes)
             .map(read_le_uint)
@@ -2495,7 +2495,7 @@ pub(super) fn verify_direct_block_checksum<R: Read + Seek>(
     block_size: u64,
 ) -> Result<()> {
     let restore = reader.position()?;
-    let block_offset_bytes = (usize::from(max_heap_size) + 7) / 8;
+    let block_offset_bytes = usize::from(max_heap_size).div_ceil(8);
     let check_len = 4usize
         .checked_add(1)
         .and_then(|n| n.checked_add(usize::from(reader.sizeof_addr())))

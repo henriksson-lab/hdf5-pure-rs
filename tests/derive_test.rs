@@ -20,6 +20,13 @@ enum Color {
 
 #[derive(Copy, Clone, DeriveH5Type)]
 #[repr(C)]
+struct Pixel {
+    color: Color,
+    intensity: u8,
+}
+
+#[derive(Copy, Clone, DeriveH5Type)]
+#[repr(C)]
 struct Measurement {
     value: f32,
     #[hdf5(rename = "error_margin")]
@@ -31,6 +38,8 @@ fn test_derive_struct_size() {
     assert_eq!(Point::type_size(), std::mem::size_of::<Point>());
     // f64(8) + f64(8) + i32(4) + padding(4) = 24 on most platforms, or 20 with packed
     assert!(Point::type_size() >= 20);
+    assert!(Point::has_padding());
+    assert!(!Measurement::has_padding());
 }
 
 #[test]
@@ -64,6 +73,7 @@ fn test_derive_struct_fields() {
 #[test]
 fn test_derive_enum_size() {
     assert_eq!(Color::type_size(), 1);
+    assert!(Color::requires_validation());
 }
 
 #[test]
@@ -76,6 +86,39 @@ fn test_derive_enum_members() {
     })
     .unwrap();
     assert_eq!(index, expected.len());
+}
+
+#[test]
+fn test_derive_enum_rejects_invalid_discriminant_bytes() {
+    let err = match hdf5_pure_rust::hl::types::bytes_to_vec::<Color>(vec![3]) {
+        Ok(_) => panic!("invalid enum discriminant should be rejected"),
+        Err(err) => err,
+    };
+    assert!(format!("{err}").contains("enum value"));
+}
+
+#[test]
+fn test_derive_compound_validates_enum_fields() {
+    assert!(Pixel::requires_validation());
+    assert!(!Pixel::has_padding());
+
+    let err = match hdf5_pure_rust::hl::types::bytes_to_vec::<Pixel>(vec![3, 9]) {
+        Ok(_) => panic!("invalid nested enum discriminant should be rejected"),
+        Err(err) => err,
+    };
+    assert!(format!("{err}").contains("enum value"));
+}
+
+#[test]
+fn test_derive_padded_struct_rejects_typed_write_byte_view() {
+    let value = Point {
+        x: 1.0,
+        y: 2.0,
+        label: 42,
+    };
+    let err = hdf5_pure_rust::hl::types::slice_as_bytes_checked(std::slice::from_ref(&value))
+        .unwrap_err();
+    assert!(format!("{err}").contains("padding"));
 }
 
 #[test]

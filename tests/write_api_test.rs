@@ -762,7 +762,7 @@ fn test_writable_dense_attrs_support_wider_heap_ids() {
             .add_fixed_ascii_attr("very_large_attr", "z", large_len)
             .unwrap();
         for idx in 0..8 {
-            group.add_attr(&format!("attr_{idx}"), idx as i32).unwrap();
+            group.add_attr(&format!("attr_{idx}"), idx).unwrap();
         }
         let f = wf.close().unwrap();
 
@@ -799,9 +799,7 @@ fn test_writable_dense_attrs_cross_leaf_btree_boundary() {
         let mut wf = WritableFile::create(&path).unwrap();
         let mut group = wf.create_group("metadata").unwrap();
         for idx in 0..64 {
-            group
-                .add_attr(&format!("attr_{idx:02}"), idx as i32)
-                .unwrap();
+            group.add_attr(&format!("attr_{idx:02}"), idx).unwrap();
         }
         let f = wf.close().unwrap();
 

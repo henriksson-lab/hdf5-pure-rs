@@ -1120,6 +1120,7 @@ impl File {
         current.with_link_ref_by_name(part, ResolvedLink::from_ref)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_path_component(
         &self,
         _current: &Group,

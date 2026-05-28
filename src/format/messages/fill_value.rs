@@ -241,6 +241,7 @@ fn read_u32_len_at(data: &[u8], pos: usize, context: &'static str) -> Result<usi
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

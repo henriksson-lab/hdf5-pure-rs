@@ -84,6 +84,11 @@ impl<R: Read + Seek> HdfReader<R> {
         })
     }
 
+    /// Return whether the logical HDF5 stream is empty.
+    pub fn is_empty(&mut self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Get the physical stream length while preserving the current position.
     pub fn len_physical(&mut self) -> Result<u64> {
         let pos = self.inner.stream_position()?;

@@ -98,6 +98,7 @@ impl Dataset {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn try_read_full_chunk_1d_into_output<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         info: &DatasetInfo,
@@ -281,7 +282,7 @@ impl Dataset {
             .map(|&coord| usize_from_u64(coord, "chunk coordinate"))
             .collect::<Result<Vec<_>>>()?;
         let copy_counts = Self::chunk_copy_counts(&coords, copy_plan)?;
-        if copy_counts.iter().any(|&count| count == 0) {
+        if copy_counts.contains(&0) {
             return Ok(());
         }
 
@@ -402,13 +403,16 @@ impl Dataset {
         copy_plan: &ChunkCopyPlan,
     ) -> Result<usize> {
         let mut offset = 0usize;
-        for d in 0..span_start {
-            offset =
-                offset
-                    .checked_add(idx[d].checked_mul(copy_plan.chunk_strides[d]).ok_or_else(
-                        || Error::InvalidFormat("chunk input offset overflow".into()),
-                    )?)
-                    .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
+        for (d, idx_value) in idx.iter().enumerate().take(span_start) {
+            offset = offset
+                .checked_add(
+                    idx_value
+                        .checked_mul(copy_plan.chunk_strides[d])
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("chunk input offset overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
         }
         Ok(offset)
     }
@@ -514,8 +518,8 @@ impl Dataset {
 
         for elem_idx in 0..copy_plan.total_chunk_elements {
             let mut remaining = elem_idx;
-            for d in 0..ndims {
-                idx[d] = remaining / copy_plan.chunk_suffix_products[d];
+            for (d, idx_value) in idx.iter_mut().enumerate().take(ndims) {
+                *idx_value = remaining / copy_plan.chunk_suffix_products[d];
                 remaining %= copy_plan.chunk_suffix_products[d];
             }
 

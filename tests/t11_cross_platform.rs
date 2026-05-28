@@ -17,7 +17,7 @@ fn member_count(file: &File) -> hdf5_pure_rust::Result<usize> {
 
 #[test]
 fn t11a_be_data_read() {
-    let f = File::open(&format!("{REF_DIR}/be_data.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/be_data.h5")).unwrap();
     // Verify we can navigate the file
     assert_ne!(member_count(&f).unwrap(), 0);
 }
@@ -25,16 +25,16 @@ fn t11a_be_data_read() {
 #[test]
 fn t11a_be_extlinks() {
     // Big-endian external link files
-    let f1 = File::open(&format!("{REF_DIR}/be_extlink1.h5")).unwrap();
+    let f1 = File::open(format!("{REF_DIR}/be_extlink1.h5")).unwrap();
     assert_ne!(member_count(&f1).unwrap(), 0);
 
-    let f2 = File::open(&format!("{REF_DIR}/be_extlink2.h5")).unwrap();
+    let f2 = File::open(format!("{REF_DIR}/be_extlink2.h5")).unwrap();
     assert_ne!(member_count(&f2).unwrap(), 0);
 }
 
 #[test]
 fn t11a_be_filters() {
-    let f = File::open(&format!("{REF_DIR}/test_filters_be.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/test_filters_be.h5")).unwrap();
     assert_ne!(member_count(&f).unwrap(), 0);
 }
 
@@ -51,7 +51,7 @@ fn t11a_c_suite_nbit_custom_float_read() {
         ("le_data.h5", "Nbit_float_data_le"),
         ("be_data.h5", "Nbit_float_data_be"),
     ] {
-        let f = File::open(&format!("{REF_DIR}/{file_name}")).unwrap();
+        let f = File::open(format!("{REF_DIR}/{file_name}")).unwrap();
         let ds = f.dataset(nbit_name).unwrap();
         assert_eq!(ds.shape().unwrap(), vec![7, 6]);
 
@@ -80,13 +80,13 @@ fn t11a_typed_read_be() {
 
 #[test]
 fn t11b_old_group_format() {
-    let f = File::open(&format!("{REF_DIR}/group_old.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/group_old.h5")).unwrap();
     assert_ne!(member_count(&f).unwrap(), 0);
 }
 
 #[test]
 fn t11b_old_fill_values() {
-    let f = File::open(&format!("{REF_DIR}/fill_old.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/fill_old.h5")).unwrap();
     let mut names = Vec::new();
     f.member_names_into(&mut names).unwrap();
     assert_eq!(names, vec!["dset1".to_string(), "dset2".to_string()]);
@@ -99,7 +99,7 @@ fn t11b_old_fill_values() {
 
 #[test]
 fn t11b_old_fill_value_create_plist() {
-    let f = File::open(&format!("{REF_DIR}/fill_old.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/fill_old.h5")).unwrap();
     let plist = f.dataset("dset2").unwrap().create_plist().unwrap();
 
     assert!(plist.fill_value_defined);
@@ -108,7 +108,7 @@ fn t11b_old_fill_value_create_plist() {
 
 #[test]
 fn t11b_chunked_fill18_values() {
-    let f = File::open(&format!("{REF_DIR}/fill18.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/fill18.h5")).unwrap();
     let ds = f.dataset("DS1").unwrap();
     let mut vals = vec![0; ds.size().unwrap() as usize];
     ds.read_into(&mut vals).unwrap();
@@ -122,21 +122,21 @@ fn t11b_chunked_fill18_values() {
 
 #[test]
 fn t11b_old_layout() {
-    let f = File::open(&format!("{REF_DIR}/tlayouto.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/tlayouto.h5")).unwrap();
     assert_ne!(member_count(&f).unwrap(), 0);
 }
 
 #[test]
 fn t11b_old_mtime() {
     for name in ["tmtimen.h5", "tmtimeo.h5"] {
-        let f = File::open(&format!("{REF_DIR}/{name}")).unwrap();
+        let f = File::open(format!("{REF_DIR}/{name}")).unwrap();
         assert_ne!(member_count(&f).unwrap(), 0, "{name} has no members");
     }
 }
 
 #[test]
 fn t11b_old_array() {
-    let f = File::open(&format!("{REF_DIR}/tarrold.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/tarrold.h5")).unwrap();
     assert_ne!(member_count(&f).unwrap(), 0);
 }
 
@@ -153,7 +153,7 @@ fn t11c_filespace_strategies() {
         "fsm_aggr_persist.h5",
         "aggr.h5",
     ] {
-        let f = File::open(&format!("{REF_DIR}/{name}")).unwrap();
+        let f = File::open(format!("{REF_DIR}/{name}")).unwrap();
         let sb = f.superblock();
         println!(
             "{name}: sb_version={}, sizeof_addr={}, sizeof_size={}",
@@ -166,7 +166,7 @@ fn t11c_filespace_strategies() {
 
 #[test]
 fn t11d_deflate_reference() {
-    let f = File::open(&format!("{REF_DIR}/deflate.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/deflate.h5")).unwrap();
     let mut names = Vec::new();
     f.member_names_into(&mut names).unwrap();
     let root = f.root_group().unwrap();
@@ -187,6 +187,6 @@ fn t11d_deflate_reference() {
 
 #[test]
 fn t11e_charsets() {
-    let f = File::open(&format!("{REF_DIR}/charsets.h5")).unwrap();
+    let f = File::open(format!("{REF_DIR}/charsets.h5")).unwrap();
     assert_ne!(member_count(&f).unwrap(), 0);
 }

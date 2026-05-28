@@ -104,6 +104,15 @@ fn impl_struct(
                 }
                 let inner_ty = &fields[0].ty;
                 return quote! {
+                    fn has_padding() -> bool {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::has_padding()
+                    }
+                    fn requires_validation() -> bool {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::requires_validation()
+                    }
+                    fn validate_bytes(bytes: &[u8]) -> ::hdf5_pure_rust::Result<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::validate_bytes(bytes)
+                    }
                     fn visit_compound_fields<F>(visitor: F) -> Option<()>
                     where
                         F: FnMut(::hdf5_pure_rust::hl::types::FieldDescriptor),
@@ -134,8 +143,43 @@ fn impl_struct(
                 .collect();
             let field_idents: Vec<_> = fields.iter().map(|f| f.ident.clone().unwrap()).collect();
             let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
+            let field_idents_for_padding = field_idents.clone();
+            let field_types_for_padding = field_types.clone();
+            let field_idents_for_validation = field_idents.clone();
+            let field_types_for_validation = field_types.clone();
 
             quote! {
+                fn has_padding() -> bool {
+                    let mut cursor = 0usize;
+                    let mut padded = false;
+                    #(
+                        let offset = ::std::mem::offset_of!(#ty #ty_generics, #field_idents_for_padding);
+                        padded |= offset != cursor;
+                        cursor = offset + <#field_types_for_padding as ::hdf5_pure_rust::H5Type>::type_size();
+                        padded |= <#field_types_for_padding as ::hdf5_pure_rust::H5Type>::has_padding();
+                    )*
+                    padded || cursor != ::std::mem::size_of::<#ty #ty_generics>()
+                }
+                fn requires_validation() -> bool {
+                    false #(|| <#field_types_for_validation as ::hdf5_pure_rust::H5Type>::requires_validation())*
+                }
+                fn validate_bytes(bytes: &[u8]) -> ::hdf5_pure_rust::Result<()> {
+                    if bytes.len() != ::std::mem::size_of::<#ty #ty_generics>() {
+                        return Err(::hdf5_pure_rust::Error::InvalidFormat(format!(
+                            "byte count {} does not match element size {}",
+                            bytes.len(),
+                            ::std::mem::size_of::<#ty #ty_generics>()
+                        )));
+                    }
+                    #(
+                        let offset = ::std::mem::offset_of!(#ty #ty_generics, #field_idents_for_validation);
+                        let size = <#field_types_for_validation as ::hdf5_pure_rust::H5Type>::type_size();
+                        <#field_types_for_validation as ::hdf5_pure_rust::H5Type>::validate_bytes(
+                            &bytes[offset..offset + size],
+                        )?;
+                    )*
+                    Ok(())
+                }
                 fn compound_fields_into(out: &mut Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>) -> Option<()> {
                     out.clear();
                     let origin = ::std::mem::MaybeUninit::<#ty #ty_generics>::uninit();
@@ -243,8 +287,43 @@ fn impl_struct(
                 .collect();
             let field_indices: Vec<Index> = fields.iter().map(|(i, _)| Index::from(*i)).collect();
             let field_types: Vec<_> = fields.iter().map(|(_, f)| &f.ty).collect();
+            let field_indices_for_padding = field_indices.clone();
+            let field_types_for_padding = field_types.clone();
+            let field_indices_for_validation = field_indices.clone();
+            let field_types_for_validation = field_types.clone();
 
             quote! {
+                fn has_padding() -> bool {
+                    let mut cursor = 0usize;
+                    let mut padded = false;
+                    #(
+                        let offset = ::std::mem::offset_of!(#ty #ty_generics, #field_indices_for_padding);
+                        padded |= offset != cursor;
+                        cursor = offset + <#field_types_for_padding as ::hdf5_pure_rust::H5Type>::type_size();
+                        padded |= <#field_types_for_padding as ::hdf5_pure_rust::H5Type>::has_padding();
+                    )*
+                    padded || cursor != ::std::mem::size_of::<#ty #ty_generics>()
+                }
+                fn requires_validation() -> bool {
+                    false #(|| <#field_types_for_validation as ::hdf5_pure_rust::H5Type>::requires_validation())*
+                }
+                fn validate_bytes(bytes: &[u8]) -> ::hdf5_pure_rust::Result<()> {
+                    if bytes.len() != ::std::mem::size_of::<#ty #ty_generics>() {
+                        return Err(::hdf5_pure_rust::Error::InvalidFormat(format!(
+                            "byte count {} does not match element size {}",
+                            bytes.len(),
+                            ::std::mem::size_of::<#ty #ty_generics>()
+                        )));
+                    }
+                    #(
+                        let offset = ::std::mem::offset_of!(#ty #ty_generics, #field_indices_for_validation);
+                        let size = <#field_types_for_validation as ::hdf5_pure_rust::H5Type>::type_size();
+                        <#field_types_for_validation as ::hdf5_pure_rust::H5Type>::validate_bytes(
+                            &bytes[offset..offset + size],
+                        )?;
+                    )*
+                    Ok(())
+                }
                 fn compound_fields_into(out: &mut Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>) -> Option<()> {
                     out.clear();
                     let origin = ::std::mem::MaybeUninit::<#ty #ty_generics>::uninit();
@@ -318,8 +397,33 @@ fn impl_enum(_ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> TokenStr
         .collect();
     let repr_iter_visit = std::iter::repeat(&repr);
     let repr_iter_into = std::iter::repeat(&repr);
+    let repr_validate = &repr;
+    let values_for_validation = values.clone();
 
     quote! {
+        fn requires_validation() -> bool {
+            true
+        }
+        fn validate_bytes(bytes: &[u8]) -> ::hdf5_pure_rust::Result<()> {
+            const SIZE: usize = ::std::mem::size_of::<#repr_validate>();
+            if bytes.len() != SIZE {
+                return Err(::hdf5_pure_rust::Error::InvalidFormat(format!(
+                    "byte count {} does not match enum size {}",
+                    bytes.len(),
+                    SIZE
+                )));
+            }
+            let mut raw = [0u8; SIZE];
+            raw.copy_from_slice(bytes);
+            let value = <#repr_validate>::from_ne_bytes(raw);
+            if false #(|| value == (#values_for_validation) as #repr_validate)* {
+                Ok(())
+            } else {
+                Err(::hdf5_pure_rust::Error::InvalidFormat(
+                    "enum value does not match any declared variant".into(),
+                ))
+            }
+        }
         fn visit_enum_members<F>(mut visitor: F) -> Option<()>
         where
             F: FnMut(&str, i64),

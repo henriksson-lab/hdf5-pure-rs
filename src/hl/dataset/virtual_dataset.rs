@@ -586,6 +586,7 @@ impl Dataset {
         Ok(dirs)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn populate_virtual_dataset_output(
         mappings: Vec<VirtualMapping>,
         file_path: Option<&Path>,
@@ -596,7 +597,7 @@ impl Dataset {
         output: &mut [u8],
         source_cache: &mut VirtualSourceCache,
     ) -> Result<()> {
-        let virtual_strides = Self::row_major_strides(&output_dims)?;
+        let virtual_strides = Self::row_major_strides(output_dims)?;
 
         for mapping in mappings {
             let (source_info, source_raw) =
@@ -762,9 +763,9 @@ impl Dataset {
         if output_dims.iter().all(|&dim| dim != 0) && !has_unlimited_dims {
             return Ok(output_dims);
         }
-        for dim in 0..output_dims.len() {
+        for (dim, output_dim) in output_dims.iter_mut().enumerate() {
             if Self::is_unlimited_vds_dim(info, dim) {
-                output_dims[dim] = 0;
+                *output_dim = 0;
             }
         }
         let mut unlimited_extents: Vec<Option<(u64, u64)>> = vec![None; output_dims.len()];

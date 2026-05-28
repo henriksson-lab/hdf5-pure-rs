@@ -125,7 +125,7 @@ impl MutableFile {
         if new_dims.len() != info.dataspace.dims.len() || chunk_dims.len() != new_dims.len() {
             return Ok(());
         }
-        if chunk_dims.iter().any(|&dim| dim == 0) {
+        if chunk_dims.contains(&0) {
             return Ok(());
         }
         let old_dims = &info.dataspace.dims;

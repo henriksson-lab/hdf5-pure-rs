@@ -176,6 +176,12 @@ impl ExtensibleArray {
     }
 }
 
+impl Default for ExtensibleArray {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensibleArrayCreateParams {
     pub raw_element_size: usize,

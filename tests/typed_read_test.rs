@@ -271,6 +271,29 @@ fn test_h5type_output_helpers_clear_when_unsupported() {
 }
 
 #[test]
+fn test_bytes_to_vec_copies_when_vec_u8_layout_differs_from_target() {
+    let bytes = vec![1u8, 0, 0, 0, 2, 0, 0, 0];
+    let input_ptr = bytes.as_ptr();
+    let input_was_aligned = (input_ptr as usize).is_multiple_of(std::mem::align_of::<u32>());
+
+    let values = hdf5_pure_rust::hl::types::bytes_to_vec::<u32>(bytes).unwrap();
+    assert_eq!(values, vec![1, 2]);
+    if input_was_aligned {
+        assert_ne!(values.as_ptr() as *const u8, input_ptr);
+    }
+}
+
+#[test]
+fn test_bytes_to_vec_reuses_layout_identical_one_byte_buffer() {
+    let bytes = vec![1u8, 2, 3];
+    let input_ptr = bytes.as_ptr();
+
+    let values = hdf5_pure_rust::hl::types::bytes_to_vec::<u8>(bytes).unwrap();
+    assert_eq!(values, vec![1, 2, 3]);
+    assert_eq!(values.as_ptr(), input_ptr);
+}
+
+#[test]
 fn test_read_chunked_typed() {
     let f = File::open("tests/data/datasets_v0.h5").unwrap();
     let ds = f.dataset("chunked").unwrap();

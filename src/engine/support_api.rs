@@ -1,12 +1,15 @@
 #![allow(dead_code, non_snake_case)]
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Condvar, Mutex, Once};
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::engine::free_list::{FreeListManager, FreeListStats};
@@ -14,6 +17,11 @@ use crate::error::{Error, Result};
 
 static LIBRARY_OPEN: AtomicBool = AtomicBool::new(false);
 static LIBRARY_TERMINATING: AtomicBool = AtomicBool::new(false);
+static NEXT_TLS_KEY: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    static TLS_VALUES: RefCell<HashMap<usize, Box<dyn Any>>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Debug, Clone)]
 pub struct H5Timer {
@@ -33,7 +41,12 @@ impl Default for H5Timer {
 
 #[derive(Debug, Default)]
 pub struct H5TsMutex {
-    locked: Mutex<bool>,
+    state: Mutex<H5TsMutexState>,
+}
+
+#[derive(Debug, Default)]
+struct H5TsMutexState {
+    owner: Option<ThreadId>,
 }
 
 #[derive(Debug, Default)]
@@ -49,8 +62,14 @@ pub struct H5TsSemaphore {
 
 #[derive(Debug, Default)]
 pub struct H5TsRwLock {
-    state: Mutex<(usize, bool)>,
+    state: Mutex<H5TsRwLockState>,
     cond: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct H5TsRwLockState {
+    readers: HashMap<ThreadId, usize>,
+    writer: Option<ThreadId>,
 }
 
 /// Returns an `Unsupported` error stub for platform/MPI features not implemented in pure-Rust mode.
@@ -153,6 +172,10 @@ pub fn H5_buffer_dump(bytes: &[u8]) -> String {
 }
 
 /// Acquire the global API lock; no-op in pure-Rust mode.
+///
+/// The original C library can serialize every public API entry through a process-wide lock.
+/// This translation uses Rust synchronization on the shared data structures instead, so this
+/// compatibility hook intentionally has no separate unlockable global state.
 pub fn H5TS_api_lock() {}
 
 /// Compute bandwidth in bytes/second from a transfer size and elapsed time.
@@ -360,12 +383,12 @@ pub fn H5MM_xfree(bytes: Vec<u8>) {
     H5free_memory(bytes);
 }
 
-/// Return whether the library was built thread-safe.
+/// Return whether the libhdf5-style global thread-safety runtime is available.
 pub fn H5is_library_threadsafe() -> bool {
-    true
+    false
 }
 
-/// Return whether the library was built thread-safe through a libhdf5-style out parameter.
+/// Return whether the libhdf5-style global thread-safety runtime is available.
 pub fn H5is_library_threadsafe_into(is_threadsafe: &mut bool) {
     *is_threadsafe = H5is_library_threadsafe();
 }
@@ -421,13 +444,25 @@ pub fn H5TS_mutex_init() -> H5TsMutex {
 
 /// Attempt to lock a mutex without blocking; returns whether the lock was acquired.
 pub fn H5TS_mutex_trylock(mutex: &H5TsMutex) -> bool {
-    if let Ok(mut locked) = mutex.locked.try_lock() {
-        if !*locked {
-            *locked = true;
+    let current = thread::current().id();
+    if let Ok(mut state) = mutex.state.try_lock() {
+        if state.owner.is_none() {
+            state.owner = Some(current);
             return true;
         }
     }
     false
+}
+
+/// Release a thread-safety mutex acquired by `H5TS_mutex_trylock`.
+pub fn H5TS_mutex_unlock(mutex: &H5TsMutex) {
+    let current = thread::current().id();
+    let mut state = mutex.state.lock().expect("mutex poisoned");
+    match state.owner {
+        Some(owner) if owner == current => state.owner = None,
+        Some(_) => panic!("mutex unlocked from a non-owning thread"),
+        None => panic!("mutex unlocked while not locked"),
+    }
 }
 
 /// Destroy a thread-safety mutex.
@@ -485,37 +520,47 @@ pub fn H5TS_rwlock_destroy(_lock: H5TsRwLock) {}
 
 /// Acquire a shared (read) lock, blocking while a writer holds the lock.
 pub fn H5TS_rwlock_rdlock(lock: &H5TsRwLock) {
+    let current = thread::current().id();
     let mut state = lock.state.lock().expect("rwlock poisoned");
-    while state.1 {
+    while state.writer.is_some() {
         state = lock.cond.wait(state).expect("rwlock wait poisoned");
     }
-    state.0 = state.0.saturating_add(1);
+    *state.readers.entry(current).or_insert(0) += 1;
 }
 
 /// Release a shared (read) lock, waking waiting writers when the last reader exits.
 pub fn H5TS_rwlock_rdunlock(lock: &H5TsRwLock) {
-    if let Ok(mut state) = lock.state.lock() {
-        state.0 = state.0.saturating_sub(1);
-        if state.0 == 0 {
-            lock.cond.notify_all();
-        }
+    let current = thread::current().id();
+    let mut state = lock.state.lock().expect("rwlock poisoned");
+    let count = state
+        .readers
+        .get_mut(&current)
+        .expect("rwlock read-unlocked by a thread without a read lock");
+    *count -= 1;
+    if *count == 0 {
+        state.readers.remove(&current);
+    }
+    if state.readers.is_empty() {
+        lock.cond.notify_all();
     }
 }
 
 /// Acquire an exclusive (write) lock, blocking while any readers or another writer hold it.
 pub fn H5TS_rwlock_wrlock(lock: &H5TsRwLock) {
+    let current = thread::current().id();
     let mut state = lock.state.lock().expect("rwlock poisoned");
-    while state.1 || state.0 != 0 {
+    while state.writer.is_some() || !state.readers.is_empty() {
         state = lock.cond.wait(state).expect("rwlock wait poisoned");
     }
-    state.1 = true;
+    state.writer = Some(current);
 }
 
 /// Try to acquire an exclusive write lock without blocking.
 pub fn H5TS_rwlock_trywrlock(lock: &H5TsRwLock) -> bool {
+    let current = thread::current().id();
     if let Ok(mut state) = lock.state.try_lock() {
-        if !state.1 && state.0 == 0 {
-            state.1 = true;
+        if state.writer.is_none() && state.readers.is_empty() {
+            state.writer = Some(current);
             return true;
         }
     }
@@ -524,28 +569,44 @@ pub fn H5TS_rwlock_trywrlock(lock: &H5TsRwLock) -> bool {
 
 /// Release an exclusive (write) lock and notify all waiters.
 pub fn H5TS_rwlock_wrunlock(lock: &H5TsRwLock) {
-    if let Ok(mut state) = lock.state.lock() {
-        state.1 = false;
-        lock.cond.notify_all();
+    let current = thread::current().id();
+    let mut state = lock.state.lock().expect("rwlock poisoned");
+    match state.writer {
+        Some(owner) if owner == current => {
+            state.writer = None;
+            lock.cond.notify_all();
+        }
+        Some(_) => panic!("rwlock write-unlocked from a non-owning thread"),
+        None => panic!("rwlock write-unlocked while not write-locked"),
     }
 }
 
 /// Create a thread-local key.
 pub fn H5TS_key_create() -> usize {
-    0
+    NEXT_TLS_KEY.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 /// Delete a thread-local key.
-pub fn H5TS_key_delete(_key: usize) {}
+pub fn H5TS_key_delete(key: usize) {
+    TLS_VALUES.with(|values| {
+        values.borrow_mut().remove(&key);
+    });
+}
 
-/// Store a thread-local value under the given key.
-pub fn H5TS_key_set_value<T>(_key: usize, value: T) -> T {
+/// Mark the current thread as having a value for the given compatibility key.
+///
+/// The compatibility getter below exposes only presence because its historical Rust wrapper
+/// returns `Option<()>`; typed TLS access lives in `threading::TsKey`.
+pub fn H5TS_key_set_value<T: 'static>(key: usize, value: T) -> T {
+    TLS_VALUES.with(|values| {
+        values.borrow_mut().insert(key, Box::new(()));
+    });
     value
 }
 
 /// Retrieve the thread-local value associated with the given key.
-pub fn H5TS_key_get_value(_key: usize) -> Option<()> {
-    None
+pub fn H5TS_key_get_value(key: usize) -> Option<()> {
+    TLS_VALUES.with(|values| values.borrow().contains_key(&key).then_some(()))
 }
 
 /// Create a thread pool; intentionally unsupported in pure-Rust mode.
@@ -1053,6 +1114,51 @@ mod tests {
         H5close();
         H5is_library_terminating_into(&mut is_terminating);
         assert!(is_terminating);
+    }
+
+    #[test]
+    fn support_thread_wrappers_track_mutex_rwlock_and_tls_state() {
+        let mutex = H5TS_mutex_init();
+        assert!(H5TS_mutex_trylock(&mutex));
+        assert!(!H5TS_mutex_trylock(&mutex));
+        H5TS_mutex_unlock(&mutex);
+        assert!(H5TS_mutex_trylock(&mutex));
+        H5TS_mutex_unlock(&mutex);
+
+        let lock = H5TS_rwlock_init();
+        H5TS_rwlock_rdlock(&lock);
+        assert!(!H5TS_rwlock_trywrlock(&lock));
+        H5TS_rwlock_rdunlock(&lock);
+        assert!(H5TS_rwlock_trywrlock(&lock));
+        H5TS_rwlock_wrunlock(&lock);
+
+        let key = H5TS_key_create();
+        assert_eq!(H5TS_key_get_value(key), None);
+        assert_eq!(H5TS_key_set_value(key, "value"), "value");
+        assert_eq!(H5TS_key_get_value(key), Some(()));
+        H5TS_key_delete(key);
+        assert_eq!(H5TS_key_get_value(key), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "mutex unlocked while not locked")]
+    fn support_mutex_unlock_without_lock_panics() {
+        let mutex = H5TS_mutex_init();
+        H5TS_mutex_unlock(&mutex);
+    }
+
+    #[test]
+    #[should_panic(expected = "rwlock read-unlocked by a thread without a read lock")]
+    fn support_rwlock_read_unlock_without_lock_panics() {
+        let lock = H5TS_rwlock_init();
+        H5TS_rwlock_rdunlock(&lock);
+    }
+
+    #[test]
+    #[should_panic(expected = "rwlock write-unlocked while not write-locked")]
+    fn support_rwlock_write_unlock_without_lock_panics() {
+        let lock = H5TS_rwlock_init();
+        H5TS_rwlock_wrunlock(&lock);
     }
 
     #[test]

@@ -140,7 +140,7 @@ fn test_write_multiple_datasets() {
         w.begin().unwrap();
         w.create_root_group().unwrap();
 
-        let f64_data: Vec<u8> = vec![1.0f64, 2.0, 3.0]
+        let f64_data: Vec<u8> = [1.0f64, 2.0, 3.0]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
@@ -156,7 +156,7 @@ fn test_write_multiple_datasets() {
         )
         .unwrap();
 
-        let i32_data: Vec<u8> = vec![10i32, 20, 30, 40]
+        let i32_data: Vec<u8> = [10i32, 20, 30, 40]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
@@ -483,7 +483,7 @@ fn test_write_readable_by_h5dump() {
         w.begin().unwrap();
         w.create_root_group().unwrap();
 
-        let data: Vec<u8> = vec![1.0f64, 2.0, 3.0]
+        let data: Vec<u8> = [1.0f64, 2.0, 3.0]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();

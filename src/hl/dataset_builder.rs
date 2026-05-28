@@ -4,7 +4,7 @@ use crate::engine::writer::{
     ChunkWriteSpec, CompoundFieldSpec, DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
 };
 use crate::error::{Error, Result};
-use crate::hl::types::{slice_as_bytes, H5Type, TypeClass};
+use crate::hl::types::{slice_as_bytes, slice_as_bytes_checked, H5Type, TypeClass};
 
 /// Builder for creating datasets with a fluent API.
 pub struct DatasetBuilder<'a> {
@@ -160,7 +160,7 @@ impl<'a> DatasetBuilder<'a> {
             name: name.to_string(),
             shape: Vec::new(),
             dtype,
-            data: slice_as_bytes(std::slice::from_ref(&value)).to_vec(),
+            data: slice_as_bytes_checked(std::slice::from_ref(&value))?.to_vec(),
         })?;
         Ok(self)
     }
@@ -172,7 +172,7 @@ impl<'a> DatasetBuilder<'a> {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = slice_as_bytes(values);
+        let data = slice_as_bytes_checked(values)?;
         debug_assert_eq!(data.len(), byte_len);
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
@@ -258,7 +258,7 @@ impl<'a> DatasetBuilder<'a> {
         let max_shape =
             Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
 
-        let data_bytes = slice_as_bytes(data);
+        let data_bytes = slice_as_bytes_checked(data)?;
 
         let spec = DatasetSpec {
             name: &self.name,
@@ -299,19 +299,13 @@ impl<'a> DatasetBuilder<'a> {
                     attrs,
                 )
             })?;
+        } else if self.attrs.is_empty() {
+            self.writer
+                .create_dataset_with_fill(&self.parent, &spec, fill)?;
         } else {
-            if self.attrs.is_empty() {
-                self.writer
-                    .create_dataset_with_fill(&self.parent, &spec, fill)?;
-            } else {
-                let attrs = collect_attr_specs(&self.attrs);
-                self.writer.create_dataset_with_attrs_and_fill(
-                    &self.parent,
-                    &spec,
-                    &attrs,
-                    fill,
-                )?;
-            }
+            let attrs = collect_attr_specs(&self.attrs);
+            self.writer
+                .create_dataset_with_attrs_and_fill(&self.parent, &spec, &attrs, fill)?;
         }
 
         Ok(())
@@ -411,11 +405,13 @@ impl<'a> DatasetBuilder<'a> {
             .collect();
         let byte_chunks: Vec<ChunkWriteSpec<'_>> = owned_chunks
             .iter()
-            .map(|(coords, data)| ChunkWriteSpec {
-                coords,
-                data: slice_as_bytes(*data),
+            .map(|(coords, data)| {
+                Ok(ChunkWriteSpec {
+                    coords,
+                    data: slice_as_bytes_checked(data)?,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         let spec = DatasetSpec {
             name: &self.name,
@@ -454,7 +450,7 @@ impl<'a> DatasetBuilder<'a> {
                 "dataset datatype size must be nonzero".into(),
             ));
         }
-        if data.len() % dtype_size != 0 {
+        if !data.len().is_multiple_of(dtype_size) {
             return Err(Error::InvalidFormat(format!(
                 "raw dataset byte length {} is not a multiple of datatype size {dtype_size}",
                 data.len()
@@ -563,7 +559,7 @@ impl<'a> DatasetBuilder<'a> {
             self.alloc_time,
             self.fill_time,
         )?;
-        let data_bytes = slice_as_bytes(std::slice::from_ref(&value));
+        let data_bytes = slice_as_bytes_checked(std::slice::from_ref(&value))?;
 
         let spec = DatasetSpec {
             name: &self.name,

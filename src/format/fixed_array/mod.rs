@@ -183,6 +183,12 @@ impl FixedArray {
     }
 }
 
+impl Default for FixedArray {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedArrayCreateParams {
     pub raw_element_size: usize,

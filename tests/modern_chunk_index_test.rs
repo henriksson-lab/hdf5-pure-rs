@@ -126,6 +126,29 @@ fn test_v4_fixed_array_chunks_read() {
 }
 
 #[test]
+fn test_v4_fixed_array_chunk_info_offsets_are_dataset_offsets() {
+    let f = File::open("tests/data/hdf5_ref/v4_fixed_array_chunks.h5").unwrap();
+    let ds = f.dataset("fixed_array").unwrap();
+    let info = ds.info().unwrap();
+    let chunk = info.layout.chunk_dims.as_ref().unwrap()[0];
+    let expected = (0..info.dataspace.dims[0])
+        .step_by(chunk as usize)
+        .map(|offset| vec![offset])
+        .collect::<Vec<_>>();
+
+    let mut chunks = Vec::new();
+    ds.chunk_infos_into(&mut chunks).unwrap();
+    chunks.sort_by_key(|chunk| chunk.offset.clone());
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.offset.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
 fn test_v4_fixed_array_deflate_parallel_threshold_tail_read() {
     const CHUNK: usize = 2048;
     const LEN: usize = CHUNK * 8 + 17;
@@ -414,6 +437,29 @@ fn test_v4_extensible_array_chunks_read() {
         &(0..80).map(|v| v as f64).collect::<Vec<_>>(),
     )
     .unwrap();
+}
+
+#[test]
+fn test_v4_extensible_array_chunk_info_offsets_are_dataset_offsets() {
+    let f = File::open("tests/data/hdf5_ref/v4_extensible_array_chunks.h5").unwrap();
+    let ds = f.dataset("extensible_array").unwrap();
+    let info = ds.info().unwrap();
+    let chunk = info.layout.chunk_dims.as_ref().unwrap()[0];
+    let expected = (0..info.dataspace.dims[0])
+        .step_by(chunk as usize)
+        .map(|offset| vec![offset])
+        .collect::<Vec<_>>();
+
+    let mut chunks = Vec::new();
+    ds.chunk_infos_into(&mut chunks).unwrap();
+    chunks.sort_by_key(|chunk| chunk.offset.clone());
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.offset.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[test]

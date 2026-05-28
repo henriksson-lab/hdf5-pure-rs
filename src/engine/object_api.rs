@@ -660,18 +660,10 @@ pub fn H5O_msg_iterate(header: &ObjectHeaderState) -> impl Iterator<Item = &Obje
 /// Iterate over the entries of an object.
 #[allow(non_snake_case)]
 pub fn H5O__msg_iterate_real(header: &ObjectHeaderState) -> impl Iterator<Item = &ObjectMessage> {
-    let mut sequence = 0usize;
     header
         .messages
         .iter()
-        .enumerate()
-        .filter_map(move |(_idx, message)| {
-            if matches!(message.msg_type, 0 | 0xffff | 0x001a) {
-                return None;
-            }
-            sequence = sequence.saturating_add(1);
-            Some(message)
-        })
+        .filter(|message| !matches!(message.msg_type, 0 | 0xffff | 0x001a))
 }
 
 /// Object operation: msg raw size.
@@ -989,9 +981,7 @@ pub fn H5O__cache_get_final_load_size(image: &[u8]) -> usize {
             Ok(value) => value as usize,
             Err(_) => return image.len(),
         };
-        16usize
-            .checked_add(chunk_size)
-            .unwrap_or_else(|| image.len())
+        16usize.checked_add(chunk_size).unwrap_or(image.len())
     } else {
         image.len()
     }
@@ -2564,11 +2554,7 @@ pub fn H5O__stab_size_with_size(stab: &SymbolTableMessage, sizeof_addr: u8) -> R
 
 /// Free an object's in-memory resources.
 #[allow(non_snake_case)]
-pub fn H5O__stab_free(mut stab: SymbolTableMessage) {
-    stab.btree_addr = u64::MAX;
-    stab.heap_addr = u64::MAX;
-    drop(stab);
-}
+pub fn H5O__stab_free(_stab: SymbolTableMessage) {}
 
 /// Delete an object.
 #[allow(non_snake_case)]
@@ -2887,7 +2873,7 @@ pub fn H5Ovisit3_refs(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<&str
     ordered.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.1.cmp(right.1))
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| right.3.cmp(&left.3))
             .then_with(|| right.4.cmp(&left.4))
@@ -3270,13 +3256,7 @@ pub fn H5O__mdci_size(message: &MetadataCacheImageMessage) -> usize {
 
 /// Free an object's in-memory resources.
 #[allow(non_snake_case)]
-pub fn H5O__mdci_free(mut message: MetadataCacheImageMessage) {
-    message.addr = u64::MAX;
-    message.size = 0;
-    message.sizeof_addr = 0;
-    message.sizeof_size = 0;
-    drop(message);
-}
+pub fn H5O__mdci_free(_message: MetadataCacheImageMessage) {}
 
 /// Delete an object.
 #[allow(non_snake_case)]
@@ -3693,8 +3673,7 @@ pub fn H5O__eliminate_gap(header: &mut ObjectHeaderState) {
 /// Allocate storage for an object.
 #[allow(non_snake_case)]
 pub fn H5O__alloc_null(size: usize) -> ObjectMessage {
-    let mut data = Vec::with_capacity(size);
-    data.resize(size, 0);
+    let data = vec![0; size];
     ObjectMessage {
         msg_type: 0,
         flags: 0,
@@ -3781,9 +3760,7 @@ pub fn H5O__alloc_extend_chunk(header: &mut ObjectHeaderState, size: usize) {
 /// Allocate storage for an object.
 #[allow(non_snake_case)]
 pub fn H5O__alloc_new_chunk(size: usize) -> Vec<u8> {
-    let mut chunk = Vec::with_capacity(size);
-    chunk.resize(size, 0);
-    chunk
+    vec![0; size]
 }
 
 /// Allocate storage for an object.
@@ -3978,7 +3955,7 @@ pub fn H5O__move_msgs_forward(header: &mut ObjectHeaderState) {
                 split_null.flags = 0;
                 split_null.shared = false;
                 header.messages.insert(null_idx + 1, split_null);
-                let adjusted_msg_idx = if msg_idx >= null_idx + 1 {
+                let adjusted_msg_idx = if msg_idx > null_idx {
                     msg_idx + 1
                 } else {
                     msg_idx
@@ -4106,13 +4083,7 @@ pub fn H5O__alloc_shrink_chunk(header: &mut ObjectHeaderState) {
     let before = header.messages.len();
     H5O__move_msgs_forward(header);
     H5O__merge_null(header);
-    header.messages.retain(|message| {
-        if message.msg_type == 0 {
-            !message.data.is_empty()
-        } else {
-            !message.data.is_empty()
-        }
-    });
+    header.messages.retain(|message| !message.data.is_empty());
     if header.messages.len() != before {
         H5O__chunk_update_idx(header);
     }
@@ -4120,10 +4091,9 @@ pub fn H5O__alloc_shrink_chunk(header: &mut ObjectHeaderState) {
         .messages
         .last()
         .is_some_and(|message| message.msg_type == 0)
+        && header.messages.iter().any(|message| message.msg_type != 0)
     {
-        if header.messages.iter().any(|message| message.msg_type != 0) {
-            header.flush_disabled = false;
-        }
+        header.flush_disabled = false;
     }
     header.messages.shrink_to_fit();
     header.flush_disabled = false;
@@ -4185,8 +4155,7 @@ pub fn H5O__mtime_encode(timestamp: u64) -> Vec<u8> {
 /// Return a deep copy of an object.
 #[allow(non_snake_case)]
 pub fn H5O__mtime_copy(timestamp: u64) -> u64 {
-    let copied = timestamp;
-    copied
+    timestamp
 }
 
 /// Object operation: mtime new size.
@@ -4833,7 +4802,7 @@ pub fn H5O__pline_decode(bytes: &[u8]) -> Result<FilterPipelineMessage> {
                 let name_len =
                     read_le_uint_cursor(bytes, &mut pos, 2, "filter pipeline v1 name length")?
                         as usize;
-                if name_len % 8 != 0 {
+                if !name_len.is_multiple_of(8) {
                     return Err(Error::InvalidFormat(format!(
                         "filter pipeline v1 name length {name_len} is not a multiple of eight"
                     )));
@@ -4893,7 +4862,7 @@ pub fn H5O__pline_decode(bytes: &[u8]) -> Result<FilterPipelineMessage> {
                         "filter pipeline v1 client data",
                     )? as u32);
                 }
-                if cd_nelmts % 2 != 0 {
+                if !cd_nelmts.is_multiple_of(2) {
                     let padding_end =
                         checked_add(pos, 4, "filter pipeline v1 client data padding")?;
                     if bytes.get(pos..padding_end).is_none() {
@@ -5781,9 +5750,11 @@ pub fn H5O_get_native_info(header: &ObjectHeaderState) -> ObjectInfo {
 /// Return native-specific info about an object.
 #[allow(non_snake_case)]
 pub fn H5Oget_native_info(header: &ObjectHeaderState) -> ObjectInfo {
-    let mut info = ObjectInfo::default();
-    info.addr = header.addr;
-    info.refcount = header.refcount;
+    let mut info = ObjectInfo {
+        addr: header.addr,
+        refcount: header.refcount,
+        ..Default::default()
+    };
     let mut msg_count = 0usize;
     let mut has_checksum = false;
     for message in &header.messages {
@@ -6557,14 +6528,7 @@ pub fn H5O__ginfo_size(info: &GroupInfoMessage) -> Result<usize> {
 
 /// Free an object's in-memory resources.
 #[allow(non_snake_case)]
-pub fn H5O__ginfo_free(mut info: GroupInfoMessage) {
-    info.version = 0;
-    info.max_compact = None;
-    info.min_dense = None;
-    info.estimated_entries = None;
-    info.estimated_name_len = None;
-    drop(info);
-}
+pub fn H5O__ginfo_free(_info: GroupInfoMessage) {}
 
 /// Return a debug-friendly representation of an object.
 #[allow(non_snake_case)]
@@ -6675,7 +6639,7 @@ pub fn H5O__attr_update_shared(message: &mut ObjectMessage, shared: bool) {
     if message.msg_type != 0x000c {
         return;
     }
-    if message.data.is_empty() || !message.data.iter().any(|byte| *byte == 0) {
+    if message.data.is_empty() || !message.data.contains(&0) {
         message.shared = false;
         message.flags &= !0x02;
         return;
@@ -6840,7 +6804,7 @@ pub fn H5O_attr_iterate_real_refs(header: &ObjectHeaderState) -> Vec<&ObjectMess
     let mut attrs: Vec<&ObjectMessage> = header
         .messages
         .iter()
-        .filter(|msg| msg.msg_type == 0x000c && msg.data.iter().any(|byte| *byte == 0))
+        .filter(|msg| msg.msg_type == 0x000c && msg.data.contains(&0))
         .map(H5O__attr_open_by_idx_cb_ref)
         .collect();
     attrs.sort_by_key(|msg| msg.creation_index);
@@ -6852,7 +6816,7 @@ pub fn H5O_attr_iterate_real_refs(header: &ObjectHeaderState) -> Vec<&ObjectMess
 pub fn H5O__attr_iterate_refs(header: &ObjectHeaderState) -> Vec<&ObjectMessage> {
     let mut attrs = Vec::new();
     for message in &header.messages {
-        if message.msg_type == 0x000c && message.data.iter().any(|byte| *byte == 0) {
+        if message.msg_type == 0x000c && message.data.contains(&0) {
             attrs.push(H5O__attr_open_by_idx_cb_ref(message));
         }
     }
@@ -6868,7 +6832,7 @@ pub fn H5O__attr_remove_update(header: &mut ObjectHeaderState) {
         if message.msg_type != 0x000c {
             continue;
         }
-        if message.data.is_empty() || !message.data.iter().any(|byte| *byte == 0) {
+        if message.data.is_empty() || !message.data.contains(&0) {
             message.flags &= !0x01;
             continue;
         }
@@ -6925,7 +6889,7 @@ pub fn H5O__attr_count_real(header: &ObjectHeaderState) -> usize {
     header
         .messages
         .iter()
-        .filter(|msg| msg.msg_type == 0x000c && msg.data.iter().any(|byte| *byte == 0))
+        .filter(|msg| msg.msg_type == 0x000c && msg.data.contains(&0))
         .count()
 }
 
@@ -7192,7 +7156,7 @@ pub fn H5O__fill_old_size(message: &FillValueMessage) -> Result<usize> {
 #[allow(non_snake_case)]
 pub fn H5O_fill_reset_dyn(message: &mut FillValueMessage) {
     message.version = match message.version {
-        0 | 1 | 2 | 3 => message.version,
+        0..=3 => message.version,
         _ => 2,
     };
     message.alloc_time = 2;
@@ -7205,7 +7169,7 @@ pub fn H5O_fill_reset_dyn(message: &mut FillValueMessage) {
 #[allow(non_snake_case)]
 pub fn H5O__fill_reset(message: &mut FillValueMessage) {
     message.version = match message.version {
-        0 | 1 | 2 | 3 => message.version,
+        0..=3 => message.version,
         _ => 2,
     };
     message.alloc_time = 2;
@@ -7370,7 +7334,7 @@ pub fn H5Ovisit1_refs(objects: &BTreeMap<String, ObjectHeaderState>) -> Vec<&str
     ordered.sort_by(|left, right| {
         left.0
             .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.1.cmp(right.1))
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| right.3.cmp(&left.3))
             .then_with(|| right.4.cmp(&left.4))
@@ -7655,14 +7619,7 @@ pub fn H5O__linfo_size(message: &LinkInfoObjectMessage) -> usize {
 
 /// Free an object's in-memory resources.
 #[allow(non_snake_case)]
-pub fn H5O__linfo_free(mut message: LinkInfoObjectMessage) {
-    message.message.max_creation_index = None;
-    message.message.fractal_heap_addr = u64::MAX;
-    message.message.name_btree_addr = u64::MAX;
-    message.message.corder_btree_addr = None;
-    message.raw_size = 0;
-    drop(message);
-}
+pub fn H5O__linfo_free(_message: LinkInfoObjectMessage) {}
 
 /// Delete an object.
 #[allow(non_snake_case)]
@@ -8137,14 +8094,7 @@ pub fn H5O__ainfo_size(message: &AttributeInfoObjectMessage) -> usize {
 
 /// Free an object's in-memory resources.
 #[allow(non_snake_case)]
-pub fn H5O__ainfo_free(mut message: AttributeInfoObjectMessage) {
-    message.message.max_creation_index = None;
-    message.message.fractal_heap_addr = u64::MAX;
-    message.message.name_btree_addr = u64::MAX;
-    message.message.corder_btree_addr = None;
-    message.raw_size = 0;
-    drop(message);
-}
+pub fn H5O__ainfo_free(_message: AttributeInfoObjectMessage) {}
 
 /// Delete an object.
 #[allow(non_snake_case)]
@@ -8346,7 +8296,7 @@ pub fn H5O__dtype_get_oloc(header: &ObjectHeaderState) -> u64 {
 pub fn H5O__is_attr_dense_test(header: &ObjectHeaderState) -> bool {
     let mut count = 0usize;
     for message in &header.messages {
-        if message.msg_type == 0x000c && message.data.iter().any(|byte| *byte == 0) {
+        if message.msg_type == 0x000c && message.data.contains(&0) {
             count = count.saturating_add(1);
         }
     }
@@ -8387,7 +8337,7 @@ pub fn H5O__num_attrs_test(header: &ObjectHeaderState) -> usize {
         if message.data.is_empty() {
             continue;
         }
-        if message.data.iter().any(|byte| *byte == 0) {
+        if message.data.contains(&0) {
             count = count.saturating_add(1)
         }
     }

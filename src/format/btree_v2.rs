@@ -1211,6 +1211,7 @@ fn decode_internal_node<R: Read + Seek>(
 
 /// Drive the decoded internal-node into the depth-first record stream —
 /// mirrors libhdf5's `H5B2_iterate` for an internal node.
+#[allow(clippy::too_many_arguments)]
 fn visit_internal_records<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &BTreeV2Header,
@@ -1301,6 +1302,7 @@ fn visit_child_records<R: Read + Seek>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_matching_child_records<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &BTreeV2Header,
@@ -1322,6 +1324,7 @@ fn visit_matching_child_records<R: Read + Seek>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_matching_internal_records<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &BTreeV2Header,
@@ -1387,6 +1390,7 @@ fn visit_matching_internal_records<R: Read + Seek>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_matching_leaf_records<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     header: &BTreeV2Header,
@@ -1484,7 +1488,7 @@ fn visit_leaf_records_with_buffer<R: Read + Seek>(
     record.resize(record_size, 0);
     for _ in 0..nrecords {
         image_reader.read_bytes_into(record)?;
-        visit(&record)?;
+        visit(record)?;
     }
     verify_compact_or_padded_node_image(
         reader,

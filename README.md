@@ -138,6 +138,18 @@ remain for compatibility with public `hdf5-metno`-style entry points.
 - Most checked-in C-library reference files parse successfully; the exact count is enforced by tests rather than treated as a general compatibility guarantee.
 - Zero panics on corrupt/malformed files (CVE regression tested)
 
+### Type-safety notes
+
+The raw byte-to-typed-vector conversion path only reuses an input `Vec<u8>`
+allocation for layout-identical one-byte target types; other target layouts copy
+into storage allocated with the target type's layout.
+
+Derived `H5Type` enums validate raw discriminants before exposing Rust enum
+values, and derived compound structs report padding so typed writes can reject
+layouts that would expose uninitialized padding bytes. Primitive numeric types
+and no-padding compounds keep the raw-copy fast path; enum reads and compound
+types containing enum fields add validation before typed values are returned.
+
 ## Benchmark
 
 These numbers are for local development only. They are intended to guide
@@ -145,6 +157,17 @@ translation work and performance regressions, not to make broad claims about
 general HDF5 performance.
 
 Current local read baselines after the recent chunked-read optimizations:
+
+### Local deflate parallelism
+
+For 1D full-prefix reads of deflate-only chunked datasets, this crate may read
+the compressed chunk payloads and decompress multiple chunks on scoped Rust
+worker threads before copying into disjoint output ranges. This is a local CPU
+optimization, not libhdf5 execution-model parity: upstream libhdf5 reads
+filtered chunks through the raw data chunk cache and applies `H5Z_pipeline`
+serially per chunk in a process. The serial libhdf5 behavior remains the
+semantic baseline for filter masks, reverse filter order, fill/missing chunks,
+output placement, and error handling.
 
 1. Large 1D `f64` dataset, `32,000,000` elements, chunked `(1,000,000)`,
    gzip/deflate level `1`, no shuffle:

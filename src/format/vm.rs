@@ -8,11 +8,11 @@ pub fn vector_reduce_product(values: &[u64]) -> Result<u64> {
 }
 
 pub fn vector_zerop_u(values: &[u64]) -> bool {
-    values.iter().any(|&value| value == 0)
+    values.contains(&0)
 }
 
 pub fn vector_zerop_s(values: &[i64]) -> bool {
-    values.iter().any(|&value| value == 0)
+    values.contains(&0)
 }
 
 pub fn vector_cmp_u(lhs: &[u64], rhs: &[u64]) -> std::cmp::Ordering {

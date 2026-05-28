@@ -1,3 +1,25 @@
+#![allow(
+    clippy::bool_assert_comparison,
+    clippy::collapsible_else_if,
+    clippy::explicit_auto_deref,
+    clippy::if_same_then_else,
+    clippy::items_after_test_module,
+    clippy::len_without_is_empty,
+    clippy::manual_contains,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::manual_saturating_arithmetic,
+    clippy::needless_borrow,
+    clippy::needless_range_loop,
+    clippy::needless_return,
+    clippy::new_without_default,
+    clippy::only_used_in_recursion,
+    clippy::ptr_arg,
+    clippy::should_implement_trait,
+    clippy::too_many_arguments,
+    clippy::useless_conversion
+)]
+
 pub mod engine;
 pub mod error;
 pub mod filters;

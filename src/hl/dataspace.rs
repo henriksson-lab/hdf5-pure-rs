@@ -308,7 +308,7 @@ impl Dataspace {
     /// product overflows.
     pub fn npoints_max(&self) -> u64 {
         let dims = self.msg.max_dims.as_ref().unwrap_or(&self.msg.dims);
-        if dims.iter().any(|&dim| dim == u64::MAX) {
+        if dims.contains(&u64::MAX) {
             return u64::MAX;
         }
         if dims.is_empty() {
@@ -365,7 +365,7 @@ impl Dataspace {
     /// Whether any dimension is resizable (has unlimited max dim).
     pub fn is_resizable(&self) -> bool {
         if let Some(maxdims) = &self.msg.max_dims {
-            maxdims.iter().any(|&d| d == u64::MAX)
+            maxdims.contains(&u64::MAX)
         } else {
             false
         }

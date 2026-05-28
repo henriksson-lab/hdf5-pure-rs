@@ -118,7 +118,7 @@ fn t8d_parse_all_reference_ohs() {
     for entry in dir {
         let entry = entry.unwrap();
         let path = entry.path();
-        if !path.extension().map_or(false, |e| e == "h5") {
+        if path.extension().is_none_or(|e| e != "h5") {
             continue;
         }
 

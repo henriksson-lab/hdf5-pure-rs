@@ -119,20 +119,20 @@ pub fn H5M__open_api_common_ref(map: &H5Map) -> Result<&H5Map> {
 }
 
 #[allow(non_snake_case)]
-pub fn H5Mopen_ref<'a>(
-    map: &'a H5Map,
+pub fn H5Mopen_ref(
+    map: &H5Map,
     _loc: impl Into<String>,
     _name: impl Into<String>,
-) -> Result<&'a H5Map> {
+) -> Result<&H5Map> {
     H5M__open_api_common_ref(map)
 }
 
 #[allow(non_snake_case)]
-pub fn H5Mopen_async_ref<'a>(
-    map: &'a H5Map,
+pub fn H5Mopen_async_ref(
+    map: &H5Map,
     loc: impl Into<String>,
     name: impl Into<String>,
-) -> Result<&'a H5Map> {
+) -> Result<&H5Map> {
     H5Mopen_ref(map, loc, name)
 }
 

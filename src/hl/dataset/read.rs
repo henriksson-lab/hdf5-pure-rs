@@ -93,7 +93,7 @@ impl Dataset {
             return self.read_virtual_raw_into_with_info(info, access, out);
         }
 
-        let (element_size, total_elements_usize, total_bytes) = Self::raw_read_size(&info)?;
+        let (element_size, total_elements_usize, total_bytes) = Self::raw_read_size(info)?;
         if out.len() != total_bytes {
             return Err(Error::InvalidFormat(format!(
                 "raw output buffer has {} bytes, expected {total_bytes}",
@@ -135,12 +135,12 @@ impl Dataset {
                             &mut guard.reader,
                             path.as_deref(),
                             access,
-                            &info,
+                            info,
                             out,
                         )?;
                         return Ok(());
                     }
-                    return Self::filled_data_into(total_elements_usize, element_size, &info, out);
+                    return Self::filled_data_into(total_elements_usize, element_size, info, out);
                 }
 
                 if size < total_bytes {
@@ -152,7 +152,7 @@ impl Dataset {
                 guard.reader.read_exact(out)
             }
             LayoutClass::Chunked => {
-                Self::read_chunked_into(&mut guard.reader, &info, total_bytes, out)
+                Self::read_chunked_into(&mut guard.reader, info, total_bytes, out)
             }
             LayoutClass::Virtual => unreachable!("virtual datasets are handled before raw sizing"),
         }
@@ -334,6 +334,7 @@ impl Dataset {
             };
             self.read_raw_into_with_info(&info, access, raw_out)?;
             conversion.convert_bytes_in_place(raw_out);
+            T::validate_byte_slice(raw_out)?;
             unsafe {
                 values.set_len(total_elements);
             }
@@ -415,7 +416,7 @@ impl Dataset {
             )));
         }
 
-        if conversion.is_same_size_bytes() {
+        if conversion.is_same_size_bytes() && !T::requires_validation() {
             let raw_out = crate::hl::types::slice_as_bytes_mut(out);
             self.read_raw_into_with_info(&info, access, raw_out)?;
             conversion.convert_bytes_in_place(raw_out);
@@ -433,6 +434,13 @@ impl Dataset {
         };
         let mut raw = vec![0; total_bytes];
         self.read_raw_into_with_info(&info, access, &mut raw)?;
+        if conversion.is_same_size_bytes() {
+            conversion.convert_bytes_in_place(&mut raw);
+            T::validate_byte_slice(&raw)?;
+            let raw_out = crate::hl::types::slice_as_bytes_mut(out);
+            raw_out.copy_from_slice(&raw);
+            return Ok(());
+        }
         conversion.bytes_into_slice(&raw, out)
     }
 
@@ -472,7 +480,7 @@ impl Dataset {
             )));
         }
 
-        if conversion.is_same_size_bytes() {
+        if conversion.is_same_size_bytes() && !T::requires_validation() {
             let mut value = std::mem::MaybeUninit::<T>::uninit();
             let raw_out = unsafe {
                 std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, T::type_size())
@@ -483,11 +491,20 @@ impl Dataset {
         }
 
         let raw = if info.layout.layout_class == LayoutClass::Virtual {
-            self.read_virtual_raw_with_info(info, access)?
+            let mut raw = self.read_virtual_raw_with_info(info, access)?;
+            if conversion.is_same_size_bytes() {
+                conversion.convert_bytes_in_place(&mut raw);
+                return crate::hl::types::bytes_to_vec::<T>(raw).map(|mut values| values.remove(0));
+            }
+            raw
         } else {
             let (_, _, total_bytes) = Self::raw_read_size(&info)?;
             let mut raw = vec![0; total_bytes];
             self.read_raw_into_with_info(&info, access, &mut raw)?;
+            if conversion.is_same_size_bytes() {
+                conversion.convert_bytes_in_place(&mut raw);
+                return crate::hl::types::bytes_to_vec::<T>(raw).map(|mut values| values.remove(0));
+            }
             raw
         };
         conversion.bytes_to_scalar_from_slice(&raw)
@@ -531,7 +548,7 @@ impl Dataset {
             )));
         }
 
-        if conversion.is_same_size_bytes() {
+        if conversion.is_same_size_bytes() && !T::requires_validation() {
             let output = std::slice::from_mut(out);
             let raw_out = crate::hl::types::slice_as_bytes_mut(output);
             self.read_raw_into_with_info(&info, access, raw_out)?;
@@ -542,6 +559,13 @@ impl Dataset {
         let element_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
         let mut raw = vec![0u8; element_size];
         self.read_raw_into_with_info(&info, access, &mut raw)?;
+        if conversion.is_same_size_bytes() {
+            conversion.convert_bytes_in_place(&mut raw);
+            T::validate_bytes(&raw)?;
+            let raw_out = crate::hl::types::slice_as_bytes_mut(std::slice::from_mut(out));
+            raw_out.copy_from_slice(&raw);
+            return Ok(());
+        }
         conversion.bytes_into_slice(&raw, std::slice::from_mut(out))
     }
 

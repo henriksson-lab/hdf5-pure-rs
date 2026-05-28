@@ -279,10 +279,7 @@ pub fn H5VL__get_connector_by_name<'a>(
 }
 
 #[allow(non_snake_case)]
-pub fn H5VL__get_connector_by_value<'a>(
-    registry: &'a VolRegistry,
-    value: u64,
-) -> Option<&'a VolConnector> {
+pub fn H5VL__get_connector_by_value(registry: &VolRegistry, value: u64) -> Option<&VolConnector> {
     registry
         .connectors
         .values()
@@ -290,10 +287,7 @@ pub fn H5VL__get_connector_by_value<'a>(
 }
 
 #[allow(non_snake_case)]
-pub fn H5VL__get_connector_by_id<'a>(
-    registry: &'a VolRegistry,
-    id: u64,
-) -> Option<&'a VolConnector> {
+pub fn H5VL__get_connector_by_id(registry: &VolRegistry, id: u64) -> Option<&VolConnector> {
     registry.connectors.get(&id)
 }
 
@@ -878,6 +872,7 @@ pub fn H5VL_pass_through_str_to_info(name: &str) -> VolConnector {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

@@ -115,7 +115,7 @@ impl MutableFile {
                     Self::chunk_btree_leaf_layout(btree_addr, ndims, sa)?;
                 let entry_pos = Self::chunk_btree_entry_pos(entries_start, entry_idx, entry_size)?;
                 self.write_btree_entry(entry_pos, chunk_coords, chunk_size, chunk_addr, sa)?;
-                return Ok(());
+                Ok(())
             }
             Err(insert_idx) if entries_used < CHUNK_BTREE_MAX_LEAF_ENTRIES => {
                 entries.insert(
@@ -128,7 +128,7 @@ impl MutableFile {
                     },
                 );
                 self.write_chunk_btree_node(btree_addr, 0, &entries, chunk_dims, element_size, sa)?;
-                return Ok(());
+                Ok(())
             }
             Err(insert_idx) => {
                 entries.insert(
@@ -147,7 +147,7 @@ impl MutableFile {
                     element_size,
                     sa,
                 )?;
-                return Ok(());
+                Ok(())
             }
         }
     }
@@ -657,8 +657,8 @@ impl MutableFile {
             sizeof_addr,
             "chunk B-tree sibling address",
         )?;
-        buf.extend_from_slice(&undef);
-        buf.extend_from_slice(&undef);
+        buf.extend_from_slice(undef);
+        buf.extend_from_slice(undef);
 
         for entry in entries {
             buf.extend_from_slice(&entry.chunk_size.to_le_bytes());
@@ -735,6 +735,7 @@ impl MutableFile {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_chunk_btree_node_with_buf(
         &mut self,
         pos: u64,

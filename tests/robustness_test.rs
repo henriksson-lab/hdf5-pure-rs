@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use hdf5_pure_rust::format::btree_v2::BTreeV2Header;
 use hdf5_pure_rust::format::checksum::checksum_metadata;
 use hdf5_pure_rust::format::fractal_heap::FractalHeapHeader;
@@ -2636,7 +2638,7 @@ fn hdf5_fletcher32(data: &[u8]) -> u32 {
         sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
 
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         sum1 += (data[pos] as u32) << 8;
         sum2 += sum1;
         sum1 = (sum1 & 0xffff) + (sum1 >> 16);

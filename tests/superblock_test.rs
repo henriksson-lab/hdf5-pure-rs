@@ -82,7 +82,7 @@ fn test_open_v0_file_after_userblock_reads_root_members() {
     let f = Hdf5File::open(&path).expect("failed to open userblock fixture");
 
     assert_eq!(f.userblock(), 512);
-    assert!(f.member_names().expect("failed to list members").len() > 0);
+    assert!(!f.member_names().expect("failed to list members").is_empty());
     assert_eq!(
         f.file_image().unwrap().len() as u64,
         std::fs::metadata(path).unwrap().len()

@@ -282,6 +282,10 @@ impl Dataset {
         output: &mut [u8],
         handled: &mut [bool],
     ) -> Result<()> {
+        // libhdf5 reads each filtered chunk through the raw data chunk cache
+        // and runs H5Z_pipeline serially in-process. This Rust-only fast path
+        // keeps that serial behavior as the semantic baseline but decompresses
+        // independent deflate-only 1D full-prefix chunks on scoped workers.
         let Some(pipeline) = info.filter_pipeline.as_ref() else {
             return Ok(());
         };

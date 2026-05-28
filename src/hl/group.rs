@@ -32,7 +32,7 @@ use crate::hl::file::{
 };
 use crate::hl::link::{get_val_cb_borrowed, LinkValueRef};
 use crate::hl::mutable_file::MutableFile;
-use crate::hl::types::{slice_as_bytes, H5Type};
+use crate::hl::types::{slice_as_bytes_checked, H5Type};
 use crate::io::reader::HdfReader;
 
 pub(crate) struct LinkMessageRef<'a> {
@@ -238,7 +238,7 @@ impl<'d, T: H5Type> GroupDatasetBuilderDataStub<'d, T> {
             &self.parent_name,
             name,
             shape,
-            Some(slice_as_bytes(self.data)),
+            Some(slice_as_bytes_checked(self.data)?),
         )
     }
 }
@@ -685,7 +685,7 @@ impl Group {
                         &mut guard.reader,
                         &link_info,
                         sizeof_addr,
-                        |link| visitor(link),
+                        &mut visitor,
                     );
                 }
             }
@@ -735,7 +735,7 @@ impl Group {
                         &mut guard.reader,
                         &link_info,
                         sizeof_addr,
-                        |link| visitor(link),
+                        &mut visitor,
                     );
                 }
             }

@@ -2945,7 +2945,7 @@ pub fn H5D__none_idx_configure(
             "none chunk index chunk size is zero".into(),
         ));
     }
-    if chunks_per_dim.is_empty() || chunks_per_dim.iter().any(|&dim| dim == 0) {
+    if chunks_per_dim.is_empty() || chunks_per_dim.contains(&0) {
         return Err(Error::InvalidFormat(
             "none chunk index dimensions must be nonzero".into(),
         ));

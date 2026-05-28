@@ -604,7 +604,7 @@ impl MutableFile {
         }
 
         let record_size = usize::from(location.btree.record_size);
-        if record_size == 0 || location.leaf_records.len() % record_size != 0 {
+        if record_size == 0 || !location.leaf_records.len().is_multiple_of(record_size) {
             return Err(Error::InvalidFormat(
                 "dense link records have inconsistent sizes".into(),
             ));
@@ -657,7 +657,7 @@ impl MutableFile {
         target_addr: u64,
     ) -> Result<usize> {
         let record_size = usize::from(location.btree.record_size);
-        if record_size == 0 || location.leaf_records.len() % record_size != 0 {
+        if record_size == 0 || !location.leaf_records.len().is_multiple_of(record_size) {
             return Err(Error::InvalidFormat(
                 "dense link records have inconsistent sizes".into(),
             ));
@@ -1689,20 +1689,18 @@ impl MutableFile {
                     }
                     found = Some(location);
                 }
-            } else {
-                if msg_type == object_header::MSG_SYMBOL_TABLE {
-                    return Err(Error::Unsupported(
-                        "mutating v1 symbol-table group links is not implemented".into(),
-                    ));
-                } else if msg_type == object_header::MSG_LINK_INFO {
-                    read_message_into(reader, &mut msg_buf, msg_size)?;
-                    let link_info = LinkInfoMessage::decode(&msg_buf, sizeof_addr)?;
-                    if link_info.has_dense_storage() || link_info.corder_btree_addr.is_some() {
-                        has_dense_links = true;
-                    }
-                } else {
-                    reader.skip(msg_size_u64)?;
+            } else if msg_type == object_header::MSG_SYMBOL_TABLE {
+                return Err(Error::Unsupported(
+                    "mutating v1 symbol-table group links is not implemented".into(),
+                ));
+            } else if msg_type == object_header::MSG_LINK_INFO {
+                read_message_into(reader, &mut msg_buf, msg_size)?;
+                let link_info = LinkInfoMessage::decode(&msg_buf, sizeof_addr)?;
+                if link_info.has_dense_storage() || link_info.corder_btree_addr.is_some() {
+                    has_dense_links = true;
                 }
+            } else {
+                reader.skip(msg_size_u64)?;
             }
         }
 
@@ -1911,7 +1909,7 @@ impl MutableFile {
 
     fn rewrite_dense_link_name_index(&mut self, location: &DenseLinkLocation) -> Result<()> {
         let record_size = usize::from(location.btree.record_size);
-        if record_size == 0 || location.leaf_records.len() % record_size != 0 {
+        if record_size == 0 || !location.leaf_records.len().is_multiple_of(record_size) {
             return Err(Error::InvalidFormat(
                 "dense link records have inconsistent sizes".into(),
             ));
@@ -1978,7 +1976,7 @@ impl MutableFile {
         record_index: usize,
         record_size: usize,
     ) -> Result<()> {
-        if record_size == 0 || records.len() % record_size != 0 {
+        if record_size == 0 || !records.len().is_multiple_of(record_size) {
             return Err(Error::InvalidFormat(
                 "dense link records have inconsistent sizes".into(),
             ));

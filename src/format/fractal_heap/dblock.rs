@@ -18,6 +18,7 @@ use super::{
 };
 
 impl FractalHeapHeader {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn read_from_direct_block<R: Read + Seek>(
         &self,
         reader: &mut HdfReader<R>,
@@ -42,6 +43,7 @@ impl FractalHeapHeader {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn read_from_direct_block_into<R: Read + Seek>(
         &self,
         reader: &mut HdfReader<R>,
@@ -118,6 +120,7 @@ impl FractalHeapHeader {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn read_from_direct_block_cached_slice<'cache, R: Read + Seek>(
         &self,
         reader: &mut HdfReader<R>,

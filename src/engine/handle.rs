@@ -286,10 +286,7 @@ impl HandleRegistry {
 
     /// Check if a handle is valid (exists and has refcount > 0).
     pub fn is_valid(&self, id: Hid) -> bool {
-        self.entries
-            .read()
-            .get(&id)
-            .map_or(false, |e| e.refcount > 0)
+        self.entries.read().get(&id).is_some_and(|e| e.refcount > 0)
     }
 
     /// Public validity alias.

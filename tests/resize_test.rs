@@ -252,7 +252,7 @@ fn test_mutable_file_deletes_dense_attribute() {
     {
         let mut wf = WritableFile::create(&path).unwrap();
         for idx in 0..12 {
-            wf.add_attr(&format!("attr_{idx:02}"), idx as i32).unwrap();
+            wf.add_attr(&format!("attr_{idx:02}"), idx).unwrap();
         }
         wf.flush().unwrap();
     }
@@ -274,7 +274,7 @@ fn test_mutable_file_renames_dense_attribute_same_length() {
     {
         let mut wf = WritableFile::create(&path).unwrap();
         for idx in 0..12 {
-            wf.add_attr(&format!("attr_{idx:02}"), idx as i32).unwrap();
+            wf.add_attr(&format!("attr_{idx:02}"), idx).unwrap();
         }
         wf.flush().unwrap();
     }
@@ -340,15 +340,11 @@ fn test_mutable_file_mutates_group_and_dataset_dense_attributes() {
         let mut wf = WritableFile::create(&path).unwrap();
         let mut group = wf.create_group("metadata").unwrap();
         for idx in 0..12 {
-            group
-                .add_attr(&format!("gattr_{idx:02}"), idx as i32)
-                .unwrap();
+            group.add_attr(&format!("gattr_{idx:02}"), idx).unwrap();
         }
         let mut builder = group.new_dataset_builder("values");
         for idx in 0..12 {
-            builder = builder
-                .attr(&format!("dattr_{idx:02}"), (idx as i32) * 10)
-                .unwrap();
+            builder = builder.attr(&format!("dattr_{idx:02}"), idx * 10).unwrap();
         }
         builder.write::<i32>(&[1, 2, 3]).unwrap();
         wf.flush().unwrap();
@@ -1105,6 +1101,31 @@ fn test_write_chunk_splits_full_v1_btree_leaf() {
 }
 
 #[test]
+fn test_write_chunk_rejects_out_of_extent_v1_btree_without_appending() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reject_out_of_extent_v1_btree.h5");
+    std::fs::copy("tests/data/hdf5_ref/v1_btree_full_leaf_gap.h5", &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (325..330).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        let err = mf
+            .write_chunk("btree_v1_full_leaf_gap", &[325], bytes)
+            .expect_err("out-of-extent v1 B-tree chunk should be rejected");
+        assert!(err.to_string().contains("outside dataset extent"));
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
 fn test_write_chunk_updates_v0_userblock_v1_btree_without_corrupting_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("userblock_split_full_v1_btree_leaf.h5");
@@ -1476,6 +1497,31 @@ fn test_write_chunk_replaces_existing_v4_btree2_chunk() {
          assert int(x[7, 7]) == 63",
         "replaced v2 B-tree file",
     );
+}
+
+#[test]
+fn test_write_chunk_rejects_out_of_extent_v4_btree2_without_appending() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reject_out_of_extent_v4_btree2.h5");
+    std::fs::copy("tests/data/hdf5_ref/v4_btree2_chunks.h5", &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut mf = MutableFile::open_rw(&path).unwrap();
+        let chunk: Vec<i32> = (1000..1016).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr() as *const u8,
+                chunk.len() * std::mem::size_of::<i32>(),
+            )
+        };
+        let err = mf
+            .write_chunk("btree_v2", &[8, 0], bytes)
+            .expect_err("out-of-extent v2 B-tree chunk should be rejected");
+        assert!(err.to_string().contains("outside dataset extent"));
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]

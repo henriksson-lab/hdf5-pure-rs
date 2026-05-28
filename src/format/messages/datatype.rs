@@ -609,7 +609,7 @@ impl DatatypeMessage {
         }
         let dims_start = checked_usize_add(*pos, 12, "compound datatype member dimension table")?;
         let mut dims = [0u64; 4];
-        for idx in 0usize..4 {
+        for (idx, dim_slot) in dims.iter_mut().enumerate() {
             let elem_offset = idx.checked_mul(4).ok_or_else(|| {
                 Error::InvalidFormat("compound datatype dimension offset overflow".into())
             })?;
@@ -635,7 +635,7 @@ impl DatatypeMessage {
                         "compound datatype inline array dimension must be positive".into(),
                     ));
                 }
-                dims[idx] = dim;
+                *dim_slot = dim;
             }
         }
         *pos = block_end;
@@ -1114,11 +1114,7 @@ impl<'a> Iterator for CompoundFields<'a> {
             }
         };
 
-        if self
-            .seen_names
-            .iter()
-            .any(|&seen_name| seen_name == field.raw_name)
-        {
+        if self.seen_names.contains(&field.raw_name) {
             self.remaining = 0;
             return Some(Err(Error::InvalidFormat(format!(
                 "duplicated compound field name '{}'",

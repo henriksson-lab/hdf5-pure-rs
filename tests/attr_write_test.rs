@@ -32,7 +32,7 @@ fn test_write_dataset_with_attrs() {
         w.begin().unwrap();
         w.create_root_group().unwrap();
 
-        let data: Vec<u8> = vec![1.0f64, 2.0, 3.0]
+        let data: Vec<u8> = [1.0f64, 2.0, 3.0]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();

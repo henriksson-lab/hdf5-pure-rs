@@ -769,15 +769,13 @@ impl Dataset {
             .try_fold(1usize, |acc, &value| acc.checked_mul(value))
             .ok_or_else(|| Error::InvalidFormat("chunk count overflow".into()))?;
         let mut offset = Vec::new();
-        let mut scaled = Vec::new();
         for chunk_index in 0..total_chunks {
             Self::implicit_chunk_coords_into(
                 chunk_index,
                 chunk_dims,
                 &chunks_per_dim,
-                &mut scaled,
+                &mut offset,
             )?;
-            Self::scaled_chunk_offset_into(&scaled, chunk_dims, &mut offset)?;
             let addr = idx_addr
                 .checked_add(
                     u64_from_usize(chunk_index, "implicit chunk index")?
@@ -808,7 +806,6 @@ impl Dataset {
     {
         let chunks_per_dim = Self::chunks_per_dim(&info.dataspace.dims, chunk_dims)?;
         let mut offset = Vec::new();
-        let mut scaled = Vec::new();
         for (chunk_index, element) in elements.into_iter().enumerate() {
             if crate::io::reader::is_undef_addr(element.addr) {
                 continue;
@@ -817,9 +814,8 @@ impl Dataset {
                 chunk_index,
                 chunk_dims,
                 &chunks_per_dim,
-                &mut scaled,
+                &mut offset,
             )?;
-            Self::scaled_chunk_offset_into(&scaled, chunk_dims, &mut offset)?;
             f(
                 &offset,
                 element.filter_mask,

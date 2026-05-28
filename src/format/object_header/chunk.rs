@@ -56,6 +56,7 @@ pub(super) fn read_v1_continuation<R: Read + Seek>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn read_v2_continuation<R: Read + Seek>(
     reader: &mut HdfReader<R>,
     addr: u64,

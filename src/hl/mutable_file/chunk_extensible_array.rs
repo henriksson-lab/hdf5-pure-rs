@@ -59,6 +59,7 @@ struct ExtensibleArrayDataBlockElement {
 }
 
 impl MutableFile {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn rewrite_extensible_array_chunk(
         &mut self,
         index_addr: u64,
@@ -247,6 +248,7 @@ impl MutableFile {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_direct_extensible_array_element(
         &mut self,
         header_addr: u64,
@@ -952,7 +954,7 @@ impl MutableFile {
                 block.extend_from_slice(fill_addr);
             }
         }
-        let checksum = checksum_metadata(&block);
+        let checksum = checksum_metadata(block);
         block.extend_from_slice(&checksum.to_le_bytes());
         Ok(())
     }
@@ -2265,7 +2267,7 @@ impl MutableFile {
                 }
             }
         }
-        let checksum = checksum_metadata(&prefix);
+        let checksum = checksum_metadata(prefix);
         prefix.extend_from_slice(&checksum.to_le_bytes());
         Ok(())
     }
@@ -2383,7 +2385,7 @@ impl MutableFile {
                 page.extend_from_slice(&0u32.to_le_bytes());
             }
         }
-        let checksum = checksum_metadata(&page);
+        let checksum = checksum_metadata(page);
         page.extend_from_slice(&checksum.to_le_bytes());
         Ok(())
     }

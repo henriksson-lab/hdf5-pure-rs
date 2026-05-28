@@ -733,10 +733,8 @@ pub fn H5T_is_vl_storage(dtype: &RuntimeDatatype) -> bool {
             DatatypeClass::Reference => return true,
             DatatypeClass::Compound => {
                 if let Ok(fields) = message.compound_fields_iter() {
-                    for field in fields {
-                        if let Ok(field) = field {
-                            stack.push(field.datatype);
-                        }
+                    for field in fields.flatten() {
+                        stack.push(field.datatype);
                     }
                 }
             }
@@ -1772,7 +1770,7 @@ pub fn H5Tinsert(
     dtype.message.properties.extend_from_slice(name.as_bytes());
     dtype.message.properties.push(0);
     if dtype.message.version < 3 {
-        while (dtype.message.properties.len() - name_start) % 8 != 0 {
+        while !(dtype.message.properties.len() - name_start).is_multiple_of(8) {
             dtype.message.properties.push(0);
         }
         dtype.message.properties.extend_from_slice(
@@ -2429,12 +2427,12 @@ pub fn H5T__reverse_order_into(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let size = data.len();
-    if order == H5TDetectedOrder::Vax && size % 2 != 0 {
+    if order == H5TDetectedOrder::Vax && !size.is_multiple_of(2) {
         return Err(Error::InvalidFormat(
             "VAX byte order requires an even byte count".into(),
         ));
     }
-    if order == H5TDetectedOrder::BigEndian && is_complex && size % 2 != 0 {
+    if order == H5TDetectedOrder::BigEndian && is_complex && !size.is_multiple_of(2) {
         return Err(Error::InvalidFormat(
             "complex byte order requires an even byte count".into(),
         ));
@@ -2513,17 +2511,17 @@ pub fn H5T__conv_order_opt_into(
             "byte-order optimized conversion only supports 1, 2, 4, 8, or 16 byte elements".into(),
         ));
     }
-    if data.len() % element_size != 0 {
+    if !data.len().is_multiple_of(element_size) {
         return Err(Error::InvalidFormat(
             "byte-order conversion buffer is not element aligned".into(),
         ));
     }
-    if order == H5TDetectedOrder::Vax && element_size % 2 != 0 {
+    if order == H5TDetectedOrder::Vax && !element_size.is_multiple_of(2) {
         return Err(Error::InvalidFormat(
             "VAX byte order requires an even byte count".into(),
         ));
     }
-    if order == H5TDetectedOrder::BigEndian && is_complex && element_size % 2 != 0 {
+    if order == H5TDetectedOrder::BigEndian && is_complex && !element_size.is_multiple_of(2) {
         return Err(Error::InvalidFormat(
             "complex byte order requires an even byte count".into(),
         ));
@@ -3162,7 +3160,7 @@ pub fn H5T__bit_find(
             let mut idx = (offset + size - 1) / 8;
             let bit_offset = offset % 8;
 
-            if size > 8 - bit_offset && (offset + size) % 8 != 0 {
+            if size > 8 - bit_offset && !(offset + size).is_multiple_of(8) {
                 let byte = *data.get(idx)?;
                 let mut bit = (offset + size) % 8;
                 while bit > 0 {
@@ -3325,7 +3323,7 @@ pub fn H5T__fix_order(n: usize, last: usize, perm: &mut [usize]) -> Result<H5TDe
         }
         Ok(H5TDetectedOrder::BigEndian)
     } else {
-        if n % 2 != 0 {
+        if !n.is_multiple_of(2) {
             return Err(Error::InvalidFormat("n is not a power of 2".into()));
         }
         for i in (0..n).step_by(2) {

@@ -2491,7 +2491,7 @@ fn validate_child_name(name: &str) -> Result<()> {
 /// Verify an attribute payload size matches the shape and datatype.
 fn validate_attr_payload(name: &str, dtype: &DtypeSpec, shape: &[u64], data: &[u8]) -> Result<()> {
     validate_dtype_spec(dtype)?;
-    if name.as_bytes().len() == usize::MAX {
+    if name.len() == usize::MAX {
         return Err(Error::InvalidFormat(
             "attribute name length overflow".into(),
         ));

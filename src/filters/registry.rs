@@ -93,10 +93,10 @@ impl FilterRegistry {
             RegisteredFilter::builtin(FILTER_DEFLATE, "deflate"),
             RegisteredFilter::builtin(FILTER_SHUFFLE, "shuffle"),
             RegisteredFilter::builtin(FILTER_FLETCHER32, "fletcher32"),
-            RegisteredFilter::builtin(FILTER_SZIP, "szip"),
             RegisteredFilter::builtin(FILTER_NBIT, "nbit"),
             RegisteredFilter::builtin(FILTER_SCALEOFFSET, "scaleoffset"),
             RegisteredFilter::builtin(FILTER_LZF, "lzf"),
+            #[cfg(feature = "blosc")]
             RegisteredFilter::builtin(FILTER_BLOSC, "blosc"),
         ] {
             registry.filters.insert(filter.id, filter);
@@ -145,7 +145,18 @@ impl FilterRegistry {
     }
 
     pub fn filter_avail_internal(&self, filter_id: u16) -> bool {
-        self.filters.contains_key(&filter_id)
+        self.filters.contains_key(&filter_id) && Self::filter_is_implemented(filter_id)
+    }
+
+    fn filter_is_implemented(filter_id: u16) -> bool {
+        if filter_id == FILTER_SZIP {
+            return false;
+        }
+        #[cfg(not(feature = "blosc"))]
+        if filter_id == FILTER_BLOSC {
+            return false;
+        }
+        true
     }
 
     pub fn prepare_prelude_callback_dcpl(
@@ -551,7 +562,28 @@ mod tests {
         let registry = FilterRegistry::init_package();
         assert!(registry.filter_avail(FILTER_DEFLATE));
         assert!(registry.filter_avail(FILTER_SHUFFLE));
+        assert!(!registry.filter_avail(FILTER_SZIP));
+        #[cfg(not(feature = "blosc"))]
+        assert!(!registry.filter_avail(FILTER_BLOSC));
+        #[cfg(feature = "blosc")]
+        assert!(registry.filter_avail(FILTER_BLOSC));
         assert!(!registry.filter_avail(32_099));
+    }
+
+    #[test]
+    fn all_filters_avail_matches_implemented_filter_surface() {
+        let registry = FilterRegistry::init_package();
+        let mut pipeline = pipeline();
+        assert!(registry.all_filters_avail(&pipeline));
+
+        pipeline.filters[0].id = FILTER_SZIP;
+        assert!(!registry.all_filters_avail(&pipeline));
+
+        pipeline.filters[0].id = FILTER_BLOSC;
+        assert_eq!(
+            registry.all_filters_avail(&pipeline),
+            cfg!(feature = "blosc")
+        );
     }
 
     #[test]

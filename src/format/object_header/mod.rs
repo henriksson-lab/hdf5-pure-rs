@@ -1,10 +1,10 @@
 //! Object header — top-level public API. Mirrors libhdf5's `H5O.c` /
 //! `H5Opkg.h` (the file-spanning entry points and shared types). The
 //! per-component code lives in sibling modules:
-//!   - `cache` → `H5Ocache.c` (`H5O__cache_deserialize` for v1 and v2)
-//!   - `chunk` → `H5Ochunk.c` (continuation chunks + range bookkeeping)
-//!   - `msg`   → `H5Omessage.c` + `H5Oint.c` (per-message decode loop +
-//!              shared-message validation)
+//! - `cache` → `H5Ocache.c` (`H5O__cache_deserialize` for v1 and v2)
+//! - `chunk` → `H5Ochunk.c` (continuation chunks + range bookkeeping)
+//! - `msg`   → `H5Omessage.c` + `H5Oint.c` (per-message decode loop +
+//!   shared-message validation)
 
 mod cache;
 mod chunk;
@@ -600,14 +600,10 @@ mod tests {
             encode_v2_with_continuations(&messages, 0, &continuation_addrs, 25, 25, 8, 8).unwrap();
 
         assert_eq!(encoded.continuation_chunks.len(), continuation_addrs.len());
-        assert!(encoded
-            .prefix
-            .iter()
-            .any(|byte| *byte == MSG_HEADER_CONTINUATION as u8));
+        assert!(encoded.prefix.contains(&(MSG_HEADER_CONTINUATION as u8)));
         assert!(encoded.continuation_chunks[0]
             .1
-            .iter()
-            .any(|byte| *byte == MSG_HEADER_CONTINUATION as u8));
+            .contains(&(MSG_HEADER_CONTINUATION as u8)));
 
         let mut file = vec![0u8; 512];
         file[..encoded.prefix.len()].copy_from_slice(&encoded.prefix);

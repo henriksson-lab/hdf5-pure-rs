@@ -103,6 +103,8 @@ impl ReadConversion {
                 src_signed: datatype.is_signed().unwrap_or(false),
                 dst_size,
             })
+        } else if T::enum_members().is_some() && requested == stored {
+            Ok(ConversionKind::SameSizeBytes)
         } else {
             Err(Error::InvalidFormat(format!(
                 "requested element size {requested} does not match dataset element size {stored}"
@@ -166,6 +168,21 @@ impl ReadConversion {
     }
 
     pub(crate) fn bytes_into_slice<T: H5Type>(&self, bytes: &[u8], out: &mut [T]) -> Result<()> {
+        if matches!(self.kind, ConversionKind::SameSizeBytes) && T::requires_validation() {
+            let mut raw = bytes.to_vec();
+            self.convert_bytes_in_place(&mut raw);
+            T::validate_byte_slice(&raw)?;
+            let raw_out = types::slice_as_bytes_mut(out);
+            if raw_out.len() != raw.len() {
+                return Err(Error::InvalidFormat(format!(
+                    "typed output buffer has {} bytes, expected {}",
+                    raw_out.len(),
+                    raw.len()
+                )));
+            }
+            raw_out.copy_from_slice(&raw);
+            return Ok(());
+        }
         let raw_out = types::slice_as_bytes_mut(out);
         self.bytes_into_raw_out(bytes, raw_out)
     }
@@ -251,6 +268,7 @@ impl ReadConversion {
         let raw_out =
             unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, out_len) };
         self.bytes_into_raw_out(bytes, raw_out)?;
+        T::validate_byte_slice(raw_out)?;
         // SAFETY: `bytes_into_raw_out` initialized every byte of each element
         // and `T: H5Type` guarantees a byte-addressable `Copy` representation.
         unsafe {
@@ -299,6 +317,7 @@ impl ReadConversion {
             std::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, T::type_size())
         };
         self.bytes_into_raw_out(bytes, raw_out)?;
+        T::validate_bytes(raw_out)?;
         // SAFETY: `bytes_into_raw_out` initialized the complete object bytes.
         Ok(unsafe { value.assume_init() })
     }
@@ -415,7 +434,7 @@ fn convert_array_datatype_bytes_into(
             "array datatype conversion element size is zero".into(),
         ));
     }
-    if bytes.len() % src_size != 0 {
+    if !bytes.len().is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {} is not a multiple of source array size {src_size}",
             bytes.len()
@@ -597,6 +616,7 @@ fn convert_integer_bytes_into(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_integer_bytes_to_order_into(
     bytes: &[u8],
     src_size: usize,
@@ -612,7 +632,7 @@ fn convert_integer_bytes_to_order_into(
             "integer conversion supports 1..=16 byte integer payloads".into(),
         ));
     }
-    if bytes.len() % src_size != 0 {
+    if !bytes.len().is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {} is not a multiple of source integer size {src_size}",
             bytes.len()
@@ -718,9 +738,7 @@ fn read_signed(bytes: &[u8], byte_order: Option<ByteOrder>) -> i128 {
     let unsigned = read_unsigned(bytes, byte_order);
     let bits = n * 8;
     let sign_bit = 1u128 << (bits - 1);
-    if unsigned & sign_bit == 0 {
-        unsigned as i128
-    } else if bits == 128 {
+    if unsigned & sign_bit == 0 || bits == 128 {
         unsigned as i128
     } else {
         (unsigned as i128) - (1i128 << bits)
@@ -791,7 +809,7 @@ fn convert_float_bytes_to_order_into(
 ) -> Result<()> {
     validate_float_size(src_size, "source")?;
     validate_float_size(dst_size, "target")?;
-    if bytes.len() % src_size != 0 {
+    if !bytes.len().is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {} is not a multiple of source float size {src_size}",
             bytes.len()
@@ -876,7 +894,7 @@ fn convert_integer_to_float_bytes_to_order_into(
         ));
     }
     validate_float_size(dst_size, "target")?;
-    if bytes.len() % src_size != 0 {
+    if !bytes.len().is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {} is not a multiple of source integer size {src_size}",
             bytes.len()
@@ -961,7 +979,7 @@ fn convert_float_to_integer_bytes_to_order_into(
             "float-to-integer conversion supports 1..=16 byte integer targets".into(),
         ));
     }
-    if bytes.len() % src_size != 0 {
+    if !bytes.len().is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {} is not a multiple of source float size {src_size}",
             bytes.len()
@@ -990,7 +1008,7 @@ fn converted_element_count(byte_len: usize, src_size: usize) -> Result<usize> {
             "conversion source element size is zero".into(),
         ));
     }
-    if byte_len % src_size != 0 {
+    if !byte_len.is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {byte_len} is not a multiple of source element size {src_size}"
         )));
@@ -1019,7 +1037,7 @@ fn validate_conversion_buffers(
     dst_size: usize,
     source_name: &str,
 ) -> Result<()> {
-    if bytes.len() % src_size != 0 {
+    if !bytes.len().is_multiple_of(src_size) {
         return Err(Error::InvalidFormat(format!(
             "byte count {} is not a multiple of {source_name} size {src_size}",
             bytes.len()
@@ -1221,17 +1239,26 @@ mod tests {
     }
 
     fn float_type(size: u32, order: ByteOrder) -> DatatypeMessage {
-        let mut class_bits = [0u8; 3];
+        let spec = match size {
+            4 => DtypeSpec::F32,
+            8 => DtypeSpec::F64,
+            _ => {
+                return DatatypeMessage {
+                    version: 1,
+                    class: DatatypeClass::FloatingPoint,
+                    class_bits: [0; 3],
+                    size,
+                    properties: Vec::new(),
+                };
+            }
+        };
+        let mut bytes = spec
+            .encode()
+            .expect("floating-point datatype should encode");
         if matches!(order, ByteOrder::BigEndian) {
-            class_bits[0] |= 0x01;
+            bytes[1] |= 0x01;
         }
-        DatatypeMessage {
-            version: 1,
-            class: DatatypeClass::FloatingPoint,
-            class_bits,
-            size,
-            properties: Vec::new(),
-        }
+        DatatypeMessage::decode(&bytes).expect("floating-point datatype should decode")
     }
 
     fn time_type(size: u32, order: ByteOrder) -> DatatypeMessage {

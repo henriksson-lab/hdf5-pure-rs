@@ -491,7 +491,7 @@ impl MutableFile {
         location: &DenseAttributeLocation,
     ) -> Result<()> {
         let record_size = usize::from(location.btree.record_size);
-        if record_size == 0 || location.leaf_records.len() % record_size != 0 {
+        if record_size == 0 || !location.leaf_records.len().is_multiple_of(record_size) {
             return Err(Error::InvalidFormat(
                 "dense attribute records have inconsistent sizes".into(),
             ));
@@ -682,11 +682,11 @@ impl MutableFile {
 
     fn reposition_dense_attribute_record_by_hash(
         heap: &FractalHeapHeader,
-        records: &mut Vec<u8>,
+        records: &mut [u8],
         record_index: usize,
         record_size: usize,
     ) -> Result<()> {
-        if record_size == 0 || records.len() % record_size != 0 {
+        if record_size == 0 || !records.len().is_multiple_of(record_size) {
             return Err(Error::InvalidFormat(
                 "dense attribute records have inconsistent sizes".into(),
             ));

@@ -4,8 +4,7 @@ use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, HdfFileWriter};
 use hdf5_pure_rust::{Dataset, File};
 
 fn raw_len(ds: &Dataset) -> usize {
-    let nbytes = ds.size().unwrap() as usize * ds.element_size().unwrap() as usize;
-    nbytes
+    ds.size().unwrap() as usize * ds.element_size().unwrap()
 }
 
 #[test]

@@ -381,7 +381,7 @@ impl FreeSpaceManager {
         }
         let payload_end = data.len().saturating_sub(4);
         let section_size = FreeSpaceSection::SERIALIZED_SIZE;
-        if payload_end % section_size != 0 {
+        if !payload_end.is_multiple_of(section_size) {
             return Err(Error::InvalidFormat(
                 "free-space section info has a partial section record".into(),
             ));
@@ -466,9 +466,11 @@ impl FreeSpaceManager {
     /// Retrieve metadata statistics for the free-space manager.
     pub fn stat_info(&self) -> FreeSpaceStats {
         self.stat_info_checked().unwrap_or_else(|_| {
-            let mut stats = FreeSpaceStats::default();
-            stats.section_count = self.sections.len();
-            stats.total_space = u64::MAX;
+            let mut stats = FreeSpaceStats {
+                section_count: self.sections.len(),
+                total_space: u64::MAX,
+                ..Default::default()
+            };
             for section in self.sections.values() {
                 stats.largest_section = stats.largest_section.max(section.size);
             }
@@ -478,8 +480,10 @@ impl FreeSpaceManager {
 
     /// Checked variant of [`stat_info`] that errors on total-size overflow.
     pub fn stat_info_checked(&self) -> Result<FreeSpaceStats> {
-        let mut stats = FreeSpaceStats::default();
-        stats.section_count = self.sections.len();
+        let mut stats = FreeSpaceStats {
+            section_count: self.sections.len(),
+            ..Default::default()
+        };
         for section in self.sections.values() {
             stats.total_space = stats
                 .total_space

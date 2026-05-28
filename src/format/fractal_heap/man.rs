@@ -368,6 +368,7 @@ impl FractalHeapHeader {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn visit_in_indirect_block_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
@@ -475,6 +476,7 @@ impl FractalHeapHeader {
         self.lookup_in_indirect_block(reader, &iblock, block_start, offset, length)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn visit_from_indirect_block_rows_cached<R, T, F>(
         &self,
         reader: &mut HdfReader<R>,
@@ -697,7 +699,7 @@ impl FractalHeapHeader {
 /// Number of bytes used to encode a managed heap-ID offset, derived from
 /// `max_heap_size` (in bits). Rejects widths beyond 8 bytes.
 fn managed_heap_offset_bytes(max_heap_size: u16) -> Result<usize> {
-    let bytes = (usize::from(max_heap_size) + 7) / 8;
+    let bytes = usize::from(max_heap_size).div_ceil(8);
     if bytes > 8 {
         return Err(Error::Unsupported(format!(
             "managed heap ID offset uses {bytes} bytes"
@@ -750,6 +752,7 @@ fn validate_location_range(block_size: u64, offset: u64, length: u64) -> Result<
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

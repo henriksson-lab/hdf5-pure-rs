@@ -825,7 +825,7 @@ fn validate_record_aligned(total_len: usize, record_size: usize, context: &str) 
     if record_size == 0 {
         return Err(Error::InvalidFormat(format!("{context} size is zero")));
     }
-    if total_len % record_size != 0 {
+    if !total_len.is_multiple_of(record_size) {
         return Err(Error::InvalidFormat(format!(
             "{context} length {total_len} is not a multiple of record size {record_size}"
         )));
@@ -912,9 +912,7 @@ fn read_signed_int(bytes: &[u8], little_endian: bool) -> i128 {
         return 0;
     }
     let sign_bit = 1u128 << (bits - 1);
-    if unsigned & sign_bit == 0 {
-        unsigned as i128
-    } else if bits == 128 {
+    if unsigned & sign_bit == 0 || bits == 128 {
         unsigned as i128
     } else {
         (unsigned as i128) - ((1u128 << bits) as i128)
@@ -922,6 +920,7 @@ fn read_signed_int(bytes: &[u8], little_endian: bool) -> i128 {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

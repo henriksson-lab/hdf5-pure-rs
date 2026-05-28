@@ -26,6 +26,7 @@ struct BuiltBTreeV2Node {
 }
 
 impl MutableFile {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn rewrite_btree_v2_chunk(
         &mut self,
         index_addr: u64,
@@ -1084,7 +1085,7 @@ impl MutableFile {
             cum_max_nrec: leaf_max_u64,
             cum_max_nrec_size: 0,
         });
-        for level in 1..=usize::from(depth) {
+        for level in 1..=depth {
             let pointer_size = sizeof_addr
                 .checked_add(max_nrec_size)
                 .and_then(|value| value.checked_add(infos[level - 1].cum_max_nrec_size))

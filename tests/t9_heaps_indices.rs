@@ -202,7 +202,7 @@ fn t9a_global_heap_deleted_objects_duplicate_ids_and_padding() {
         heap.extend_from_slice(&(data.len() as u64).to_le_bytes());
         heap.extend_from_slice(data);
         let padded = (data.len() + 7) & !7;
-        heap.extend(std::iter::repeat(0xa5).take(padded - data.len()));
+        heap.extend(std::iter::repeat_n(0xa5, padded - data.len()));
     }
     fn push_free_object(heap: &mut Vec<u8>, body_len: usize) {
         let padded = (body_len + 7) & !7;
@@ -211,7 +211,7 @@ fn t9a_global_heap_deleted_objects_duplicate_ids_and_padding() {
         heap.extend_from_slice(&0u16.to_le_bytes());
         heap.extend_from_slice(&[0; 4]);
         heap.extend_from_slice(&(object_size as u64).to_le_bytes());
-        heap.extend(std::iter::repeat(0xa5).take(padded));
+        heap.extend(std::iter::repeat_n(0xa5, padded));
     }
 
     let mut heap = b"GCOL".to_vec();
@@ -267,7 +267,7 @@ fn t9a_global_heap_read_object_skips_deleted_and_padding() {
         heap.extend_from_slice(&(data.len() as u64).to_le_bytes());
         heap.extend_from_slice(data);
         let padded = (data.len() + 7) & !7;
-        heap.extend(std::iter::repeat(0).take(padded - data.len()));
+        heap.extend(std::iter::repeat_n(0, padded - data.len()));
     }
     fn push_free_object(heap: &mut Vec<u8>, body_len: usize) {
         let padded = (body_len + 7) & !7;
@@ -276,7 +276,7 @@ fn t9a_global_heap_read_object_skips_deleted_and_padding() {
         heap.extend_from_slice(&0u16.to_le_bytes());
         heap.extend_from_slice(&[0; 4]);
         heap.extend_from_slice(&(object_size as u64).to_le_bytes());
-        heap.extend(std::iter::repeat(0).take(padded));
+        heap.extend(std::iter::repeat_n(0, padded));
     }
 
     let mut heap = b"GCOL".to_vec();
