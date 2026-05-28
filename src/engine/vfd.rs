@@ -1670,7 +1670,10 @@ pub fn H5FD__hdfs_sb_encode_into(config: &HdfsConfig, out: &mut Vec<u8>) -> Resu
     if !H5FD__hdfs_validate_config(config) {
         return Err(Error::InvalidFormat("invalid HDFS VFD config".into()));
     }
-    out.reserve(H5FD__hdfs_sb_size(config));
+    out.try_reserve_exact(H5FD__hdfs_sb_size(config))
+        .map_err(|err| {
+            Error::InvalidFormat(format!("HDFS VFD config image allocation failed: {err}"))
+        })?;
     out.extend_from_slice(&HDFS_FAPL_VERSION.to_le_bytes());
     hdfs_encode_fixed_string(&config.namenode_name, out)?;
     out.extend_from_slice(&u32::from(config.namenode_port).to_le_bytes());
@@ -2251,7 +2254,9 @@ pub fn H5FD_mirror_xmit_encode_write_into(addr: u64, data: &[u8], out: &mut Vec<
     let image_len = 8usize.checked_add(data.len()).ok_or_else(|| {
         Error::InvalidFormat("mirror transmit write image length overflow".into())
     })?;
-    out.reserve(image_len);
+    out.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!("mirror transmit write allocation failed: {err}"))
+    })?;
     out.extend_from_slice(&addr.to_le_bytes());
     out.extend_from_slice(data);
     Ok(())
@@ -2472,7 +2477,10 @@ pub fn H5FD__family_sb_encode_into(config: &FamilyFileConfig, out: &mut Vec<u8>)
     if !H5FD__family_validate_config(config) {
         return Err(Error::InvalidFormat("invalid family VFD config".into()));
     }
-    out.reserve(H5FD__family_sb_size(config)?);
+    out.try_reserve_exact(H5FD__family_sb_size(config)?)
+        .map_err(|err| {
+            Error::InvalidFormat(format!("family VFD image allocation failed: {err}"))
+        })?;
     out.extend_from_slice(&config.member_size.to_le_bytes());
     Ok(())
 }
@@ -2697,7 +2705,8 @@ pub fn H5FD_multi_sb_encode_into(config: &MultiFileConfig, out: &mut Vec<u8>) ->
     }
     let count = u32::try_from(config.memb_map.len())
         .map_err(|_| Error::InvalidFormat("multi VFD member count exceeds u32".into()))?;
-    out.reserve(H5FD_multi_sb_size(config)?);
+    out.try_reserve_exact(H5FD_multi_sb_size(config)?)
+        .map_err(|err| Error::InvalidFormat(format!("multi VFD image allocation failed: {err}")))?;
     out.extend_from_slice(&count.to_le_bytes());
     for mem_type in VFD_MEM_TYPES_IN_CODE_ORDER {
         if let Some(driver) = config.memb_map.get(&mem_type) {
@@ -3038,7 +3047,10 @@ pub fn H5FD__splitter_sb_encode_into(config: &SplitterFileConfig, out: &mut Vec<
         .unwrap_or(&[]);
     let path_len = u32::try_from(path.len())
         .map_err(|_| Error::InvalidFormat("splitter VFD path length exceeds u32".into()))?;
-    out.reserve(H5FD__splitter_sb_size(config)?);
+    out.try_reserve_exact(H5FD__splitter_sb_size(config)?)
+        .map_err(|err| {
+            Error::InvalidFormat(format!("splitter VFD image allocation failed: {err}"))
+        })?;
     out.push(u8::from(config.ignore_wo_errors));
     out.extend_from_slice(&path_len.to_le_bytes());
     out.extend_from_slice(path);
@@ -3260,7 +3272,8 @@ pub fn H5FD__log_sb_encode_into(config: &LogFileConfig, out: &mut Vec<u8>) -> Re
         .map_err(|_| Error::InvalidFormat("log VFD buffer size exceeds u64".into()))?;
     let path_len = u32::try_from(path.len())
         .map_err(|_| Error::InvalidFormat("log VFD path length exceeds u32".into()))?;
-    out.reserve(H5FD__log_sb_size(config)?);
+    out.try_reserve_exact(H5FD__log_sb_size(config)?)
+        .map_err(|err| Error::InvalidFormat(format!("log VFD image allocation failed: {err}")))?;
     out.extend_from_slice(&config.flags.to_le_bytes());
     out.extend_from_slice(&buffer_size.to_le_bytes());
     out.extend_from_slice(&path_len.to_le_bytes());
@@ -3492,7 +3505,8 @@ pub fn H5FD__ros3_sb_encode_into(config: &Ros3Config, out: &mut Vec<u8>) -> Resu
         .map_err(|_| Error::InvalidFormat("ROS3 VFD region length exceeds u32".into()))?;
     let token_len = u32::try_from(token.len())
         .map_err(|_| Error::InvalidFormat("ROS3 VFD token length exceeds u32".into()))?;
-    out.reserve(H5FD__ros3_sb_size(config)?);
+    out.try_reserve_exact(H5FD__ros3_sb_size(config)?)
+        .map_err(|err| Error::InvalidFormat(format!("ROS3 VFD image allocation failed: {err}")))?;
     out.extend_from_slice(&endpoint_len.to_le_bytes());
     out.extend_from_slice(&region_len.to_le_bytes());
     out.extend_from_slice(&token_len.to_le_bytes());
@@ -3739,7 +3753,9 @@ pub fn H5FD__onion_revision_record_encode_into(
     record: &OnionRevisionRecord,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    out.reserve(24);
+    out.try_reserve_exact(24).map_err(|err| {
+        Error::InvalidFormat(format!("onion revision record allocation failed: {err}"))
+    })?;
     out.extend_from_slice(&record.revision.to_le_bytes());
     out.extend_from_slice(&record.address.to_le_bytes());
     out.extend_from_slice(&record.size.to_le_bytes());
@@ -3834,7 +3850,10 @@ pub fn H5FD__onion_sb_size(_header: &OnionHeader) -> usize {
 /// `H5FD__onion_sb_encode`: distributed/cloud driver, not supported by the pure-Rust backend.
 #[allow(non_snake_case)]
 pub fn H5FD__onion_sb_encode_into(header: &OnionHeader, out: &mut Vec<u8>) -> Result<()> {
-    out.reserve(H5FD__onion_sb_size(header));
+    out.try_reserve_exact(H5FD__onion_sb_size(header))
+        .map_err(|err| {
+            Error::InvalidFormat(format!("onion superblock image allocation failed: {err}"))
+        })?;
     out.push(header.version);
     out.push(header.flags);
     out.extend_from_slice(&header.revision_count.to_le_bytes());
@@ -4043,7 +4062,8 @@ pub fn H5FD__onion_history_encode_into(
     index: &OnionRevisionIndex,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    out.reserve(H5FD__onion_history_size(index)?);
+    out.try_reserve_exact(H5FD__onion_history_size(index)?)
+        .map_err(|err| Error::InvalidFormat(format!("onion history allocation failed: {err}")))?;
     for record in &index.records {
         H5FD__onion_revision_record_encode_into(record, out)?;
     }
@@ -4404,7 +4424,8 @@ pub fn H5FD__ioc_sb_encode_into(config: &IocConfig, out: &mut Vec<u8>) -> Result
         .map_err(|_| Error::InvalidFormat("subfiling IOC thread pool size exceeds u64".into()))?;
     let queue_depth = u64::try_from(config.queue_depth)
         .map_err(|_| Error::InvalidFormat("subfiling IOC queue depth exceeds u64".into()))?;
-    out.reserve(H5FD__ioc_sb_size(config));
+    out.try_reserve_exact(H5FD__ioc_sb_size(config))
+        .map_err(|err| Error::InvalidFormat(format!("IOC VFD image allocation failed: {err}")))?;
     out.extend_from_slice(&thread_pool_size.to_le_bytes());
     out.extend_from_slice(&queue_depth.to_le_bytes());
     Ok(())
@@ -4716,7 +4737,10 @@ pub fn H5FD__subfiling_sb_encode_into(config: &SubfilingConfig, out: &mut Vec<u8
     if config.stripe_size == 0 || config.ioc_count == 0 || config.stripe_count == 0 {
         return Err(Error::InvalidFormat("invalid subfiling VFD config".into()));
     }
-    out.reserve(H5FD__subfiling_sb_size(config));
+    out.try_reserve_exact(H5FD__subfiling_sb_size(config))
+        .map_err(|err| {
+            Error::InvalidFormat(format!("subfiling VFD image allocation failed: {err}"))
+        })?;
     out.extend_from_slice(&config.stripe_size.to_le_bytes());
     out.extend_from_slice(&config.ioc_count.to_le_bytes());
     out.extend_from_slice(&config.stripe_count.to_le_bytes());

@@ -842,10 +842,10 @@ pub fn H5P__decode_chunks(bytes: &[u8]) -> H5PDecodeChunks<'_> {
 #[allow(non_snake_case)]
 pub fn H5P__decode_with<F>(bytes: &[u8], mut callback: F) -> Result<()>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) -> Result<()>,
 {
     for chunk in H5P__decode_chunks(bytes) {
-        callback(chunk?);
+        callback(chunk?)?;
     }
     Ok(())
 }
@@ -853,10 +853,23 @@ where
 /// Append decoded length-prefixed property chunks into a caller-provided buffer.
 #[allow(non_snake_case)]
 pub fn H5P__decode_into(bytes: &[u8], chunks: &mut Vec<Vec<u8>>) -> Result<()> {
-    chunks
-        .try_reserve(decoded_chunk_count(bytes)?)
+    let mut next = Vec::new();
+    next.try_reserve(decoded_chunk_count(bytes)?)
         .map_err(|_| Error::InvalidFormat("property chunk count overflow".into()))?;
-    H5P__decode_with(bytes, |chunk| chunks.push(chunk.to_vec()))
+    H5P__decode_with(bytes, |chunk| {
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(chunk.len()).map_err(|err| {
+            Error::InvalidFormat(format!("property chunk allocation failed: {err}"))
+        })?;
+        owned.extend_from_slice(chunk);
+        next.push(owned);
+        Ok(())
+    })?;
+    chunks.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("property chunk output allocation failed: {err}"))
+    })?;
+    chunks.extend(next);
+    Ok(())
 }
 
 fn decoded_chunk_count(bytes: &[u8]) -> Result<usize> {
@@ -961,7 +974,11 @@ pub fn H5P__plist_get_ref<'a>(list: &'a PropertyList, name: &str) -> Result<&'a 
 /// Append a property value from a list into a caller-provided buffer.
 #[allow(non_snake_case)]
 pub fn H5P__plist_get_into(list: &PropertyList, name: &str, out: &mut Vec<u8>) -> Result<()> {
-    out.extend_from_slice(plist_get_ref(list, name)?);
+    let value = plist_get_ref(list, name)?;
+    out.try_reserve_exact(value.len()).map_err(|err| {
+        Error::InvalidFormat(format!("property value output allocation failed: {err}"))
+    })?;
+    out.extend_from_slice(value);
     Ok(())
 }
 

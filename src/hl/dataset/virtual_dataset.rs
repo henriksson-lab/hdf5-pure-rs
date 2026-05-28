@@ -75,10 +75,9 @@ impl VirtualSourceCache {
                 &dest_info.datatype,
             )?);
         }
-        let raw = entry
-            .raw
-            .as_deref()
-            .expect("virtual source raw data must be cached after read");
+        let raw = entry.raw.as_deref().ok_or_else(|| {
+            Error::InvalidFormat("virtual source raw data was not cached after read".into())
+        })?;
         Ok((&entry.info, raw))
     }
 
@@ -175,8 +174,8 @@ impl Dataset {
         info: &DatasetInfo,
         out: &mut Vec<VirtualMappingInfo>,
     ) -> Result<()> {
-        out.clear();
         if info.layout.layout_class != LayoutClass::Virtual {
+            out.clear();
             return Ok(());
         }
         let mut guard = self.inner.lock();
@@ -199,11 +198,20 @@ impl Dataset {
         drop(guard);
 
         let mappings = Self::decode_virtual_mappings(&heap_data, sizeof_size)?;
-        out.extend(
+        let mut next = Vec::new();
+        next.try_reserve_exact(mappings.len()).map_err(|err| {
+            Error::InvalidFormat(format!("virtual mapping output allocation failed: {err}"))
+        })?;
+        next.extend(
             mappings
                 .into_iter()
                 .map(Self::virtual_mapping_info_from_mapping),
         );
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!("virtual mapping output allocation failed: {err}"))
+        })?;
+        out.clear();
+        out.extend(next);
         Ok(())
     }
 

@@ -312,19 +312,24 @@ pub fn H5D__virtual_build_source_name_into(
     out: &mut String,
 ) -> Result<()> {
     let Some(parsed_name) = parsed_name else {
+        out.try_reserve_exact(source_name.len()).map_err(|err| {
+            Error::InvalidFormat(format!("VDS source-name output allocation failed: {err}"))
+        })?;
         out.clear();
         out.push_str(source_name);
         return Ok(());
     };
     if parsed_name.substitutions == 0 {
+        let source = parsed_name
+            .segments
+            .first()
+            .map(String::as_str)
+            .unwrap_or(source_name);
+        out.try_reserve_exact(source.len()).map_err(|err| {
+            Error::InvalidFormat(format!("VDS source-name output allocation failed: {err}"))
+        })?;
         out.clear();
-        out.push_str(
-            parsed_name
-                .segments
-                .first()
-                .map(String::as_str)
-                .unwrap_or(source_name),
-        );
+        out.push_str(source);
         return Ok(());
     }
     if parsed_name.segments.len() != parsed_name.substitutions + 1 {
@@ -341,14 +346,17 @@ pub fn H5D__virtual_build_source_name_into(
         .static_strlen
         .checked_add(substitution_bytes)
         .ok_or_else(|| Error::InvalidFormat("VDS built source-name size overflow".into()))?;
-    out.clear();
-    out.reserve(capacity.saturating_sub(out.capacity()));
+    let mut next = String::new();
+    next.try_reserve_exact(capacity).map_err(|err| {
+        Error::InvalidFormat(format!("VDS built source-name allocation failed: {err}"))
+    })?;
     for (idx, segment) in parsed_name.segments.iter().enumerate() {
-        out.push_str(segment);
+        next.push_str(segment);
         if idx < parsed_name.substitutions {
-            out.push_str(&block);
+            next.push_str(&block);
         }
     }
+    *out = next;
     Ok(())
 }
 
@@ -1634,8 +1642,12 @@ pub fn H5D__chunk_index_encode_count_into(
     index: &ChunkIndexState,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let encoded = chunk_index_encode_count_array(index)?;
+    out.try_reserve_exact(encoded.len()).map_err(|err| {
+        Error::InvalidFormat(format!("chunk index count output allocation failed: {err}"))
+    })?;
     out.clear();
-    out.extend_from_slice(&chunk_index_encode_count_array(index)?);
+    out.extend_from_slice(&encoded);
     Ok(())
 }
 
@@ -2513,8 +2525,23 @@ pub fn H5D__mpio_dump_collective_filtered_chunk_list_to<W: fmt::Write>(
     note = "use H5D__scatter_file_into to fill caller-provided buffers"
 )]
 pub fn H5D__scatter_file(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    let mut out = allocate_span_outputs(spans, "dataset scatter output")?;
     H5D__scatter_file_into(src, spans, &mut out)?;
+    Ok(out)
+}
+
+fn allocate_span_outputs(spans: &[(usize, usize)], context: &str) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(spans.len())
+        .map_err(|err| Error::InvalidFormat(format!("{context} list allocation failed: {err}")))?;
+    for &(_, len) in spans {
+        let mut span = Vec::new();
+        span.try_reserve_exact(len).map_err(|err| {
+            Error::InvalidFormat(format!("{context} span allocation failed: {err}"))
+        })?;
+        span.resize(len, 0);
+        out.push(span);
+    }
     Ok(out)
 }
 
@@ -2623,7 +2650,7 @@ pub fn H5D__scatter_file_into_slices(
     note = "use H5D__scatter_file_into to fill caller-provided buffers"
 )]
 pub fn H5D__scatter_file_checked(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    let mut out = allocate_span_outputs(spans, "dataset scatter output")?;
     H5D__scatter_file_into(src, spans, &mut out)?;
     Ok(out)
 }
@@ -2656,7 +2683,7 @@ pub fn H5D__gather_file(parts: &[Vec<u8>]) -> Vec<u8> {
     note = "use H5D__scatter_mem_into to fill caller-provided buffers"
 )]
 pub fn H5D__scatter_mem(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    let mut out = allocate_span_outputs(spans, "dataset scatter output")?;
     H5D__scatter_mem_into(src, spans, &mut out)?;
     Ok(out)
 }
@@ -2894,11 +2921,14 @@ pub fn H5D__layout_meta_size_checked(dataset: &DatasetApi) -> Result<usize> {
 #[allow(non_snake_case)]
 pub fn H5D__layout_oh_create_into(dataset: &DatasetApi, out: &mut Vec<u8>) -> Result<()> {
     let size = H5D__layout_meta_size_checked(dataset)?;
-    out.clear();
-    out.reserve(size);
+    let mut next = Vec::new();
+    next.try_reserve_exact(size).map_err(|err| {
+        Error::InvalidFormat(format!("dataset layout metadata allocation failed: {err}"))
+    })?;
     for dim in &dataset.extent {
-        out.extend_from_slice(&dim.to_le_bytes());
+        next.extend_from_slice(&dim.to_le_bytes());
     }
+    *out = next;
     Ok(())
 }
 
@@ -3065,7 +3095,12 @@ pub fn H5D__none_idx_iterate(index: &ChunkIndexState) -> Result<Vec<ChunkInfo>> 
     let total = none_total_chunks(&index.none_chunks_per_dim)?;
     let total_usize = usize::try_from(total)
         .map_err(|_| Error::InvalidFormat("none chunk count exceeds usize".into()))?;
-    let mut out = Vec::with_capacity(total_usize);
+    let mut out = Vec::new();
+    out.try_reserve_exact(total_usize).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "none chunk-index iterator allocation failed: {err}"
+        ))
+    })?;
     H5D__none_idx_iterate_with(index, |coord, addr, size| {
         out.push(ChunkInfo {
             coord: coord.to_vec(),
@@ -3084,7 +3119,12 @@ pub fn H5D__none_idx_iterate_checked(index: &ChunkIndexState) -> Result<Vec<Chun
     let total = none_total_chunks(&index.none_chunks_per_dim)?;
     let total_usize = usize::try_from(total)
         .map_err(|_| Error::InvalidFormat("none chunk count exceeds usize".into()))?;
-    let mut out = Vec::with_capacity(total_usize);
+    let mut out = Vec::new();
+    out.try_reserve_exact(total_usize).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "none chunk-index iterator allocation failed: {err}"
+        ))
+    })?;
     H5D__none_idx_iterate_with(index, |coord, addr, size| {
         out.push(ChunkInfo {
             coord: coord.to_vec(),
@@ -3577,7 +3617,7 @@ pub fn H5D__contig_readvv(
     storage: &ContiguousStorage,
     spans: &[(usize, usize)],
 ) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    let mut out = allocate_span_outputs(spans, "contiguous read output")?;
     H5D__contig_readvv_into(storage, spans, &mut out)?;
     Ok(out)
 }
@@ -4532,7 +4572,7 @@ pub fn H5D_btree_debug(index: &ChunkIndexState) -> String {
     note = "use H5D__select_io_into to fill caller-provided buffers"
 )]
 pub fn H5D__select_io(dataset: &DatasetApi, spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    let mut out = allocate_span_outputs(spans, "dataset select output")?;
     H5D__select_io_into(dataset, spans, &mut out)?;
     Ok(out)
 }
@@ -4577,7 +4617,7 @@ where
     note = "use H5D_select_io_mem_into to fill caller-provided buffers"
 )]
 pub fn H5D_select_io_mem(src: &[u8], spans: &[(usize, usize)]) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = spans.iter().map(|&(_, len)| vec![0; len]).collect();
+    let mut out = allocate_span_outputs(spans, "dataset select output")?;
     H5D_select_io_mem_into(src, spans, &mut out)?;
     Ok(out)
 }

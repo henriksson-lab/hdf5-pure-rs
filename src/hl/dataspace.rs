@@ -238,6 +238,9 @@ impl Dataspace {
                 self.ndim()
             )));
         }
+        out.try_reserve_exact(offsets.len()).map_err(|err| {
+            crate::Error::InvalidFormat(format!("dataspace offset allocation failed: {err}"))
+        })?;
         out.clear();
         out.extend_from_slice(offsets);
         Ok(())
@@ -458,9 +461,8 @@ pub fn H5S_extent_get_dims_ref(space: &Dataspace) -> (&[u64], Option<&[u64]>) {
 
 #[allow(non_snake_case)]
 pub fn H5S_extent_get_dims(space: &Dataspace) -> (Vec<u64>, Option<Vec<u64>>) {
-    space
-        .extents()
-        .expect("dataspace extents are already validated in memory")
+    let (dims, max_dims) = space.extent_dims();
+    (dims.to_vec(), max_dims.map(<[u64]>::to_vec))
 }
 
 #[allow(non_snake_case)]

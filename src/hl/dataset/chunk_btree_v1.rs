@@ -313,8 +313,10 @@ impl Dataset {
                 "chunk coordinate rank does not match chunk dimensions".into(),
             ));
         }
-        out.clear();
-        out.reserve(coords.len());
+        let mut next = Vec::new();
+        next.try_reserve_exact(coords.len()).map_err(|err| {
+            Error::InvalidFormat(format!("scaled chunk coordinate allocation failed: {err}"))
+        })?;
         for (&coord, &dim) in coords.iter().zip(chunk_dims) {
             if dim == 0 {
                 return Err(Error::InvalidFormat("chunk dimension is zero".into()));
@@ -324,8 +326,9 @@ impl Dataset {
                     "chunk coordinate is not aligned to chunk dimension".into(),
                 ));
             }
-            out.push(coord / dim);
+            next.push(coord / dim);
         }
+        *out = next;
         Ok(())
     }
 

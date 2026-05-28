@@ -332,7 +332,11 @@ fn apply_filter_reverse<'a>(
         FILTER_DEFLATE => {
             let mut out = Vec::new();
             if let Some(expected_len) = deflate_exact_len {
-                out.resize(expected_len, 0);
+                resize_zeroed_checked(
+                    &mut out,
+                    expected_len,
+                    "deflate decompression output allocation",
+                )?;
                 deflate::decompress_exact_into(bytes, &mut out)?;
             } else {
                 deflate::decompress_with_hint_into(bytes, expected_len, &mut out)?;
@@ -399,7 +403,8 @@ fn apply_filter_reverse<'a>(
                     .checked_mul(2)
                     .ok_or_else(|| Error::InvalidFormat("lzf expected size hint overflow".into()))?
             };
-            let mut out = vec![0u8; expected];
+            let mut out = Vec::new();
+            resize_zeroed_checked(&mut out, expected, "lzf output allocation")?;
             lzf::decompress_into(bytes, &mut out)?;
             Ok(Cow::Owned(out))
         }
@@ -422,7 +427,11 @@ fn apply_filter_reverse_into(
     match filter.id {
         FILTER_DEFLATE => {
             if let Some(expected_len) = deflate_exact_len {
-                out.resize(expected_len, 0);
+                resize_zeroed_checked(
+                    out,
+                    expected_len,
+                    "deflate decompression output allocation",
+                )?;
                 deflate::decompress_exact_into(data, out)?;
             } else {
                 deflate::decompress_with_hint_into(data, expected_len, out)?;
@@ -468,7 +477,7 @@ fn apply_filter_reverse_into(
                     .checked_mul(2)
                     .ok_or_else(|| Error::InvalidFormat("lzf expected size hint overflow".into()))?
             };
-            out.resize(expected, 0);
+            resize_zeroed_checked(out, expected, "lzf output allocation")?;
             lzf::decompress_into(data, out)?;
         }
         _ => {
@@ -478,6 +487,15 @@ fn apply_filter_reverse_into(
             )));
         }
     }
+    Ok(())
+}
+
+fn resize_zeroed_checked(out: &mut Vec<u8>, len: usize, context: &str) -> Result<()> {
+    if len > out.len() {
+        out.try_reserve_exact(len - out.len())
+            .map_err(|err| Error::InvalidFormat(format!("{context} failed: {err}")))?;
+    }
+    out.resize(len, 0);
     Ok(())
 }
 
@@ -649,6 +667,45 @@ mod tests {
                     .contains("deflate decompression produced more bytes than expected"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn expected_length_allocation_failure_returns_error() {
+        let compressed = deflate_compress(b"abcd", 4);
+        let err = apply_pipeline_reverse_with_mask_expected(
+            &compressed,
+            &deflate_pipeline(),
+            1,
+            0,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deflate decompression output allocation failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expected_length_allocation_failure_preserves_caller_output() {
+        let compressed = deflate_compress(b"abcd", 4);
+        let mut out = b"stale".to_vec();
+        let err = apply_pipeline_reverse_with_mask_expected_into(
+            &compressed,
+            &deflate_pipeline(),
+            1,
+            0,
+            usize::MAX,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deflate decompression output allocation failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
     }
 
     #[test]

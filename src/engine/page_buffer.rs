@@ -120,9 +120,10 @@ impl PageBuffer {
                 "page buffer entry exceeds page size".into(),
             ));
         }
+        let owned = Self::copy_page_data(data)?;
         self.insert_entry(PageEntry {
             addr,
-            data: data.to_vec(),
+            data: owned,
             dirty: false,
         })
     }
@@ -151,7 +152,7 @@ impl PageBuffer {
         let entry = self.entries.get_mut(&addr).ok_or_else(|| {
             Error::InvalidFormat(format!("page buffer entry {addr:#x} not found"))
         })?;
-        Self::write_entry_from_slice(entry, data);
+        Self::write_entry_from_slice(entry, data)?;
         self.stats.writes = self.stats.writes.saturating_add(1);
         Ok(())
     }
@@ -169,11 +170,12 @@ impl PageBuffer {
             .as_slice())
     }
 
-    pub fn replace_entry_data_from_slice(entry: &mut PageEntry, data: &[u8]) {
+    pub fn replace_entry_data_from_slice(entry: &mut PageEntry, data: &[u8]) -> Result<()> {
+        let next = Self::copy_page_data(data)?;
         entry.data.clear();
-        entry.data.reserve(data.len());
-        entry.data.extend_from_slice(data);
+        entry.data.extend_from_slice(&next);
         entry.dirty = true;
+        Ok(())
     }
 
     pub fn remove_entry(&mut self, addr: u64) -> Result<PageEntry> {
@@ -237,13 +239,14 @@ impl PageBuffer {
             ));
         }
         if let Some(entry) = self.entries.get_mut(&addr) {
-            Self::write_entry_from_slice(entry, data);
+            Self::write_entry_from_slice(entry, data)?;
             self.stats.writes = self.stats.writes.saturating_add(1);
             return Ok(());
         }
+        let owned = Self::copy_page_data(data)?;
         self.insert_entry(PageEntry {
             addr,
-            data: data.to_vec(),
+            data: owned,
             dirty: true,
         })?;
         self.stats.writes = self.stats.writes.saturating_add(1);
@@ -279,8 +282,17 @@ impl PageBuffer {
         entry.dirty = true;
     }
 
-    pub fn write_entry_from_slice(entry: &mut PageEntry, data: &[u8]) {
-        Self::replace_entry_data_from_slice(entry, data);
+    pub fn write_entry_from_slice(entry: &mut PageEntry, data: &[u8]) -> Result<()> {
+        Self::replace_entry_data_from_slice(entry, data)
+    }
+
+    fn copy_page_data(data: &[u8]) -> Result<Vec<u8>> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(data.len())
+            .map_err(|err| Error::InvalidFormat(format!("page buffer allocation failed: {err}")))?;
+        owned.extend_from_slice(data);
+        Ok(owned)
     }
 }
 

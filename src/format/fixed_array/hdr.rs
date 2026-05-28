@@ -44,6 +44,8 @@ pub(super) fn cache_hdr_get_initial_load_size() -> usize {
 
 /// Compute the on-disk size of a fixed array header for the given widths.
 pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Result<usize> {
+    validate_width(addr_size, "fixed array encoded address size")?;
+    validate_width(length_size, "fixed array encoded integer size")?;
     4usize
         .checked_add(1)
         .and_then(|value| value.checked_add(1))
@@ -62,7 +64,11 @@ pub(super) fn cache_hdr_serialize_into(
     length_size: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut image = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    let image_len = cache_hdr_image_len(addr_size, length_size)?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!("fixed array header image allocation failed: {err}"))
+    })?;
     image.extend_from_slice(b"FAHD");
     image.push(0);
     image.push(header.class_id);
@@ -224,11 +230,7 @@ pub(super) fn read_header<R: Read + Seek>(
 
 /// Encode an unsigned integer as `size` little-endian bytes, validating range.
 fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
-    if size == 0 || size > 8 {
-        return Err(Error::InvalidFormat(
-            "fixed array encoded integer size is invalid".into(),
-        ));
-    }
+    validate_width(size, "fixed array encoded integer size")?;
     if size < 8 && value >= (1u64 << (size * 8)) {
         return Err(Error::InvalidFormat(format!(
             "fixed array encoded integer value {value:#x} does not fit in {size} bytes"
@@ -242,16 +244,19 @@ fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
 /// Encode an address as `size` little-endian bytes, writing the all-`0xff`
 /// sentinel for undefined addresses.
 fn encode_addr(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
-    if size == 0 || size > 8 {
-        return Err(Error::InvalidFormat(
-            "fixed array encoded address size is invalid".into(),
-        ));
-    }
+    validate_width(size, "fixed array encoded address size")?;
     if value == UNDEF_ADDR {
         out.extend(std::iter::repeat_n(0xff, size));
         return Ok(());
     }
     encode_var(out, value, size)
+}
+
+fn validate_width(size: usize, context: &str) -> Result<()> {
+    if size == 0 || size > 8 {
+        return Err(Error::InvalidFormat(format!("{context} is invalid")));
+    }
+    Ok(())
 }
 
 /// Verify the trailing metadata checksum of a fixed array image span.
@@ -286,8 +291,8 @@ mod tests {
     use crate::io::HdfReader;
 
     use super::{
-        cache_hdr_serialize_into, hdr_fuse_incr_checked, hdr_incr_checked, read_header,
-        FixedArrayHeader,
+        cache_hdr_image_len, cache_hdr_serialize_into, hdr_fuse_incr_checked, hdr_incr_checked,
+        read_header, FixedArrayHeader,
     };
 
     #[test]
@@ -333,6 +338,12 @@ mod tests {
             ..header
         };
         assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut Vec::new()).is_err());
+
+        let mut stale = b"keep me".to_vec();
+        assert!(cache_hdr_image_len(0, 4).is_err());
+        assert!(cache_hdr_image_len(4, 9).is_err());
+        assert!(cache_hdr_serialize_into(&header, 0, 4, &mut stale).is_err());
+        assert_eq!(stale, b"keep me");
     }
 
     #[test]

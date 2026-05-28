@@ -9,7 +9,7 @@ use std::{
 use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
 
-use super::{heap_object_len, read_le_uint, FractalHeapHeader};
+use super::{heap_object_len, read_le_uint, resize_heap_buffer_zeroed, FractalHeapHeader};
 
 fn checked_huge_len(parts: &[usize], context: &str) -> Result<usize> {
     let mut len = 0usize;
@@ -89,8 +89,11 @@ impl FractalHeapHeader {
                 ));
             }
             reader.seek(addr)?;
-            out.clear();
-            out.resize(heap_object_len(len, "huge heap object length")?, 0);
+            resize_heap_buffer_zeroed(
+                out,
+                heap_object_len(len, "huge heap object length")?,
+                "huge heap object",
+            )?;
             reader.read_bytes_into(out)?;
             self.trace_huge_object(heap_id, addr, len, len, 0, false);
             return Ok(());
@@ -135,8 +138,11 @@ impl FractalHeapHeader {
                 Error::InvalidFormat("filtered huge object missing filter pipeline".into())
             })?;
             reader.seek(addr)?;
-            out.clear();
-            out.resize(heap_object_len(len, "filtered huge heap object length")?, 0);
+            resize_heap_buffer_zeroed(
+                out,
+                heap_object_len(len, "filtered huge heap object length")?,
+                "filtered huge heap object",
+            )?;
             reader.read_bytes_into(out)?;
             let filtered = std::mem::take(out);
             crate::filters::apply_pipeline_reverse_with_mask_expected_into(
@@ -174,8 +180,11 @@ impl FractalHeapHeader {
 
         if let Some(huge) = matching_huge {
             reader.seek(huge.addr)?;
-            out.clear();
-            out.resize(heap_object_len(huge.len, "huge heap object length")?, 0);
+            resize_heap_buffer_zeroed(
+                out,
+                heap_object_len(huge.len, "huge heap object length")?,
+                "huge heap object",
+            )?;
             reader.read_bytes_into(out)?;
             if huge.filtered {
                 let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {

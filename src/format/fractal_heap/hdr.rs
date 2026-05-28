@@ -67,7 +67,16 @@ impl FractalHeapHeader {
         if io_filter_len > 0 {
             root_direct_filtered_size = Some(reader.read_length()?);
             root_direct_filter_mask = reader.read_u32()?;
-            let mut pipeline_bytes = vec![0; usize::from(io_filter_len)];
+            let pipeline_len = usize::from(io_filter_len);
+            let mut pipeline_bytes = Vec::new();
+            pipeline_bytes
+                .try_reserve_exact(pipeline_len)
+                .map_err(|err| {
+                    Error::InvalidFormat(format!(
+                        "fractal heap filter pipeline allocation failed: {err}"
+                    ))
+                })?;
+            pipeline_bytes.resize(pipeline_len, 0);
             reader.read_bytes_into(&mut pipeline_bytes)?;
             filter_pipeline = Some(FilterPipelineMessage::decode(&pipeline_bytes)?);
         }

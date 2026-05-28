@@ -54,7 +54,10 @@ impl SymbolTableNode {
 
         let num_symbols = usize::from(reader.read_u16()?);
 
-        let mut entries = Vec::with_capacity(num_symbols);
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(num_symbols).map_err(|err| {
+            Error::InvalidFormat(format!("symbol table entries allocation failed: {err}"))
+        })?;
         for _ in 0..num_symbols {
             let entry = Self::read_entry(reader)?;
             entries.push(entry);
@@ -74,6 +77,14 @@ impl SymbolTableNode {
     pub fn cache_node_image_len(&self, sizeof_addr: u8, sizeof_size: u8) -> Result<usize> {
         validate_width(sizeof_addr, "symbol table address width")?;
         validate_width(sizeof_size, "symbol table size width")?;
+        if self.version != 1 {
+            return Err(Error::InvalidFormat(format!(
+                "symbol table node version {} is unsupported",
+                self.version
+            )));
+        }
+        let symbol_count = u16::try_from(self.entries.len())
+            .map_err(|_| Error::InvalidFormat("symbol table entry count exceeds u16".into()))?;
         let entry_len = usize::from(sizeof_size)
             .checked_add(usize::from(sizeof_addr))
             .and_then(|value| value.checked_add(4))
@@ -81,9 +92,13 @@ impl SymbolTableNode {
             .and_then(|value| value.checked_add(16))
             .ok_or_else(|| Error::InvalidFormat("symbol table entry length overflow".into()))?;
         8usize
-            .checked_add(self.entries.len().checked_mul(entry_len).ok_or_else(|| {
-                Error::InvalidFormat("symbol table node image length overflow".into())
-            })?)
+            .checked_add(
+                usize::from(symbol_count)
+                    .checked_mul(entry_len)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("symbol table node image length overflow".into())
+                    })?,
+            )
             .ok_or_else(|| Error::InvalidFormat("symbol table node image length overflow".into()))
     }
 
@@ -108,15 +123,23 @@ impl SymbolTableNode {
                 "symbol table entry count exceeds u16".into(),
             ));
         }
-        out.clear();
-        out.reserve_exact(self.cache_node_image_len(sizeof_addr, sizeof_size)?);
-        out.extend_from_slice(&SNOD_MAGIC);
-        out.push(1);
-        out.push(0);
-        out.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        let image_len = self.cache_node_image_len(sizeof_addr, sizeof_size)?;
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!("symbol table node image allocation failed: {err}"))
+        })?;
+        image.extend_from_slice(&SNOD_MAGIC);
+        image.push(1);
+        image.push(0);
+        image.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
         for entry in &self.entries {
-            Self::write_entry(out, entry, sizeof_addr, sizeof_size)?;
+            Self::write_entry(&mut image, entry, sizeof_addr, sizeof_size)?;
         }
+        out.try_reserve_exact(image.len()).map_err(|err| {
+            Error::InvalidFormat(format!("symbol table node output allocation failed: {err}"))
+        })?;
+        out.clear();
+        out.extend_from_slice(&image);
         Ok(())
     }
 
@@ -401,7 +424,27 @@ mod tests {
             version: 2,
             entries: Vec::new(),
         };
+        assert!(invalid_version.cache_node_image_len(4, 4).is_err());
         assert!(invalid_version
+            .cache_node_serialize_into(4, 4, &mut image)
+            .is_err());
+
+        let too_many_entries = SymbolTableNode {
+            version: 1,
+            entries: vec![
+                SymbolTableEntry {
+                    name_offset: 0,
+                    obj_header_addr: 0x1234,
+                    cache_type: 0,
+                    cached_btree_addr: None,
+                    cached_name_heap_addr: None,
+                    cached_link_offset: None,
+                };
+                usize::from(u16::MAX) + 1
+            ],
+        };
+        assert!(too_many_entries.cache_node_image_len(4, 4).is_err());
+        assert!(too_many_entries
             .cache_node_serialize_into(4, 4, &mut image)
             .is_err());
     }

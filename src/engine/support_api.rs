@@ -859,6 +859,8 @@ pub fn H5_get_utf16_str_into(bytes: &[u16], out: &mut String) -> Result<()> {
         let ch = item.map_err(|_| Error::InvalidFormat("invalid UTF-16 string".into()))?;
         decoded.push(ch);
     }
+    out.try_reserve(decoded.len())
+        .map_err(|err| Error::InvalidFormat(format!("UTF-16 output allocation failed: {err}")))?;
     out.clear();
     out.push_str(&decoded);
     Ok(())

@@ -3436,7 +3436,12 @@ impl<W: Write + Seek> HdfFileWriter<W> {
 
     fn prepare_vlen_utf8_string_data(&mut self, strings: &[&str]) -> Result<Vec<u8>> {
         let mut heap_collections: Vec<Vec<&[u8]>> = Vec::new();
-        let mut heap_refs = Vec::with_capacity(strings.len());
+        let mut heap_refs = Vec::new();
+        heap_refs.try_reserve_exact(strings.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "vlen string heap-reference allocation failed: {err}"
+            ))
+        })?;
         for value in strings {
             if heap_collections
                 .last()
@@ -3449,16 +3454,21 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                 .len()
                 .checked_sub(1)
                 .ok_or_else(|| Error::InvalidFormat("missing global heap collection".into()))?;
-            let objects = heap_collections
-                .last_mut()
-                .expect("global heap collection was just created when missing");
+            let objects = heap_collections.last_mut().ok_or_else(|| {
+                Error::InvalidFormat("missing global heap collection for vlen string".into())
+            })?;
             objects.push(value.as_bytes());
             let object_index = u32::try_from(objects.len())
                 .map_err(|_| Error::InvalidFormat("global heap object index exceeds u32".into()))?;
             heap_refs.push((collection_index, object_index));
         }
 
-        let mut heap_bytes = Vec::with_capacity(heap_collections.len());
+        let mut heap_bytes = Vec::new();
+        heap_bytes
+            .try_reserve_exact(heap_collections.len())
+            .map_err(|err| {
+                Error::InvalidFormat(format!("global heap collection allocation failed: {err}"))
+            })?;
         for objects in &heap_collections {
             heap_bytes.push(encode_global_heap_collection(objects, self.sizeof_size)?);
         }
@@ -3475,7 +3485,12 @@ impl<W: Write + Seek> HdfFileWriter<W> {
                     Error::InvalidFormat("vlen string descriptor payload size overflow".into())
                 })?;
 
-        let mut heap_addrs = Vec::with_capacity(heap_bytes.len());
+        let mut heap_addrs = Vec::new();
+        heap_addrs
+            .try_reserve_exact(heap_bytes.len())
+            .map_err(|err| {
+                Error::InvalidFormat(format!("global heap address allocation failed: {err}"))
+            })?;
         for heap in &heap_bytes {
             heap_addrs.push(
                 self.allocator.allocate(
@@ -3487,7 +3502,10 @@ impl<W: Write + Seek> HdfFileWriter<W> {
             );
         }
 
-        let mut data = Vec::with_capacity(vlen_payload_size);
+        let mut data = Vec::new();
+        data.try_reserve_exact(vlen_payload_size).map_err(|err| {
+            Error::InvalidFormat(format!("vlen string descriptor allocation failed: {err}"))
+        })?;
         for (value, (collection_index, object_index)) in strings.iter().zip(heap_refs) {
             let len = u32::try_from(value.len())
                 .map_err(|_| Error::InvalidFormat("vlen string length exceeds u32".into()))?;

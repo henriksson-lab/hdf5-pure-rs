@@ -154,7 +154,9 @@ impl Dataset {
             LayoutClass::Chunked => {
                 Self::read_chunked_into(&mut guard.reader, info, total_bytes, out)
             }
-            LayoutClass::Virtual => unreachable!("virtual datasets are handled before raw sizing"),
+            LayoutClass::Virtual => Err(Error::InvalidFormat(
+                "virtual datasets must be read through the virtual layout path".into(),
+            )),
         }
     }
 

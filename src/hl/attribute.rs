@@ -1668,6 +1668,24 @@ struct DenseAttributeHeapRef {
     creation_order: Option<u64>,
 }
 
+fn dense_attribute_heap_ref_from_record(
+    record: &[u8],
+    heap_id_len: usize,
+) -> Result<Option<DenseAttributeHeapRef>> {
+    if record.len() < heap_id_len {
+        return Ok(None);
+    }
+    let mut heap_id = Vec::new();
+    heap_id.try_reserve_exact(heap_id_len).map_err(|err| {
+        Error::InvalidFormat(format!("dense attribute heap-id allocation failed: {err}"))
+    })?;
+    heap_id.extend_from_slice(&record[..heap_id_len]);
+    Ok(Some(DenseAttributeHeapRef {
+        heap_id,
+        creation_order: dense_attribute_record_creation_order(record, heap_id_len),
+    }))
+}
+
 fn collect_dense_attribute_heap_refs<R>(
     reader: &mut crate::io::reader::HdfReader<R>,
     btree_addr: u64,
@@ -1677,16 +1695,20 @@ fn collect_dense_attribute_heap_refs<R>(
 where
     R: std::io::Read + std::io::Seek,
 {
-    out.clear();
+    let mut next = Vec::new();
     btree_v2::visit_all_records(reader, btree_addr, |record| {
-        if record.len() >= heap_id_len {
-            out.push(DenseAttributeHeapRef {
-                heap_id: record[..heap_id_len].to_vec(),
-                creation_order: dense_attribute_record_creation_order(record, heap_id_len),
-            });
+        if let Some(heap_ref) = dense_attribute_heap_ref_from_record(record, heap_id_len)? {
+            next.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "dense attribute heap-ref output allocation failed: {err}"
+                ))
+            })?;
+            next.push(heap_ref);
         }
         Ok(())
-    })
+    })?;
+    *out = next;
+    Ok(())
 }
 
 fn collect_matching_dense_attribute_heap_refs<R>(
@@ -1699,7 +1721,7 @@ fn collect_matching_dense_attribute_heap_refs<R>(
 where
     R: std::io::Read + std::io::Seek,
 {
-    out.clear();
+    let mut next = Vec::new();
     btree_v2::visit_matching_records(
         reader,
         btree_addr,
@@ -1708,15 +1730,19 @@ where
             None => Ordering::Less,
         },
         |record| {
-            if record.len() >= heap_id_len {
-                out.push(DenseAttributeHeapRef {
-                    heap_id: record[..heap_id_len].to_vec(),
-                    creation_order: dense_attribute_record_creation_order(record, heap_id_len),
-                });
+            if let Some(heap_ref) = dense_attribute_heap_ref_from_record(record, heap_id_len)? {
+                next.try_reserve_exact(1).map_err(|err| {
+                    Error::InvalidFormat(format!(
+                        "dense attribute heap-ref output allocation failed: {err}"
+                    ))
+                })?;
+                next.push(heap_ref);
             }
             Ok(())
         },
-    )
+    )?;
+    *out = next;
+    Ok(())
 }
 
 fn find_dense_attribute_by_name<R>(

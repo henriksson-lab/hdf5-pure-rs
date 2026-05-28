@@ -32,7 +32,7 @@ use crate::hl::file::{
 };
 use crate::hl::link::{get_val_cb_borrowed, LinkValueRef};
 use crate::hl::mutable_file::MutableFile;
-use crate::hl::types::{slice_as_bytes_checked, H5Type};
+use crate::hl::types::{values_as_bytes_checked, H5Type};
 use crate::io::reader::HdfReader;
 
 pub(crate) struct LinkMessageRef<'a> {
@@ -233,12 +233,13 @@ impl<'d, T: H5Type> GroupDatasetBuilderDataStub<'d, T> {
             inferred_shape = vec![usize_to_u64(self.data.len(), "dataset element count")?];
             &inferred_shape
         };
+        let data = values_as_bytes_checked(self.data)?;
         create_root_compat_dataset::<T>(
             &self.inner,
             &self.parent_name,
             name,
             shape,
-            Some(slice_as_bytes_checked(self.data)?),
+            Some(data.as_ref()),
         )
     }
 }
@@ -616,7 +617,15 @@ impl Group {
     pub fn member_names_into(&self, out: &mut Vec<String>) -> Result<()> {
         let mut names = Vec::new();
         self.visit_member_names(|name| {
-            names.push(name.to_string());
+            let mut owned = String::new();
+            owned.try_reserve_exact(name.len()).map_err(|err| {
+                Error::InvalidFormat(format!("member name output allocation failed: {err}"))
+            })?;
+            owned.push_str(name);
+            names.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!("member name list output allocation failed: {err}"))
+            })?;
+            names.push(owned);
             Ok(())
         })?;
         *out = names;
@@ -1103,7 +1112,9 @@ impl Group {
                     },
                 )?;
                 if let Some(link) = found {
-                    let visitor = visitor.take().expect("link visitor called more than once");
+                    let visitor = visitor.take().ok_or_else(|| {
+                        Error::InvalidFormat("link visitor called more than once".into())
+                    })?;
                     return visitor(&link);
                 }
             }
@@ -1114,7 +1125,9 @@ impl Group {
             if msg.msg_type == object_header::MSG_LINK {
                 if let Ok(link) = LinkMessage::decode(&msg.data, sizeof_addr) {
                     if link.name == name {
-                        let visitor = visitor.take().expect("link visitor called more than once");
+                        let visitor = visitor.take().ok_or_else(|| {
+                            Error::InvalidFormat("link visitor called more than once".into())
+                        })?;
                         return visitor(&link);
                     }
                 }
@@ -1132,7 +1145,9 @@ impl Group {
                         sizeof_addr,
                         name,
                     )? {
-                        let visitor = visitor.take().expect("link visitor called more than once");
+                        let visitor = visitor.take().ok_or_else(|| {
+                            Error::InvalidFormat("link visitor called more than once".into())
+                        })?;
                         return visitor(&link);
                     }
                 }
@@ -1378,7 +1393,17 @@ impl Group {
     pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
         let mut names = Vec::new();
         self.visit_attr_names(|name| {
-            names.push(name.to_string());
+            let mut owned = String::new();
+            owned.try_reserve_exact(name.len()).map_err(|err| {
+                Error::InvalidFormat(format!("attribute name output allocation failed: {err}"))
+            })?;
+            owned.push_str(name);
+            names.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "attribute name list output allocation failed: {err}"
+                ))
+            })?;
+            names.push(owned);
             Ok(())
         })?;
         *out = names;
@@ -1495,9 +1520,9 @@ impl Group {
                     },
                 )?;
                 if let Some((member_name, addr)) = found {
-                    let visit = visitor
-                        .take()
-                        .expect("link ref visitor called more than once");
+                    let visit = visitor.take().ok_or_else(|| {
+                        Error::InvalidFormat("link ref visitor called more than once".into())
+                    })?;
                     return visit(LinkMessageRef::hard_link(&member_name, addr));
                 }
             }
@@ -1507,9 +1532,9 @@ impl Group {
             if msg.msg_type == object_header::MSG_LINK {
                 if let Ok(link) = LinkMessage::decode(&msg.data, sizeof_addr) {
                     if link.name == name {
-                        let visit = visitor
-                            .take()
-                            .expect("link ref visitor called more than once");
+                        let visit = visitor.take().ok_or_else(|| {
+                            Error::InvalidFormat("link ref visitor called more than once".into())
+                        })?;
                         return visit(LinkMessageRef::from_message(&link));
                     }
                 }
@@ -1526,9 +1551,9 @@ impl Group {
                         sizeof_addr,
                         name,
                     )? {
-                        let visit = visitor
-                            .take()
-                            .expect("link ref visitor called more than once");
+                        let visit = visitor.take().ok_or_else(|| {
+                            Error::InvalidFormat("link ref visitor called more than once".into())
+                        })?;
                         return visit(LinkMessageRef::from_message(&link));
                     }
                 }
@@ -1584,16 +1609,25 @@ impl Group {
     pub fn link_name_by_idx_into(&self, index: usize, out: &mut String) -> Result<()> {
         let mut found = false;
         let mut pos = 0usize;
+        let mut next = String::new();
         self.visit_link_refs(|link| {
             if pos == index {
-                out.clear();
-                out.push_str(link.name);
+                next.try_reserve_exact(link.name.len()).map_err(|err| {
+                    Error::InvalidFormat(format!("link name output allocation failed: {err}"))
+                })?;
+                next.clear();
+                next.push_str(link.name);
                 found = true;
             }
             pos += 1;
             Ok(())
         })?;
         if found {
+            out.try_reserve_exact(next.len()).map_err(|err| {
+                Error::InvalidFormat(format!("link name output allocation failed: {err}"))
+            })?;
+            out.clear();
+            out.push_str(&next);
             Ok(())
         } else {
             Err(Error::InvalidFormat(format!(

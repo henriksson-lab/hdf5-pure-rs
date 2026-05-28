@@ -1548,7 +1548,7 @@ impl MutableFile {
         data_block_elements: usize,
     ) -> usize {
         if data_block_elements > header.max_data_block_page_elements {
-            data_block_elements / header.max_data_block_page_elements
+            data_block_elements.div_ceil(header.max_data_block_page_elements)
         } else {
             0
         }
@@ -2656,7 +2656,37 @@ impl MutableFile {
 
 #[cfg(test)]
 mod tests {
-    use super::MutableFile;
+    use super::{MutableExtensibleArrayHeader, MutableFile};
+
+    fn mutable_header(max_data_block_page_elements: usize) -> MutableExtensibleArrayHeader {
+        MutableExtensibleArrayHeader {
+            class_id: 1,
+            raw_element_size: 8,
+            index_block_elements: 0,
+            data_block_min_elements: 1,
+            max_data_block_page_elements,
+            max_index_set: 0,
+            realized_elements: 0,
+            index_block_addr: 0,
+            array_offset_size: 1,
+            index_block_super_blocks: 0,
+            index_block_data_block_addrs: 0,
+            index_block_super_block_addrs: 0,
+            super_block_info: Vec::new(),
+            derived_super_block_count: 0,
+            super_block_count: 0,
+            super_block_size: 0,
+            data_block_count: 0,
+            data_block_size: 0,
+            checksum_pos: 0,
+            super_block_count_pos: 0,
+            super_block_size_pos: 0,
+            data_block_count_pos: 0,
+            data_block_size_pos: 0,
+            max_index_set_pos: 0,
+            realized_elements_pos: 0,
+        }
+    }
 
     #[test]
     fn mutable_super_block_info_rejects_start_index_product_overflow() {
@@ -2675,6 +2705,21 @@ mod tests {
         assert!(MutableFile::checked_usize_add(usize::MAX, 1, "ea add").is_err());
         assert!(MutableFile::checked_usize_mul(usize::MAX, 2, "ea mul").is_err());
         assert!(MutableFile::checked_u64_add(u64::MAX, 1, "ea addr").is_err());
+    }
+
+    #[test]
+    fn mutable_data_block_pages_includes_partial_final_page() {
+        let header = mutable_header(2);
+
+        assert_eq!(
+            MutableFile::extensible_array_data_block_pages(&header, 2),
+            0
+        );
+        assert_eq!(
+            MutableFile::extensible_array_data_block_pages(&header, 3),
+            2
+        );
+        assert_eq!(MutableFile::extensible_array_page_init_size(&header, 17), 2);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 /// Describes a field in a compound HDF5 type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescriptor {
     pub name: String,
     pub offset: usize,
@@ -8,11 +8,28 @@ pub struct FieldDescriptor {
 }
 
 /// Simple type class for describing H5Type fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeClass {
-    Integer { signed: bool },
+    Integer {
+        signed: bool,
+    },
     Float,
-    Compound,
+    Enum {
+        signed: bool,
+        size: usize,
+        members: Vec<(String, u64)>,
+    },
+    Compound {
+        size: usize,
+        fields: Vec<FieldDescriptor>,
+    },
+}
+
+/// Primitive Rust storage type for HDF5 dtype inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimitiveType {
+    Integer { signed: bool, size: usize },
+    Float { size: usize },
 }
 
 /// Trait for types that can be stored in HDF5 datasets/attributes.
@@ -22,6 +39,11 @@ pub enum TypeClass {
 /// in-memory representation. `validate_bytes()` must reject byte patterns that
 /// are not valid values of the implementing Rust type, and `has_padding()` must
 /// return true when raw byte views of initialized values could read padding.
+///
+/// If implemented, metadata methods must describe the same in-memory bytes:
+/// `primitive_type()` must match the Rust representation and signedness,
+/// enum metadata must include the exact base type and raw encoded members, and
+/// compound field descriptors must use valid initialized field byte ranges.
 pub unsafe trait H5Type: Copy + 'static {
     /// Size of one element in bytes.
     fn type_size() -> usize;
@@ -35,6 +57,11 @@ pub unsafe trait H5Type: Copy + 'static {
     /// Whether raw bytes must be checked before they can be exposed as `Self`.
     fn requires_validation() -> bool {
         false
+    }
+
+    /// Return the primitive storage type, if `Self` maps directly to one.
+    fn primitive_type() -> Option<PrimitiveType> {
+        None
     }
 
     /// Validate one encoded element before constructing a Rust value from it.
@@ -79,8 +106,14 @@ pub unsafe trait H5Type: Copy + 'static {
 
     /// Store compound field descriptors in caller-provided storage.
     fn compound_fields_into(out: &mut Vec<FieldDescriptor>) -> Option<()> {
-        out.clear();
-        Self::visit_compound_fields(|field| out.push(field))
+        let mut next = Vec::new();
+        let visited = Self::visit_compound_fields(|field| next.push(field));
+        if visited.is_some() {
+            *out = next;
+        } else {
+            out.clear();
+        }
+        visited
     }
 
     /// Return compound field descriptors in a fresh vector.
@@ -93,36 +126,109 @@ pub unsafe trait H5Type: Copy + 'static {
     /// Visit enum members without returning a fresh Vec.
     fn visit_enum_members<F>(_visitor: F) -> Option<()>
     where
-        F: FnMut(&str, i64),
+        F: FnMut(&str, u64),
     {
         None
     }
 
     /// Store enum members in caller-provided storage.
-    fn enum_members_into(out: &mut Vec<(String, i64)>) -> Option<()> {
-        out.clear();
-        Self::visit_enum_members(|name, value| out.push((name.to_string(), value)))
+    fn enum_members_into(out: &mut Vec<(String, u64)>) -> Option<()> {
+        let mut next = Vec::new();
+        let visited = Self::visit_enum_members(|name, value| next.push((name.to_string(), value)));
+        if visited.is_some() {
+            *out = next;
+        } else {
+            out.clear();
+        }
+        visited
     }
 
     /// Return enum members in a fresh vector.
-    fn enum_members() -> Option<Vec<(String, i64)>> {
+    fn enum_members() -> Option<Vec<(String, u64)>> {
         let mut members = Vec::new();
         Self::enum_members_into(&mut members)?;
         Some(members)
     }
+
+    /// Return the enum's integer base as `(signed, size_in_bytes)`.
+    fn enum_base_type() -> Option<(bool, usize)> {
+        None
+    }
+
+    /// Store enum members as raw encoded integer values.
+    fn enum_members_u64_into(out: &mut Vec<(String, u64)>) -> Option<()> {
+        out.clear();
+        Self::visit_enum_members(|name, value| out.push((name.to_string(), value)))
+    }
 }
 
-macro_rules! impl_h5type {
-    ($($t:ty),*) => {
+macro_rules! impl_h5type_integer {
+    ($($t:ty => $signed:literal),*) => {
         $(
             unsafe impl H5Type for $t {
                 fn type_size() -> usize { std::mem::size_of::<$t>() }
+                fn primitive_type() -> Option<PrimitiveType> {
+                    Some(PrimitiveType::Integer {
+                        signed: $signed,
+                        size: std::mem::size_of::<$t>(),
+                    })
+                }
             }
         )*
     };
 }
 
-impl_h5type!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
+macro_rules! impl_h5type_float {
+    ($($t:ty),*) => {
+        $(
+            unsafe impl H5Type for $t {
+                fn type_size() -> usize { std::mem::size_of::<$t>() }
+                fn primitive_type() -> Option<PrimitiveType> {
+                    Some(PrimitiveType::Float {
+                        size: std::mem::size_of::<$t>(),
+                    })
+                }
+            }
+        )*
+    };
+}
+
+impl_h5type_integer!(
+    u8 => false,
+    u16 => false,
+    u32 => false,
+    u64 => false,
+    u128 => false,
+    i8 => true,
+    i16 => true,
+    i32 => true,
+    i64 => true,
+    i128 => true
+);
+impl_h5type_float!(f32, f64);
+
+/// Return the HDF5 type class for a Rust `H5Type` when it is known.
+pub fn type_class_for<T: H5Type>() -> Option<TypeClass> {
+    if let Some((signed, size)) = T::enum_base_type() {
+        let mut members = Vec::new();
+        T::enum_members_u64_into(&mut members)?;
+        Some(TypeClass::Enum {
+            signed,
+            size,
+            members,
+        })
+    } else if let Some(primitive) = T::primitive_type() {
+        match primitive {
+            PrimitiveType::Integer { signed, .. } => Some(TypeClass::Integer { signed }),
+            PrimitiveType::Float { .. } => Some(TypeClass::Float),
+        }
+    } else {
+        T::compound_fields().map(|fields| TypeClass::Compound {
+            size: T::type_size(),
+            fields,
+        })
+    }
+}
 
 /// Reinterpret a byte slice as a slice of `T`, copying to ensure alignment.
 pub fn bytes_to_slice<T: H5Type>(bytes: &[u8]) -> crate::Result<&[T]> {
@@ -174,6 +280,96 @@ pub fn slice_as_bytes_checked<T: H5Type>(values: &[T]) -> crate::Result<&[u8]> {
         ));
     }
     Ok(slice_as_bytes(values))
+}
+
+/// Return write bytes for typed values without exposing padding bytes.
+pub fn values_as_bytes_checked<T: H5Type>(
+    values: &[T],
+) -> crate::Result<std::borrow::Cow<'_, [u8]>> {
+    if !T::has_padding() {
+        return Ok(std::borrow::Cow::Borrowed(slice_as_bytes(values)));
+    }
+
+    let elem_size = T::type_size();
+    let total_len = values
+        .len()
+        .checked_mul(elem_size)
+        .ok_or_else(|| crate::Error::InvalidFormat("typed slice byte length overflow".into()))?;
+    let fields = T::compound_fields().ok_or_else(|| {
+        crate::Error::Unsupported(
+            "typed writes for padded non-compound H5Type values are not supported".into(),
+        )
+    })?;
+    let mut out = vec![0u8; total_len];
+    for (index, value) in values.iter().enumerate() {
+        let src_base = value as *const T as *const u8;
+        let dst_base = index * elem_size;
+        copy_initialized_field_bytes(
+            &mut out,
+            dst_base,
+            src_base,
+            elem_size,
+            &fields,
+            "compound field",
+        )?;
+    }
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+fn copy_initialized_field_bytes(
+    out: &mut [u8],
+    dst_base: usize,
+    src_base: *const u8,
+    elem_size: usize,
+    fields: &[FieldDescriptor],
+    context: &str,
+) -> crate::Result<()> {
+    for field in fields {
+        let field_end = field
+            .offset
+            .checked_add(field.size)
+            .ok_or_else(|| crate::Error::InvalidFormat(format!("{context} range overflow")))?;
+        if field_end > elem_size {
+            return Err(crate::Error::InvalidFormat(format!(
+                "{context} '{}' ends at byte {field_end}, beyond element size {elem_size}",
+                field.name
+            )));
+        }
+
+        match &field.type_class {
+            TypeClass::Compound {
+                size,
+                fields: nested,
+            } => {
+                if field.size != *size {
+                    return Err(crate::Error::InvalidFormat(format!(
+                        "nested compound field '{}' size metadata mismatch: field size {}, type size {}",
+                        field.name, field.size, size
+                    )));
+                }
+                copy_initialized_field_bytes(
+                    out,
+                    dst_base + field.offset,
+                    // SAFETY: the range check above proves `field.offset` is
+                    // within this element. The recursive call validates nested
+                    // ranges before reading bytes.
+                    unsafe { src_base.add(field.offset) },
+                    *size,
+                    nested,
+                    "nested compound field",
+                )?;
+            }
+            _ => {
+                // SAFETY: compound metadata promises that non-compound field
+                // ranges point only to initialized field bytes. Padding bytes
+                // in `out` remain zeroed.
+                let src =
+                    unsafe { std::slice::from_raw_parts(src_base.add(field.offset), field.size) };
+                out[dst_base + field.offset..dst_base + field_end].copy_from_slice(src);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// View a typed slice as raw bytes without allocating.

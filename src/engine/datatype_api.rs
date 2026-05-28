@@ -256,12 +256,20 @@ pub fn H5T_reclaim_cb(dtype: &RuntimeDatatype, data: &mut Vec<u8>) {
 /// Encode a datatype to its on-disk representation.
 #[allow(non_snake_case)]
 pub fn H5Tencode_into(dtype: &RuntimeDatatype, out: &mut Vec<u8>) -> Result<()> {
-    let mut encoded = Vec::with_capacity(8 + dtype.message.properties.len());
+    let len = 8usize
+        .checked_add(dtype.message.properties.len())
+        .ok_or_else(|| Error::InvalidFormat("datatype image length overflow".into()))?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(len)
+        .map_err(|err| Error::InvalidFormat(format!("datatype image allocation failed: {err}")))?;
     encoded.push(((dtype.message.version & 0x0f) << 4) | (dtype.message.class as u8));
     encoded.extend_from_slice(&dtype.message.class_bits);
     encoded.extend_from_slice(&dtype.message.size.to_le_bytes());
     encoded.extend_from_slice(&dtype.message.properties);
     DatatypeMessage::decode(&encoded)?;
+    out.try_reserve_exact(encoded.len())
+        .map_err(|err| Error::InvalidFormat(format!("datatype output allocation failed: {err}")))?;
     out.clear();
     out.extend_from_slice(&encoded);
     Ok(())
@@ -627,6 +635,11 @@ pub fn H5T_convert_into(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     if H5T_path_match(src, dst) || H5Tcompiler_conv(src, dst) {
+        out.try_reserve_exact(data.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "datatype conversion output allocation failed: {err}"
+            ))
+        })?;
         out.clear();
         out.extend_from_slice(data);
         Ok(())
@@ -2527,12 +2540,29 @@ pub fn H5T__conv_order_opt_into(
         ));
     }
 
-    out.clear();
-    let mut reversed = Vec::with_capacity(element_size);
+    let mut next = Vec::new();
+    next.try_reserve_exact(data.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "datatype byte-order output allocation failed: {err}"
+        ))
+    })?;
+    let mut reversed = Vec::new();
+    reversed.try_reserve_exact(element_size).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "datatype byte-order scratch allocation failed: {err}"
+        ))
+    })?;
     for element in data.chunks_exact(element_size) {
         H5T__reverse_order_into(element, order, is_complex, &mut reversed)?;
-        out.extend_from_slice(&reversed);
+        next.extend_from_slice(&reversed);
     }
+    out.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "datatype byte-order output allocation failed: {err}"
+        ))
+    })?;
+    out.clear();
+    out.extend_from_slice(&next);
     Ok(())
 }
 
@@ -4250,11 +4280,12 @@ pub fn H5T__ref_disk_getsize(buf: &[u8]) -> Result<(usize, bool)> {
             "reference disk buffer is truncated".into(),
         ));
     }
-    let payload_size = u32::from_le_bytes(
-        buf[H5R_ENCODE_HEADER_SIZE..blob_offset]
-            .try_into()
-            .expect("slice length checked"),
-    ) as usize;
+    let payload_size = read_u32_le_window(
+        buf,
+        H5R_ENCODE_HEADER_SIZE,
+        blob_offset,
+        "reference payload size",
+    )? as usize;
     Ok((payload_size + H5R_ENCODE_HEADER_SIZE, false))
 }
 
@@ -4268,11 +4299,12 @@ pub fn H5T__ref_disk_read_into(buf: &[u8], dst: &mut Vec<u8>) -> Result<()> {
         ));
     }
 
-    let payload_size = u32::from_le_bytes(
-        buf[H5R_ENCODE_HEADER_SIZE..blob_offset]
-            .try_into()
-            .expect("slice length checked"),
-    ) as usize;
+    let payload_size = read_u32_le_window(
+        buf,
+        H5R_ENCODE_HEADER_SIZE,
+        blob_offset,
+        "reference payload size",
+    )? as usize;
     let end = blob_offset
         .checked_add(payload_size)
         .ok_or_else(|| Error::InvalidFormat("reference payload size overflows".into()))?;
@@ -4286,6 +4318,16 @@ pub fn H5T__ref_disk_read_into(buf: &[u8], dst: &mut Vec<u8>) -> Result<()> {
     dst.extend_from_slice(&buf[..H5R_ENCODE_HEADER_SIZE]);
     dst.extend_from_slice(&buf[blob_offset..end]);
     Ok(())
+}
+
+fn read_u32_le_window(buf: &[u8], start: usize, end: usize, context: &str) -> Result<u32> {
+    let bytes = buf
+        .get(start..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("{context} is truncated")))?;
+    let array: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("{context} has invalid width")))?;
+    Ok(u32::from_le_bytes(array))
 }
 
 /// Read from a datatype.
@@ -4519,11 +4561,7 @@ pub fn H5T__vlen_disk_getlen(buf: &[u8]) -> Result<usize> {
     if buf.len() < std::mem::size_of::<u32>() {
         return Err(Error::InvalidFormat("vlen disk buffer is truncated".into()));
     }
-    Ok(u32::from_le_bytes(
-        buf[..std::mem::size_of::<u32>()]
-            .try_into()
-            .expect("slice length checked"),
-    ) as usize)
+    Ok(read_u32_le_window(buf, 0, std::mem::size_of::<u32>(), "vlen disk length")? as usize)
 }
 
 /// Datatype operation: vlen disk isnull.

@@ -334,7 +334,7 @@ pub(super) fn data_block_pages(
     data_block_elements: usize,
 ) -> usize {
     if data_block_elements > header.data_block_page_elements {
-        data_block_elements / header.data_block_page_elements
+        data_block_elements.div_ceil(header.data_block_page_elements)
     } else {
         0
     }

@@ -57,10 +57,13 @@ impl DataspaceMessage {
             .checked_add(dim_bytes)
             .ok_or_else(|| Error::InvalidFormat("dataspace message size overflow".into()))?;
 
-        out.clear();
         if out.capacity() < capacity {
-            out.reserve_exact(capacity - out.capacity());
+            out.try_reserve_exact(capacity - out.capacity())
+                .map_err(|err| {
+                    Error::InvalidFormat(format!("dataspace message allocation failed: {err}"))
+                })?;
         }
+        out.clear();
 
         match self.version {
             1 => {
@@ -75,7 +78,12 @@ impl DataspaceMessage {
                 out.push(if has_max { 0x01 } else { 0x00 });
                 out.push(self.space_type.encoded_v2_type());
             }
-            _ => unreachable!("version was validated above"),
+            _ => {
+                return Err(Error::InvalidFormat(format!(
+                    "dataspace message version {}",
+                    self.version
+                )));
+            }
         }
 
         write_dims(out, &self.dims);
@@ -274,7 +282,10 @@ impl DataspaceMessage {
                 }
                 Ok(())
             }
-            _ => unreachable!("version was validated above"),
+            _ => Err(Error::InvalidFormat(format!(
+                "dataspace message version {}",
+                self.version
+            ))),
         }
     }
 }
@@ -324,7 +335,10 @@ fn read_dims(data: &[u8], pos: &mut usize, count: usize, context: &str) -> Resul
         .checked_mul(8)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} length overflow")))?;
     let bytes = checked_window(data, *pos, bytes_len, context)?;
-    let mut dims = Vec::with_capacity(count);
+    let mut dims = Vec::new();
+    dims.try_reserve_exact(count).map_err(|err| {
+        Error::InvalidFormat(format!("dataspace dimension allocation failed: {err}"))
+    })?;
     for chunk in bytes.chunks_exact(8) {
         let mut val = 0u64;
         for (i, byte) in chunk.iter().enumerate() {

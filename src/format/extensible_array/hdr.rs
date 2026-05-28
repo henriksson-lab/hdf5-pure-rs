@@ -112,6 +112,8 @@ pub(super) fn cache_hdr_get_initial_load_size() -> usize {
 
 /// Compute the on-disk size of an extensible array header for the given widths.
 pub(super) fn cache_hdr_image_len(addr_size: usize, length_size: usize) -> Result<usize> {
+    validate_width(addr_size, "extensible array encoded address size")?;
+    validate_width(length_size, "extensible array encoded integer size")?;
     let fixed = 4usize
         .checked_add(8)
         .and_then(|value| value.checked_add(6usize.checked_mul(length_size)?))
@@ -130,7 +132,18 @@ pub(super) fn cache_hdr_serialize_into(
     length_size: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut image = Vec::with_capacity(cache_hdr_image_len(addr_size, length_size)?);
+    if header.data_block_page_elements == 0 || !header.data_block_page_elements.is_power_of_two() {
+        return Err(Error::InvalidFormat(
+            "extensible array page element count must be a power of two".into(),
+        ));
+    }
+    let image_len = cache_hdr_image_len(addr_size, length_size)?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "extensible array header image allocation failed: {err}"
+        ))
+    })?;
     image.extend_from_slice(b"EAHD");
     image.push(0);
     image.push(header.class_id);
@@ -147,8 +160,7 @@ pub(super) fn cache_hdr_serialize_into(
     image.push(
         header
             .data_block_page_elements
-            .checked_ilog2()
-            .unwrap_or(0)
+            .ilog2()
             .try_into()
             .map_err(|_| Error::InvalidFormat("extensible array page bits overflow".into()))?,
     );
@@ -162,6 +174,13 @@ pub(super) fn cache_hdr_serialize_into(
     let checksum = checksum_metadata(&image);
     image.extend_from_slice(&checksum.to_le_bytes());
     *out = image;
+    Ok(())
+}
+
+fn validate_width(size: usize, context: &str) -> Result<()> {
+    if size == 0 || size > 8 {
+        return Err(Error::InvalidFormat(format!("{context} is invalid")));
+    }
     Ok(())
 }
 
@@ -604,9 +623,28 @@ mod tests {
 
         let too_large_addr = super::ParsedExtensibleArrayHeader {
             index_block_addr: u64::from(u32::MAX) + 1,
-            ..header
+            ..header.clone()
         };
         assert!(cache_hdr_serialize_into(&too_large_addr, 4, 4, &mut stale).is_err());
+        assert_eq!(stale, b"keep me");
+
+        assert!(super::cache_hdr_image_len(0, 4).is_err());
+        assert!(super::cache_hdr_image_len(4, 9).is_err());
+        assert!(cache_hdr_serialize_into(&header, 0, 4, &mut stale).is_err());
+        assert_eq!(stale, b"keep me");
+
+        let invalid_page_elements = super::ParsedExtensibleArrayHeader {
+            data_block_page_elements: 3,
+            ..header.clone()
+        };
+        assert!(cache_hdr_serialize_into(&invalid_page_elements, 4, 4, &mut stale).is_err());
+        assert_eq!(stale, b"keep me");
+
+        let zero_page_elements = super::ParsedExtensibleArrayHeader {
+            data_block_page_elements: 0,
+            ..header
+        };
+        assert!(cache_hdr_serialize_into(&zero_page_elements, 4, 4, &mut stale).is_err());
         assert_eq!(stale, b"keep me");
     }
 

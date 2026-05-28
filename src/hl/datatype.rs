@@ -236,12 +236,20 @@ impl Datatype {
 
     /// Store compound type fields in caller-provided storage.
     pub fn compound_fields_into(&self, out: &mut Vec<CompoundField>) -> crate::Result<()> {
-        out.clear();
-        let fields = self.msg.compound_fields_iter()?;
-        out.reserve(fields.len());
+        let fields = match self.msg.compound_fields_iter() {
+            Ok(fields) => fields,
+            Err(err) => {
+                out.clear();
+                return Err(err);
+            }
+        };
+        let mut next = Vec::new();
+        next.try_reserve_exact(fields.len()).map_err(|err| {
+            crate::Error::InvalidFormat(format!("compound field allocation failed: {err}"))
+        })?;
         for field in fields {
             let field = field?;
-            out.push(CompoundField {
+            next.push(CompoundField {
                 name: field.name.into_owned(),
                 byte_offset: field.byte_offset,
                 size: field.size,
@@ -250,6 +258,7 @@ impl Datatype {
                 datatype: Box::new(field.datatype),
             });
         }
+        *out = next;
         Ok(())
     }
 
@@ -311,13 +320,22 @@ impl Datatype {
 
     /// Store enum members as owned `(name, value)` pairs in caller-provided storage.
     pub fn enum_members_into(&self, out: &mut Vec<(String, u64)>) -> crate::Result<()> {
-        out.clear();
-        let members = self.msg.enum_members_iter()?;
-        out.reserve(members.len());
+        let members = match self.msg.enum_members_iter() {
+            Ok(members) => members,
+            Err(err) => {
+                out.clear();
+                return Err(err);
+            }
+        };
+        let mut next = Vec::new();
+        next.try_reserve_exact(members.len()).map_err(|err| {
+            crate::Error::InvalidFormat(format!("enum member allocation failed: {err}"))
+        })?;
         for member in members {
             let member = member?;
-            out.push((member.name.to_string(), member.value));
+            next.push((member.name.to_string(), member.value));
         }
+        *out = next;
         Ok(())
     }
 
@@ -377,12 +395,21 @@ impl Datatype {
 
     /// Store array dimensions in caller-provided storage.
     pub fn array_dims_into(&self, out: &mut Vec<u64>) -> crate::Result<()> {
-        out.clear();
-        let dims = self.array_dims_iter()?;
-        out.reserve(dims.len());
+        let dims = match self.array_dims_iter() {
+            Ok(dims) => dims,
+            Err(err) => {
+                out.clear();
+                return Err(err);
+            }
+        };
+        let mut next = Vec::new();
+        next.try_reserve_exact(dims.len()).map_err(|err| {
+            crate::Error::InvalidFormat(format!("array dimension allocation failed: {err}"))
+        })?;
         for dim in dims {
-            out.push(dim?);
+            next.push(dim?);
         }
+        *out = next;
         Ok(())
     }
 

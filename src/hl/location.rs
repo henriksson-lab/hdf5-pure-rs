@@ -17,11 +17,25 @@ pub trait Location {
 
     /// Append attribute names on this object into caller-provided storage.
     fn attr_names_into(&self, out: &mut Vec<String>) -> crate::Result<()> {
-        out.clear();
+        let mut next = Vec::new();
         self.visit_attr_names(|name| {
-            out.push(name.to_string());
+            let mut owned = String::new();
+            owned.try_reserve_exact(name.len()).map_err(|err| {
+                crate::Error::InvalidFormat(format!(
+                    "attribute name output allocation failed: {err}"
+                ))
+            })?;
+            owned.push_str(name);
+            next.try_reserve_exact(1).map_err(|err| {
+                crate::Error::InvalidFormat(format!(
+                    "attribute name list output allocation failed: {err}"
+                ))
+            })?;
+            next.push(owned);
             Ok(())
-        })
+        })?;
+        *out = next;
+        Ok(())
     }
 
     /// List attributes on this object.
@@ -38,11 +52,16 @@ pub trait Location {
 
     /// Store attributes on this object in caller-provided storage.
     fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> crate::Result<()> {
-        out.clear();
+        let mut next = Vec::new();
         self.visit_attrs(|attr| {
-            out.push(attr.clone());
+            next.try_reserve_exact(1).map_err(|err| {
+                crate::Error::InvalidFormat(format!("attribute output allocation failed: {err}"))
+            })?;
+            next.push(attr.clone());
             Ok(())
-        })
+        })?;
+        *out = next;
+        Ok(())
     }
 
     /// Return the number of attributes on this object.
@@ -68,14 +87,27 @@ pub trait Location {
         let mut pos = 0usize;
         self.visit_attr_names(|name| {
             if pos == index {
-                found = Some(name.to_string());
+                let mut owned = String::new();
+                owned.try_reserve_exact(name.len()).map_err(|err| {
+                    crate::Error::InvalidFormat(format!(
+                        "attribute name output allocation failed: {err}"
+                    ))
+                })?;
+                owned.push_str(name);
+                found = Some(owned);
             }
             pos += 1;
             Ok(())
         })?;
         match found {
             Some(name) => {
-                *out = name;
+                out.try_reserve_exact(name.len()).map_err(|err| {
+                    crate::Error::InvalidFormat(format!(
+                        "attribute name output allocation failed: {err}"
+                    ))
+                })?;
+                out.clear();
+                out.push_str(&name);
                 Ok(())
             }
             None => Err(crate::Error::InvalidFormat(format!(

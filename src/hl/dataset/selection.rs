@@ -386,7 +386,10 @@ impl Dataset {
         points: &[Vec<u64>],
     ) -> Result<Vec<T>> {
         let strides = Self::row_major_strides(shape)?;
-        let mut result = Vec::with_capacity(points.len());
+        let mut result = Vec::new();
+        result.try_reserve_exact(points.len()).map_err(|err| {
+            Error::InvalidFormat(format!("point selection allocation failed: {err}"))
+        })?;
         for point in points {
             let index = Self::linear_index(point, &strides)?;
             if index < all_data.len() {
@@ -431,7 +434,10 @@ impl Dataset {
     ) -> Result<Vec<T>> {
         let strides = Self::row_major_strides(shape)?;
         let ndims = shape.len();
-        let mut result = Vec::with_capacity(total_out_usize);
+        let mut result = Vec::new();
+        result.try_reserve_exact(total_out_usize).map_err(|err| {
+            Error::InvalidFormat(format!("hyperslab selection allocation failed: {err}"))
+        })?;
         let mut out_idx = vec![0u64; ndims];
         for _ in 0..total_out {
             let mut in_linear = 0usize;
@@ -544,7 +550,7 @@ impl Dataset {
 
         let info = self.info()?;
         let conversion = crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
-        if !conversion.is_same_size_bytes() {
+        if !conversion.is_same_size_bytes() || T::requires_validation() {
             return Ok(None);
         }
         let elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
@@ -764,10 +770,16 @@ impl Dataset {
         }
         let end = end.min(all_data.len());
         if slice.step == 1 {
-            return Ok(all_data[start..end].to_vec());
+            return copy_h5_values(&all_data[start..end], "1D selection");
         }
         let step = usize_from_u64(slice.step, "selection step")?;
-        Ok(all_data[start..end].iter().step_by(step).copied().collect())
+        let selected = selection_len_for_step(end - start, step)?;
+        let mut result = Vec::new();
+        result.try_reserve_exact(selected).map_err(|err| {
+            Error::InvalidFormat(format!("1D selection allocation failed: {err}"))
+        })?;
+        result.extend(all_data[start..end].iter().step_by(step).copied());
+        Ok(result)
     }
 
     fn extract_1d_selection_into<T: crate::hl::types::H5Type>(
@@ -810,7 +822,10 @@ impl Dataset {
         total_out: u64,
         total_out_usize: usize,
     ) -> Result<Vec<T>> {
-        let mut result = Vec::with_capacity(total_out_usize);
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(total_out_usize)
+            .map_err(|err| Error::InvalidFormat(format!("selection allocation failed: {err}")))?;
         let ndims = shape.len();
 
         let mut in_strides = vec![1usize; ndims];
@@ -941,6 +956,23 @@ impl Dataset {
             })
             .ok_or_else(|| Error::InvalidFormat("linear index overflow".into()))
     }
+}
+
+fn copy_h5_values<T: crate::hl::types::H5Type>(values: &[T], context: &str) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(values.len())
+        .map_err(|err| Error::InvalidFormat(format!("{context} allocation failed: {err}")))?;
+    out.extend_from_slice(values);
+    Ok(out)
+}
+
+fn selection_len_for_step(len: usize, step: usize) -> Result<usize> {
+    if step == 0 {
+        return Err(Error::InvalidFormat(
+            "selection step must be non-zero".into(),
+        ));
+    }
+    Ok(if len == 0 { 0 } else { (len - 1) / step + 1 })
 }
 
 #[cfg(test)]

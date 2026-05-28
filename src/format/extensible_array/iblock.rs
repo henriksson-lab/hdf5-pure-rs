@@ -195,7 +195,14 @@ pub(super) fn decode_index_block<R: Read + Seek>(
         header.max_index_set,
         "extensible array max index",
     )?);
-    let mut elements = Vec::with_capacity(inline_element_count);
+    let mut elements = Vec::new();
+    elements
+        .try_reserve_exact(inline_element_count)
+        .map_err(|err| {
+            Error::InvalidFormat(format!(
+                "extensible array index block elements allocation failed: {err}"
+            ))
+        })?;
     for idx in 0..header.index_block_elements {
         let element = read_element(reader, filtered, chunk_size_len)?;
         if u64::from(idx) < header.max_index_set {
@@ -203,12 +210,26 @@ pub(super) fn decode_index_block<R: Read + Seek>(
         }
     }
 
-    let mut data_block_addrs = Vec::with_capacity(header.index_block_data_block_addrs);
+    let mut data_block_addrs = Vec::new();
+    data_block_addrs
+        .try_reserve_exact(header.index_block_data_block_addrs)
+        .map_err(|err| {
+            Error::InvalidFormat(format!(
+                "extensible array index block data-block address allocation failed: {err}"
+            ))
+        })?;
     for _ in 0..header.index_block_data_block_addrs {
         data_block_addrs.push(reader.read_addr()?);
     }
 
-    let mut super_block_addrs = Vec::with_capacity(header.index_block_super_block_addrs);
+    let mut super_block_addrs = Vec::new();
+    super_block_addrs
+        .try_reserve_exact(header.index_block_super_block_addrs)
+        .map_err(|err| {
+            Error::InvalidFormat(format!(
+                "extensible array index block super-block address allocation failed: {err}"
+            ))
+        })?;
     for _ in 0..header.index_block_super_block_addrs {
         super_block_addrs.push(reader.read_addr()?);
     }

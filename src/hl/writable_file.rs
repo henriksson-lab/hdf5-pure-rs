@@ -5,7 +5,7 @@ use crate::engine::writer::{AttrSpec, HdfFileWriter, SharedMessageIndexConfig};
 use crate::error::{Error, Result};
 use crate::hl::dataset_builder::DatasetBuilder;
 use crate::hl::plist::file_create::FileSpaceStrategy;
-use crate::hl::types::{slice_as_bytes_checked, H5Type};
+use crate::hl::types::{values_as_bytes_checked, H5Type};
 
 /// A writable HDF5 file under construction.
 ///
@@ -236,12 +236,12 @@ impl WritableFile {
     /// Add an attribute to the root group.
     pub fn add_attr<T: H5Type>(&mut self, name: &str, value: T) -> Result<()> {
         let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
-        let data = slice_as_bytes_checked(std::slice::from_ref(&value))?;
+        let data = values_as_bytes_checked(std::slice::from_ref(&value))?;
         self.writer.add_root_attr(&AttrSpec {
             name,
             shape: &[],
             dtype,
-            data,
+            data: data.as_ref(),
         })
     }
 
@@ -252,14 +252,14 @@ impl WritableFile {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = slice_as_bytes_checked(values)?;
+        let data = values_as_bytes_checked(values)?;
         debug_assert_eq!(data.len(), byte_len);
         let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_root_attr(&AttrSpec {
             name,
             shape: &shape,
             dtype,
-            data,
+            data: data.as_ref(),
         })
     }
 
@@ -375,14 +375,14 @@ impl<'a> WritableGroup<'a> {
     /// Add an attribute to this group.
     pub fn add_attr<T: H5Type>(&mut self, name: &str, value: T) -> Result<()> {
         let dtype = crate::hl::dataset_builder::dtype_for_type::<T>()?;
-        let data = slice_as_bytes_checked(std::slice::from_ref(&value))?;
+        let data = values_as_bytes_checked(std::slice::from_ref(&value))?;
         self.writer.add_group_attr(
             &self.path,
             &AttrSpec {
                 name,
                 shape: &[],
                 dtype,
-                data,
+                data: data.as_ref(),
             },
         )
     }
@@ -394,7 +394,7 @@ impl<'a> WritableGroup<'a> {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = slice_as_bytes_checked(values)?;
+        let data = values_as_bytes_checked(values)?;
         debug_assert_eq!(data.len(), byte_len);
         let shape = [usize_to_u64(values.len(), "attribute element count")?];
         self.writer.add_group_attr(
@@ -403,7 +403,7 @@ impl<'a> WritableGroup<'a> {
                 name,
                 shape: &shape,
                 dtype,
-                data,
+                data: data.as_ref(),
             },
         )
     }

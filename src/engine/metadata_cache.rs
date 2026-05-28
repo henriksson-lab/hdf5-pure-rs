@@ -712,6 +712,12 @@ impl MetadataCache {
 
     /// Serialize a proxy entry and mark it serialized.
     pub fn proxy_entry_serialize_into(&mut self, proxy_addr: u64, out: &mut Vec<u8>) -> Result<()> {
+        let image_len = self.require_entry(proxy_addr)?.image.len();
+        out.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "metadata proxy image output allocation failed: {err}"
+            ))
+        })?;
         let entry = self.require_entry_mut(proxy_addr)?;
         entry.serialized = true;
         out.clear();
@@ -1185,10 +1191,24 @@ pub fn H5C__serialize_ring_into(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     H5C__flush_ring(cache, ring)?;
-    out.clear();
+    let image_len =
+        cache_image_buffer_len(cache.entries.values().filter(|entry| entry.ring == ring))?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "metadata cache ring image allocation failed: {err}"
+        ))
+    })?;
     for entry in cache.entries.values().filter(|entry| entry.ring == ring) {
-        write_cache_image_entry(entry, out)?;
+        write_cache_image_entry(entry, &mut image)?;
     }
+    out.try_reserve_exact(image.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "metadata cache ring output allocation failed: {err}"
+        ))
+    })?;
+    out.clear();
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -1225,17 +1245,19 @@ pub fn H5C__construct_cache_image_buffer_into(
     cache: &MetadataCache,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    out.clear();
-    let stats = cache.stats();
-    out.reserve(
-        stats
-            .entries
-            .saturating_mul(16)
-            .saturating_add(stats.total_image_bytes),
-    );
+    let image_len = cache_image_buffer_len(cache.entries.values())?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!("metadata cache image allocation failed: {err}"))
+    })?;
     for entry in cache.entries.values() {
-        write_cache_image_entry(entry, out)?;
+        write_cache_image_entry(entry, &mut image)?;
     }
+    out.try_reserve_exact(image.len()).map_err(|err| {
+        Error::InvalidFormat(format!("metadata cache output allocation failed: {err}"))
+    })?;
+    out.clear();
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -1265,12 +1287,9 @@ pub fn H5C__deserialize_cache_image_buffer_into(
             Error::InvalidFormat("metadata cache image entry length exceeds usize".into())
         })?;
         let end = checked_add(pos, len, "metadata cache image entry payload")?;
-        let image = bytes
-            .get(pos..end)
-            .ok_or_else(|| {
-                Error::InvalidFormat("metadata cache image entry payload is truncated".into())
-            })?
-            .to_vec();
+        let image = copy_cache_image_payload(bytes.get(pos..end).ok_or_else(|| {
+            Error::InvalidFormat("metadata cache image entry payload is truncated".into())
+        })?)?;
         decoded.push(MetadataCacheEntry::new(addr, "prefetched", image));
         pos = end;
     }
@@ -1301,12 +1320,9 @@ pub fn H5C__reconstruct_cache_contents_from_image(bytes: &[u8]) -> Result<Metada
             Error::InvalidFormat("metadata cache image entry length exceeds usize".into())
         })?;
         let end = checked_add(pos, len, "metadata cache image entry payload")?;
-        let image = bytes
-            .get(pos..end)
-            .ok_or_else(|| {
-                Error::InvalidFormat("metadata cache image entry payload is truncated".into())
-            })?
-            .to_vec();
+        let image = copy_cache_image_payload(bytes.get(pos..end).ok_or_else(|| {
+            Error::InvalidFormat("metadata cache image entry payload is truncated".into())
+        })?)?;
         cache.insert_entry(MetadataCacheEntry::new(addr, "prefetched", image))?;
         pos = end;
     }
@@ -1665,12 +1681,34 @@ fn usize_to_u64(value: usize, context: &str) -> Result<u64> {
 
 /// Append one cache-image entry record to `out`.
 fn write_cache_image_entry(entry: &MetadataCacheEntry, out: &mut Vec<u8>) -> Result<()> {
+    let record_len = metadata_cache_entry_image_len(entry)?;
+    out.try_reserve_exact(record_len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "metadata cache entry image allocation failed: {err}"
+        ))
+    })?;
     out.extend_from_slice(&entry.addr.to_le_bytes());
     out.extend_from_slice(
         &usize_to_u64(entry.image.len(), "metadata cache entry image length")?.to_le_bytes(),
     );
     out.extend_from_slice(&entry.image);
     Ok(())
+}
+
+fn metadata_cache_entry_image_len(entry: &MetadataCacheEntry) -> Result<usize> {
+    usize_to_u64(entry.image.len(), "metadata cache entry image length")?;
+    16usize
+        .checked_add(entry.image.len())
+        .ok_or_else(|| Error::InvalidFormat("metadata cache entry image length overflow".into()))
+}
+
+fn cache_image_buffer_len<'a>(
+    entries: impl IntoIterator<Item = &'a MetadataCacheEntry>,
+) -> Result<usize> {
+    entries.into_iter().try_fold(0usize, |acc, entry| {
+        acc.checked_add(metadata_cache_entry_image_len(entry)?)
+            .ok_or_else(|| Error::InvalidFormat("metadata cache image length overflow".into()))
+    })
 }
 
 /// Add two `usize` values, surfacing `context` on overflow.
@@ -1718,6 +1756,17 @@ fn cache_image_entry_count_hint(bytes: &[u8]) -> usize {
     count
 }
 
+fn copy_cache_image_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut image = Vec::new();
+    image.try_reserve_exact(payload.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "metadata cache image payload allocation failed: {err}"
+        ))
+    })?;
+    image.extend_from_slice(payload);
+    Ok(image)
+}
+
 /// Load an entry image by address as a borrowed view.
 #[allow(non_snake_case)]
 pub fn H5C__load_entry_view(cache: &MetadataCache, addr: u64) -> Result<&[u8]> {
@@ -1728,6 +1777,11 @@ pub fn H5C__load_entry_view(cache: &MetadataCache, addr: u64) -> Result<&[u8]> {
 #[allow(non_snake_case)]
 pub fn H5C__load_entry_into(cache: &MetadataCache, addr: u64, out: &mut Vec<u8>) -> Result<()> {
     let image = H5C__load_entry_view(cache, addr)?;
+    out.try_reserve_exact(image.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "metadata cache entry output allocation failed: {err}"
+        ))
+    })?;
     out.clear();
     out.extend_from_slice(image);
     Ok(())

@@ -165,13 +165,18 @@ impl DataLayoutMessage {
                 result.contiguous_addr = data_addr;
             }
             LayoutClass::Chunked => {
-                let (chunk_dims, element_size) =
-                    chunk_dims.expect("v1/v2 chunked layout dimensions were decoded");
+                let (chunk_dims, element_size) = chunk_dims.ok_or_else(|| {
+                    Error::InvalidFormat("missing data layout v1/v2 chunk dimensions".into())
+                })?;
                 result.chunk_index_addr = data_addr;
                 result.chunk_element_size = Some(element_size);
                 result.chunk_dims = Some(chunk_dims);
             }
-            LayoutClass::Virtual => unreachable!(),
+            LayoutClass::Virtual => {
+                return Err(Error::InvalidFormat(
+                    "virtual data layout is not valid for v1/v2 messages".into(),
+                ));
+            }
         }
 
         Ok(result)
@@ -434,7 +439,12 @@ impl DataLayoutMessage {
             )));
         }
 
-        let mut dims = Vec::with_capacity(ndims);
+        let mut dims = Vec::new();
+        dims.try_reserve_exact(ndims).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "data layout v4 chunk dimension allocation failed: {err}"
+            ))
+        })?;
         for _ in 0..ndims {
             dims.push(read_le_u64(
                 data,
@@ -732,7 +742,12 @@ fn read_u32_chunk_dims_and_element_size(
     let chunk_dim_count = ndims
         .checked_sub(1)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} chunk rank must be positive")))?;
-    let mut dims = Vec::with_capacity(chunk_dim_count);
+    let mut dims = Vec::new();
+    dims.try_reserve_exact(chunk_dim_count).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "{context} chunk dimension allocation failed: {err}"
+        ))
+    })?;
     for _ in 0..chunk_dim_count {
         let dim = u64::from(read_u32_le(data, pos, dims_context)?);
         dims.push(dim);

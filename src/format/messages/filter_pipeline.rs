@@ -74,7 +74,10 @@ impl FilterPipelineMessage {
         // v1: version(1) + nfilters(1) + reserved(6)
         ensure_available(data, 0, 8, "filter pipeline v1 header")?;
         let mut pos = 8;
-        let mut filters = Vec::with_capacity(nfilters);
+        let mut filters = Vec::new();
+        filters.try_reserve_exact(nfilters).map_err(|err| {
+            Error::InvalidFormat(format!("filter pipeline v1 allocation failed: {err}"))
+        })?;
 
         for _ in 0..nfilters {
             let id = read_u16_le(data, &mut pos, "filter pipeline v1 filter id")?;
@@ -144,7 +147,10 @@ impl FilterPipelineMessage {
     fn decode_v2(data: &[u8], nfilters: usize) -> Result<Self> {
         // v2: version(1) + nfilters(1), no reserved bytes
         let mut pos = 2;
-        let mut filters = Vec::with_capacity(nfilters);
+        let mut filters = Vec::new();
+        filters.try_reserve_exact(nfilters).map_err(|err| {
+            Error::InvalidFormat(format!("filter pipeline v2 allocation failed: {err}"))
+        })?;
 
         for _ in 0..nfilters {
             let id = read_u16_le(data, &mut pos, "filter pipeline v2 filter id")?;
@@ -209,7 +215,10 @@ fn read_client_data(data: &[u8], pos: &mut usize, count: usize, context: &str) -
         .checked_mul(4)
         .ok_or_else(|| Error::InvalidFormat(format!("{context} byte length overflow")))?;
     let bytes = checked_window(data, *pos, byte_len, context)?;
-    let mut values = Vec::with_capacity(count);
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|err| {
+        Error::InvalidFormat(format!("filter client data allocation failed: {err}"))
+    })?;
     for chunk in bytes.chunks_exact(4) {
         values.push(u32::from_le_bytes(chunk.try_into().map_err(|_| {
             Error::InvalidFormat(format!("{context} is truncated"))

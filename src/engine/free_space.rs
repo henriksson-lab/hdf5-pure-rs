@@ -347,12 +347,19 @@ impl FreeSpaceManager {
                 "free-space header alignment is zero".into(),
             ));
         }
-        out.reserve(self.cache_hdr_image_len());
-        let start = out.len();
-        out.extend_from_slice(&self.params.alignment.to_le_bytes());
-        out.extend_from_slice(&self.params.threshold.to_le_bytes());
-        let checksum = crate::format::checksum::checksum_metadata(&out[start..]);
-        out.extend_from_slice(&checksum.to_le_bytes());
+        let image_len = self.cache_hdr_image_len();
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!("free-space header image allocation failed: {err}"))
+        })?;
+        image.extend_from_slice(&self.params.alignment.to_le_bytes());
+        image.extend_from_slice(&self.params.threshold.to_le_bytes());
+        let checksum = crate::format::checksum::checksum_metadata(&image);
+        image.extend_from_slice(&checksum.to_le_bytes());
+        out.try_reserve_exact(image.len()).map_err(|err| {
+            Error::InvalidFormat(format!("free-space header output allocation failed: {err}"))
+        })?;
+        out.extend_from_slice(&image);
         Ok(())
     }
 
@@ -420,12 +427,23 @@ impl FreeSpaceManager {
 
     /// Append the serialized section-info image with trailing checksum to `out`.
     pub fn cache_sinfo_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
-        let mut image = Vec::with_capacity(self.cache_sinfo_image_len()?);
+        let image_len = self.cache_sinfo_image_len()?;
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "free-space section info image allocation failed: {err}"
+            ))
+        })?;
         for section in self.sections.values() {
             section.serialize_checked(&mut image)?;
         }
         let checksum = crate::format::checksum::checksum_metadata(&image);
         image.extend_from_slice(&checksum.to_le_bytes());
+        out.try_reserve_exact(image.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "free-space section info output allocation failed: {err}"
+            ))
+        })?;
         out.extend_from_slice(&image);
         Ok(())
     }

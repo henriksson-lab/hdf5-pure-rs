@@ -4,7 +4,7 @@ use crate::engine::writer::{
     ChunkWriteSpec, CompoundFieldSpec, DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter,
 };
 use crate::error::{Error, Result};
-use crate::hl::types::{slice_as_bytes, slice_as_bytes_checked, H5Type, TypeClass};
+use crate::hl::types::{values_as_bytes_checked, H5Type, PrimitiveType, TypeClass};
 
 /// Builder for creating datasets with a fluent API.
 pub struct DatasetBuilder<'a> {
@@ -21,6 +21,7 @@ pub struct DatasetBuilder<'a> {
     compact: bool,
     fill_value: Option<Vec<u8>>,
     vlen_utf8_fill_value: Option<String>,
+    pending_error: Option<Error>,
     alloc_time: u8,
     fill_time: u8,
     attrs: Vec<OwnedBuilderAttr>,
@@ -78,6 +79,7 @@ impl<'a> DatasetBuilder<'a> {
             compact: false,
             fill_value: None,
             vlen_utf8_fill_value: None,
+            pending_error: None,
             alloc_time: 1,
             fill_time: 2,
             attrs: Vec::new(),
@@ -143,7 +145,10 @@ impl<'a> DatasetBuilder<'a> {
 
     /// Set a scalar fill value for missing or newly allocated dataset storage.
     pub fn fill_value<T: H5Type>(mut self, value: T) -> Self {
-        self.fill_value = Some(slice_as_bytes(std::slice::from_ref(&value)).to_vec());
+        match values_as_bytes_checked(std::slice::from_ref(&value)) {
+            Ok(bytes) => self.fill_value = Some(bytes.to_vec()),
+            Err(err) => self.pending_error = Some(err),
+        }
         self
     }
 
@@ -160,7 +165,7 @@ impl<'a> DatasetBuilder<'a> {
             name: name.to_string(),
             shape: Vec::new(),
             dtype,
-            data: slice_as_bytes_checked(std::slice::from_ref(&value))?.to_vec(),
+            data: values_as_bytes_checked(std::slice::from_ref(&value))?.into_owned(),
         })?;
         Ok(self)
     }
@@ -172,7 +177,7 @@ impl<'a> DatasetBuilder<'a> {
             .len()
             .checked_mul(T::type_size())
             .ok_or_else(|| Error::InvalidFormat("attribute byte size overflow".into()))?;
-        let data = slice_as_bytes_checked(values)?;
+        let data = values_as_bytes_checked(values)?;
         debug_assert_eq!(data.len(), byte_len);
         self.push_attr(OwnedBuilderAttr {
             name: name.to_string(),
@@ -242,7 +247,8 @@ impl<'a> DatasetBuilder<'a> {
     }
 
     /// Write data and create the dataset. Infers shape from data length if not set.
-    pub fn write<T: H5Type>(self, data: &[T]) -> Result<()> {
+    pub fn write<T: H5Type>(mut self, data: &[T]) -> Result<()> {
+        self.check_pending_error()?;
         let dtype = dtype_for_type::<T>()?;
         let fill = Self::fill_spec(
             self.fill_value.as_deref(),
@@ -258,14 +264,14 @@ impl<'a> DatasetBuilder<'a> {
         let max_shape =
             Self::effective_max_shape(self.resizable, self.max_shape.as_deref(), shape.as_ref())?;
 
-        let data_bytes = slice_as_bytes_checked(data)?;
+        let data_bytes = values_as_bytes_checked(data)?;
 
         let spec = DatasetSpec {
             name: &self.name,
             shape: shape.as_ref(),
             max_shape: max_shape.as_ref().map(|shape| shape.as_ref()),
             dtype,
-            data: data_bytes,
+            data: data_bytes.as_ref(),
         };
         if self.compact {
             self.validate_compact_options()?;
@@ -315,7 +321,8 @@ impl<'a> DatasetBuilder<'a> {
     ///
     /// The dataset shape must be set explicitly. Missing chunks read back as
     /// the configured fill value, or zero bytes when no fill value was set.
-    pub fn write_fill<T: H5Type>(self) -> Result<()> {
+    pub fn write_fill<T: H5Type>(mut self) -> Result<()> {
+        self.check_pending_error()?;
         if self.compact {
             return Err(Error::Unsupported(
                 "fill-only dataset writer does not support compact storage".into(),
@@ -370,12 +377,13 @@ impl<'a> DatasetBuilder<'a> {
     ///
     /// Only the listed chunks are written. Unlisted chunks read as the
     /// configured fill value, or zero bytes when no fill value was set.
-    pub fn write_chunks<'b, T, I, C>(self, chunks: I) -> Result<()>
+    pub fn write_chunks<'b, T, I, C>(mut self, chunks: I) -> Result<()>
     where
         T: H5Type + 'b,
         I: IntoIterator<Item = (C, &'b [T])>,
         C: AsRef<[u64]>,
     {
+        self.check_pending_error()?;
         if self.compact {
             return Err(Error::Unsupported(
                 "chunk-list dataset writer does not support compact storage".into(),
@@ -399,19 +407,17 @@ impl<'a> DatasetBuilder<'a> {
             )
         })?;
 
-        let owned_chunks: Vec<(Vec<u64>, &'b [T])> = chunks
+        let owned_chunks: Vec<(Vec<u64>, Cow<'_, [u8]>)> = chunks
             .into_iter()
-            .map(|(coords, data)| (coords.as_ref().to_vec(), data))
-            .collect();
+            .map(|(coords, data)| Ok((coords.as_ref().to_vec(), values_as_bytes_checked(data)?)))
+            .collect::<Result<_>>()?;
         let byte_chunks: Vec<ChunkWriteSpec<'_>> = owned_chunks
             .iter()
-            .map(|(coords, data)| {
-                Ok(ChunkWriteSpec {
-                    coords,
-                    data: slice_as_bytes_checked(data)?,
-                })
+            .map(|(coords, data)| ChunkWriteSpec {
+                coords,
+                data: data.as_ref(),
             })
-            .collect::<Result<_>>()?;
+            .collect();
 
         let spec = DatasetSpec {
             name: &self.name,
@@ -443,7 +449,8 @@ impl<'a> DatasetBuilder<'a> {
     /// primitive type, such as enum, opaque, array, and nested compound
     /// datatypes. If no shape was set, a one-dimensional shape is inferred
     /// from `data.len() / dtype.size()`.
-    pub fn write_raw_with_dtype(self, dtype: DtypeSpec, data: &[u8]) -> Result<()> {
+    pub fn write_raw_with_dtype(mut self, dtype: DtypeSpec, data: &[u8]) -> Result<()> {
+        self.check_pending_error()?;
         let dtype_size = dtype.size() as usize;
         if dtype_size == 0 {
             return Err(Error::InvalidFormat(
@@ -537,7 +544,8 @@ impl<'a> DatasetBuilder<'a> {
     }
 
     /// Write a scalar value.
-    pub fn write_scalar<T: H5Type>(self, value: T) -> Result<()> {
+    pub fn write_scalar<T: H5Type>(mut self, value: T) -> Result<()> {
+        self.check_pending_error()?;
         if self.chunk_dims.is_some()
             || self.deflate_level.is_some()
             || self.shuffle
@@ -559,14 +567,14 @@ impl<'a> DatasetBuilder<'a> {
             self.alloc_time,
             self.fill_time,
         )?;
-        let data_bytes = slice_as_bytes_checked(std::slice::from_ref(&value))?;
+        let data_bytes = values_as_bytes_checked(std::slice::from_ref(&value))?;
 
         let spec = DatasetSpec {
             name: &self.name,
             shape: &[],
             max_shape: None,
             dtype,
-            data: data_bytes,
+            data: data_bytes.as_ref(),
         };
 
         if self.compact {
@@ -605,7 +613,8 @@ impl<'a> DatasetBuilder<'a> {
     }
 
     /// Write variable-length UTF-8 strings using HDF5 global heap storage.
-    pub fn write_vlen_utf8_strings(self, data: &[&str]) -> Result<()> {
+    pub fn write_vlen_utf8_strings(mut self, data: &[&str]) -> Result<()> {
+        self.check_pending_error()?;
         if self.compact {
             return Err(Error::Unsupported(
                 "variable-length string writer does not support compact storage".into(),
@@ -670,7 +679,8 @@ impl<'a> DatasetBuilder<'a> {
         Ok(())
     }
 
-    fn write_fixed_strings(self, data: &[&str], len: usize, utf8: bool) -> Result<()> {
+    fn write_fixed_strings(mut self, data: &[&str], len: usize, utf8: bool) -> Result<()> {
+        self.check_pending_error()?;
         let len_u32 = usize_to_u32(len, "fixed string length")?;
         let dtype = if utf8 {
             DtypeSpec::FixedUtf8String {
@@ -783,6 +793,14 @@ impl<'a> DatasetBuilder<'a> {
         Ok(())
     }
 
+    fn check_pending_error(&mut self) -> Result<()> {
+        if let Some(err) = self.pending_error.take() {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
     fn fill_spec(
         value: Option<&[u8]>,
         dtype_size: usize,
@@ -871,34 +889,17 @@ impl<'a> DatasetBuilder<'a> {
 /// Map a Rust type to DtypeSpec.
 pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
     let size = T::type_size();
-    // Use TypeId to determine the exact type
-    use std::any::TypeId;
-    let id = TypeId::of::<T>();
-
-    if id == TypeId::of::<f64>() {
-        Ok(DtypeSpec::F64)
-    } else if id == TypeId::of::<f32>() {
-        Ok(DtypeSpec::F32)
-    } else if id == TypeId::of::<i128>() {
-        Ok(DtypeSpec::I128)
-    } else if id == TypeId::of::<i64>() {
-        Ok(DtypeSpec::I64)
-    } else if id == TypeId::of::<i32>() {
-        Ok(DtypeSpec::I32)
-    } else if id == TypeId::of::<i16>() {
-        Ok(DtypeSpec::I16)
-    } else if id == TypeId::of::<i8>() {
-        Ok(DtypeSpec::I8)
-    } else if id == TypeId::of::<u128>() {
-        Ok(DtypeSpec::U128)
-    } else if id == TypeId::of::<u64>() {
-        Ok(DtypeSpec::U64)
-    } else if id == TypeId::of::<u32>() {
-        Ok(DtypeSpec::U32)
-    } else if id == TypeId::of::<u16>() {
-        Ok(DtypeSpec::U16)
-    } else if id == TypeId::of::<u8>() {
-        Ok(DtypeSpec::U8)
+    if let Some(primitive) = T::primitive_type() {
+        dtype_for_primitive(primitive)
+    } else if let Some((signed, enum_size)) = T::enum_base_type() {
+        let mut members = Vec::new();
+        T::enum_members_u64_into(&mut members).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "unsupported enum type with size {}",
+                T::type_size()
+            ))
+        })?;
+        dtype_for_enum(signed, enum_size, members)
     } else {
         let mut fields = Vec::new();
         if T::compound_fields_into(&mut fields).is_none() {
@@ -908,46 +909,7 @@ pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
         }
         let mut out = Vec::with_capacity(fields.len());
         for field in fields {
-            let dtype = match field.type_class {
-                TypeClass::Integer { signed: true } => match field.size {
-                    1 => DtypeSpec::I8,
-                    2 => DtypeSpec::I16,
-                    4 => DtypeSpec::I32,
-                    8 => DtypeSpec::I64,
-                    16 => DtypeSpec::I128,
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "unsupported signed compound field size {other}"
-                        )))
-                    }
-                },
-                TypeClass::Integer { signed: false } => match field.size {
-                    1 => DtypeSpec::U8,
-                    2 => DtypeSpec::U16,
-                    4 => DtypeSpec::U32,
-                    8 => DtypeSpec::U64,
-                    16 => DtypeSpec::U128,
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "unsupported unsigned compound field size {other}"
-                        )))
-                    }
-                },
-                TypeClass::Float => match field.size {
-                    4 => DtypeSpec::F32,
-                    8 => DtypeSpec::F64,
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "unsupported floating compound field size {other}"
-                        )))
-                    }
-                },
-                TypeClass::Compound => {
-                    return Err(Error::Unsupported(
-                        "nested compound writer type descriptors are not supported".into(),
-                    ))
-                }
-            };
+            let dtype = dtype_for_type_class(field.size, field.type_class)?;
             out.push(CompoundFieldSpec {
                 name: field.name,
                 offset: usize_to_u32(field.offset, "compound field offset")?,
@@ -958,6 +920,120 @@ pub(crate) fn dtype_for_type<T: H5Type>() -> Result<DtypeSpec> {
             size: usize_to_u32(T::type_size(), "compound type size")?,
             fields: out,
         })
+    }
+}
+
+fn dtype_for_type_class(size: usize, type_class: TypeClass) -> Result<DtypeSpec> {
+    match type_class {
+        TypeClass::Integer { signed: true } => match size {
+            1 => Ok(DtypeSpec::I8),
+            2 => Ok(DtypeSpec::I16),
+            4 => Ok(DtypeSpec::I32),
+            8 => Ok(DtypeSpec::I64),
+            16 => Ok(DtypeSpec::I128),
+            other => Err(Error::Unsupported(format!(
+                "unsupported signed compound field size {other}"
+            ))),
+        },
+        TypeClass::Integer { signed: false } => match size {
+            1 => Ok(DtypeSpec::U8),
+            2 => Ok(DtypeSpec::U16),
+            4 => Ok(DtypeSpec::U32),
+            8 => Ok(DtypeSpec::U64),
+            16 => Ok(DtypeSpec::U128),
+            other => Err(Error::Unsupported(format!(
+                "unsupported unsigned compound field size {other}"
+            ))),
+        },
+        TypeClass::Float => match size {
+            4 => Ok(DtypeSpec::F32),
+            8 => Ok(DtypeSpec::F64),
+            other => Err(Error::Unsupported(format!(
+                "unsupported floating compound field size {other}"
+            ))),
+        },
+        TypeClass::Enum {
+            signed,
+            size,
+            members,
+        } => dtype_for_enum(signed, size, members),
+        TypeClass::Compound { size, fields } => {
+            let mut out = Vec::with_capacity(fields.len());
+            for field in fields {
+                let dtype = dtype_for_type_class(field.size, field.type_class)?;
+                out.push(CompoundFieldSpec {
+                    name: field.name,
+                    offset: usize_to_u32(field.offset, "nested compound field offset")?,
+                    dtype,
+                });
+            }
+            Ok(DtypeSpec::Compound {
+                size: usize_to_u32(size, "nested compound type size")?,
+                fields: out,
+            })
+        }
+    }
+}
+
+fn dtype_for_enum(signed: bool, size: usize, members: Vec<(String, u64)>) -> Result<DtypeSpec> {
+    let base = dtype_for_primitive(PrimitiveType::Integer { signed, size })?;
+    Ok(DtypeSpec::Enum {
+        base: Box::new(base),
+        members,
+    })
+}
+
+fn dtype_for_primitive(primitive: PrimitiveType) -> Result<DtypeSpec> {
+    match primitive {
+        PrimitiveType::Float { size: 4 } => Ok(DtypeSpec::F32),
+        PrimitiveType::Float { size: 8 } => Ok(DtypeSpec::F64),
+        PrimitiveType::Float { size } => Err(Error::Unsupported(format!(
+            "unsupported floating-point type size {size}"
+        ))),
+        PrimitiveType::Integer {
+            signed: true,
+            size: 1,
+        } => Ok(DtypeSpec::I8),
+        PrimitiveType::Integer {
+            signed: true,
+            size: 2,
+        } => Ok(DtypeSpec::I16),
+        PrimitiveType::Integer {
+            signed: true,
+            size: 4,
+        } => Ok(DtypeSpec::I32),
+        PrimitiveType::Integer {
+            signed: true,
+            size: 8,
+        } => Ok(DtypeSpec::I64),
+        PrimitiveType::Integer {
+            signed: true,
+            size: 16,
+        } => Ok(DtypeSpec::I128),
+        PrimitiveType::Integer {
+            signed: false,
+            size: 1,
+        } => Ok(DtypeSpec::U8),
+        PrimitiveType::Integer {
+            signed: false,
+            size: 2,
+        } => Ok(DtypeSpec::U16),
+        PrimitiveType::Integer {
+            signed: false,
+            size: 4,
+        } => Ok(DtypeSpec::U32),
+        PrimitiveType::Integer {
+            signed: false,
+            size: 8,
+        } => Ok(DtypeSpec::U64),
+        PrimitiveType::Integer {
+            signed: false,
+            size: 16,
+        } => Ok(DtypeSpec::U128),
+        PrimitiveType::Integer { signed, size } => Err(Error::Unsupported(format!(
+            "unsupported {}integer type size {size}",
+            if signed { "signed " } else { "unsigned " }
+        ))),
     }
 }
 

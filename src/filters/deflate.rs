@@ -19,7 +19,11 @@ pub fn decompress_with_hint_into(
 ) -> Result<()> {
     let mut decoded = Vec::new();
     if let Some(expected_len) = expected_len {
-        decoded.reserve(expected_len);
+        decoded.try_reserve_exact(expected_len).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "deflate decompression output allocation failed: {err}"
+            ))
+        })?;
     }
     let mut decoder = ZlibDecoder::new(data);
     decoder
@@ -115,6 +119,18 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("deflate decompression left trailing input bytes"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
+    fn deflate_hint_allocation_failure_returns_error() {
+        let mut out = b"stale".to_vec();
+        let err = decompress_with_hint_into(b"not zlib", Some(usize::MAX), &mut out).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deflate decompression output allocation failed"),
             "unexpected error: {err}"
         );
         assert_eq!(out, b"stale");

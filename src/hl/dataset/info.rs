@@ -83,11 +83,23 @@ impl Dataset {
 
     /// Append attribute names in storage order into caller-provided storage.
     pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
-        out.clear();
+        let mut next = Vec::new();
         self.visit_attr_names(|name| {
-            out.push(name.to_string());
+            let mut owned = String::new();
+            owned.try_reserve_exact(name.len()).map_err(|err| {
+                Error::InvalidFormat(format!("attribute name output allocation failed: {err}"))
+            })?;
+            owned.push_str(name);
+            next.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "attribute name list output allocation failed: {err}"
+                ))
+            })?;
+            next.push(owned);
             Ok(())
-        })
+        })?;
+        *out = next;
+        Ok(())
     }
 
     /// List attributes.
@@ -105,11 +117,8 @@ impl Dataset {
 
     /// Store attributes in caller-provided storage.
     pub fn attrs_into(&self, out: &mut Vec<crate::hl::attribute::Attribute>) -> Result<()> {
-        out.clear();
-        out.extend(crate::hl::attribute::collect_attributes(
-            &self.inner,
-            self.addr,
-        )?);
+        let attrs = crate::hl::attribute::collect_attributes(&self.inner, self.addr)?;
+        *out = attrs;
         Ok(())
     }
 
@@ -316,10 +325,15 @@ impl Dataset {
     /// Get the shape of the dataset into caller-provided storage, overriding dataset access properties.
     pub fn shape_with_access_into(&self, access: &DatasetAccess, out: &mut Vec<u64>) -> Result<()> {
         let info = self.info()?;
-        out.clear();
         if info.layout.layout_class == LayoutClass::Virtual {
-            out.extend(self.virtual_shape_with_info(&info, access)?);
+            let next = self.virtual_shape_with_info(&info, access)?;
+            *out = next;
         } else {
+            out.try_reserve_exact(info.dataspace.dims.len())
+                .map_err(|err| {
+                    Error::InvalidFormat(format!("dataset shape output allocation failed: {err}"))
+                })?;
+            out.clear();
             out.extend_from_slice(&info.dataspace.dims);
         }
         Ok(())
@@ -425,11 +439,15 @@ impl Dataset {
     /// Returns `true` if the dataset is chunked and `out` was filled.
     pub fn chunk_into(&self, out: &mut Vec<u64>) -> Result<bool> {
         let info = self.info()?;
-        out.clear();
         if let Some(chunk_dims) = info.layout.chunk_dims.as_ref() {
+            out.try_reserve_exact(chunk_dims.len()).map_err(|err| {
+                Error::InvalidFormat(format!("chunk dimension output allocation failed: {err}"))
+            })?;
+            out.clear();
             out.extend_from_slice(chunk_dims);
             Ok(true)
         } else {
+            out.clear();
             Ok(false)
         }
     }
@@ -576,16 +594,31 @@ impl Dataset {
 
     /// Store allocated chunk metadata in caller-provided storage.
     pub fn chunk_infos_into(&self, out: &mut Vec<ChunkInfo>) -> Result<()> {
-        out.clear();
+        let mut next = Vec::new();
         self.visit_chunk_infos_impl(|offset, filter_mask, addr, size| {
-            out.push(ChunkInfo {
-                offset: offset.to_vec(),
+            next.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!("chunk info output allocation failed: {err}"))
+            })?;
+            let mut owned_offset = Vec::new();
+            owned_offset
+                .try_reserve_exact(offset.len())
+                .map_err(|err| {
+                    Error::InvalidFormat(format!("chunk offset allocation failed: {err}"))
+                })?;
+            owned_offset.extend_from_slice(offset);
+            next.push(ChunkInfo {
+                offset: owned_offset,
                 filter_mask,
                 addr,
                 size,
             });
             Ok(())
         })?;
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!("chunk info output allocation failed: {err}"))
+        })?;
+        out.clear();
+        out.extend(next);
         Ok(())
     }
 
@@ -838,14 +871,22 @@ impl Dataset {
                 "scaled chunk coordinate rank does not match chunk rank".into(),
             ));
         }
-        out.clear();
+        let mut next = Vec::new();
+        next.try_reserve_exact(scaled.len()).map_err(|err| {
+            Error::InvalidFormat(format!("chunk coordinate output allocation failed: {err}"))
+        })?;
         for (&coord, &chunk) in scaled.iter().zip(chunk_dims) {
-            out.push(
+            next.push(
                 coord
                     .checked_mul(chunk)
                     .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?,
             );
         }
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!("chunk coordinate output allocation failed: {err}"))
+        })?;
+        out.clear();
+        out.extend_from_slice(&next);
         Ok(())
     }
 
@@ -854,21 +895,32 @@ impl Dataset {
         info: &DatasetInfo,
         out: &mut Vec<crate::hl::plist::dataset_create::ExternalStorageInfo>,
     ) -> Result<()> {
-        out.clear();
         let Some(external) = info.external_file_list.as_ref() else {
+            out.clear();
             return Ok(());
         };
         let mut guard = self.inner.lock();
         let heap = LocalHeap::read_at(&mut guard.reader, external.heap_addr)?;
-        out.reserve(external.entries.len());
+        let mut next = Vec::new();
+        next.try_reserve_exact(external.entries.len())
+            .map_err(|err| {
+                Error::InvalidFormat(format!("external storage output allocation failed: {err}"))
+            })?;
         for entry in &external.entries {
             let name_offset = usize_from_u64(entry.name_offset, "external file name offset")?;
-            out.push(crate::hl::plist::dataset_create::ExternalStorageInfo {
-                name: heap.get_str(name_offset)?.to_string(),
+            let heap_name = heap.get_str(name_offset)?;
+            let mut name = String::new();
+            name.try_reserve_exact(heap_name.len()).map_err(|err| {
+                Error::InvalidFormat(format!("external storage name allocation failed: {err}"))
+            })?;
+            name.push_str(heap_name);
+            next.push(crate::hl::plist::dataset_create::ExternalStorageInfo {
+                name,
                 file_offset: entry.file_offset,
                 size: entry.size,
             });
         }
+        *out = next;
         Ok(())
     }
 }

@@ -156,7 +156,7 @@ impl MutableFile {
         let fill = Self::fill_value_bytes(info, element_size)?;
         let old_strides = Self::row_major_strides(old_dims)?;
         let chunk_strides = Self::row_major_strides(chunk_dims)?;
-        let mut starts = vec![0; new_dims.len()];
+        let mut starts = Self::zeroed_vec(new_dims.len(), "partial-shrink chunk starts")?;
         self.scrub_partial_shrink_chunks_recursive(
             path,
             0,
@@ -235,11 +235,11 @@ impl MutableFile {
             return Ok(());
         }
 
-        let mut chunk = vec![0; chunk_bytes];
+        let mut chunk = Self::zeroed_vec(chunk_bytes, "partial-shrink chunk buffer")?;
         for slot in chunk.chunks_exact_mut(element_size) {
             slot.copy_from_slice(fill);
         }
-        let mut local = vec![0; starts.len()];
+        let mut local = Self::zeroed_vec(starts.len(), "partial-shrink local coordinates")?;
         Self::copy_retained_chunk_elements(
             0,
             starts,
@@ -328,8 +328,25 @@ impl MutableFile {
         let chunk_end = chunk_byte
             .checked_add(element_size)
             .ok_or_else(|| Error::InvalidFormat("chunk byte range overflow".into()))?;
-        chunk[chunk_byte..chunk_end].copy_from_slice(&raw[old_byte..old_end]);
+        let old_slice = raw.get(old_byte..old_end).ok_or_else(|| {
+            Error::InvalidFormat("dataset retained byte range out of bounds".into())
+        })?;
+        let chunk_slice = chunk.get_mut(chunk_byte..chunk_end).ok_or_else(|| {
+            Error::InvalidFormat("chunk retained byte range out of bounds".into())
+        })?;
+        chunk_slice.copy_from_slice(old_slice);
         Ok(())
+    }
+
+    fn zeroed_vec<T>(len: usize, context: &str) -> Result<Vec<T>>
+    where
+        T: Default + Clone,
+    {
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|err| Error::InvalidFormat(format!("{context} allocation failed: {err}")))?;
+        out.resize(len, T::default());
+        Ok(out)
     }
 
     fn checked_product_u64(values: &[u64], what: &str) -> Result<u64> {
@@ -356,13 +373,13 @@ impl MutableFile {
         element_size: usize,
     ) -> Result<Vec<u8>> {
         let Some(fill) = &info.fill_value else {
-            return Ok(vec![0; element_size]);
+            return Self::zeroed_vec(element_size, "default fill value");
         };
         if fill.fill_time == FILL_TIME_NEVER {
-            return Ok(vec![0; element_size]);
+            return Self::zeroed_vec(element_size, "default fill value");
         }
         let Some(value) = fill.value.as_deref() else {
-            return Ok(vec![0; element_size]);
+            return Self::zeroed_vec(element_size, "default fill value");
         };
         if value.len() != element_size {
             return Err(Error::Unsupported(format!(

@@ -756,7 +756,9 @@ pub fn H5O_msg_encode_into(message: &ObjectMessage, out: &mut Vec<u8>) -> Result
     let len = 5usize
         .checked_add(message.data.len())
         .ok_or_else(|| Error::InvalidFormat("object message image length overflow".into()))?;
-    out.reserve(len);
+    out.try_reserve_exact(len).map_err(|err| {
+        Error::InvalidFormat(format!("object message image allocation failed: {err}"))
+    })?;
     out.extend_from_slice(&message.msg_type.to_le_bytes());
     out.push(message.flags);
     out.extend_from_slice(&message.creation_index.to_le_bytes());
@@ -925,19 +927,22 @@ pub fn H5O__cache_verify_chksum(image: &[u8], checksum: u32) -> bool {
 /// Serialize an object to bytes.
 #[allow(non_snake_case)]
 pub fn H5O__cache_serialize_into(header: &ObjectHeaderState, out: &mut Vec<u8>) -> Result<()> {
-    let mut len = 0usize;
+    let len = H5O__cache_image_len(header)?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "object header cache image allocation failed: {err}"
+        ))
+    })?;
     for message in &header.messages {
-        len = len
-            .checked_add(5)
-            .and_then(|value| value.checked_add(message.data.len()))
-            .ok_or_else(|| {
-                Error::InvalidFormat("object header cache image length overflow".into())
-            })?;
+        H5O_msg_encode_into(message, &mut image)?;
     }
-    out.reserve(len);
-    for message in &header.messages {
-        H5O_msg_encode_into(message, out)?;
-    }
+    out.try_reserve_exact(image.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "object header cache output allocation failed: {err}"
+        ))
+    })?;
+    out.extend_from_slice(&image);
     Ok(())
 }
 
@@ -1089,6 +1094,11 @@ pub fn H5O__cache_chk_serialize_into(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     validate_object_header_chunk_image(&image.raw)?;
+    out.try_reserve_exact(image.raw.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "object header continuation chunk output allocation failed: {err}"
+        ))
+    })?;
     let start = out.len();
     out.extend_from_slice(&image.raw);
     if image.is_v2_continuation && image.raw.starts_with(OBJECT_HEADER_V2_CHUNK_MAGIC) {
@@ -1608,7 +1618,11 @@ pub fn H5O__layout_decode(bytes: &[u8]) -> Result<LayoutObjectMessage> {
                     ));
                 }
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(Error::InvalidFormat(format!(
+                    "data layout v4 storage class {layout_class} is invalid"
+                )));
+            }
         }
     }
     let message = DataLayoutMessage::decode(bytes, sizeof_addr, sizeof_size)?;
@@ -9597,7 +9611,9 @@ pub fn H5O__name_encode_into(name: &str, out: &mut Vec<u8>) -> Result<()> {
         .len()
         .checked_add(1)
         .ok_or_else(|| Error::InvalidFormat("object name image length overflow".into()))?;
-    out.reserve(len);
+    out.try_reserve_exact(len).map_err(|err| {
+        Error::InvalidFormat(format!("object name image allocation failed: {err}"))
+    })?;
     out.extend_from_slice(name.as_bytes());
     out.push(0);
     Ok(())

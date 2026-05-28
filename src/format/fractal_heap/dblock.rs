@@ -13,8 +13,8 @@ use crate::error::{Error, Result};
 use crate::io::reader::HdfReader;
 
 use super::{
-    heap_object_len, verify_direct_block_checksum, DirectBlockCacheKey, FractalHeapHeader,
-    FractalHeapManagedObjectCache,
+    heap_object_len, new_heap_buffer_zeroed, verify_direct_block_checksum, DirectBlockCacheKey,
+    FractalHeapHeader, FractalHeapManagedObjectCache,
 };
 
 impl FractalHeapHeader {
@@ -68,22 +68,29 @@ impl FractalHeapHeader {
 
         if let Some(filtered_size) = filtered_size {
             reader.seek(block_addr)?;
-            let mut filtered =
-                vec![0; heap_object_len(filtered_size, "filtered fractal heap block size",)?];
+            let mut filtered = new_heap_buffer_zeroed(
+                heap_object_len(filtered_size, "filtered fractal heap block size")?,
+                "filtered fractal heap block",
+            )?;
             reader.read_bytes_into(&mut filtered)?;
             let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {
                 Error::InvalidFormat("filtered fractal heap missing filter pipeline".into())
             })?;
             let object_len = range.len();
-            out.clear();
+            let mut decoded = Vec::new();
             crate::filters::apply_pipeline_reverse_with_mask_into(
                 &filtered,
                 pipeline,
                 1,
                 filter_mask,
-                out,
+                &mut decoded,
             )?;
-            if range.start == 0 && range.end == out.len() {
+            if range.start == 0 && range.end == decoded.len() {
+                out.try_reserve_exact(decoded.len()).map_err(|err| {
+                    Error::InvalidFormat(format!("fractal heap object allocation failed: {err}"))
+                })?;
+                out.clear();
+                out.extend_from_slice(&decoded);
                 self.trace_managed_object(
                     block_addr,
                     block_size,
@@ -95,13 +102,16 @@ impl FractalHeapHeader {
                 return Ok(());
             }
             let end = range.end;
-            if end > out.len() {
+            if end > decoded.len() {
                 return Err(Error::InvalidFormat(
                     "fractal heap object exceeds filtered direct block".into(),
                 ));
             }
-            out.copy_within(range, 0);
-            out.truncate(object_len);
+            out.try_reserve_exact(object_len).map_err(|err| {
+                Error::InvalidFormat(format!("fractal heap object allocation failed: {err}"))
+            })?;
+            out.clear();
+            out.extend_from_slice(&decoded[range]);
             self.trace_managed_object(block_addr, block_size, offset, length, filter_mask, true);
             return Ok(());
         }
@@ -113,9 +123,13 @@ impl FractalHeapHeader {
             .checked_add(offset)
             .ok_or_else(|| Error::InvalidFormat("fractal heap object address overflow".into()))?;
         reader.seek(addr)?;
+        let mut next = new_heap_buffer_zeroed(range.len(), "fractal heap object")?;
+        reader.read_bytes_into(&mut next)?;
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!("fractal heap object allocation failed: {err}"))
+        })?;
         out.clear();
-        out.resize(range.len(), 0);
-        reader.read_bytes_into(out)?;
+        out.extend_from_slice(&next);
         self.trace_managed_object(block_addr, block_size, offset, length, 0, false);
         Ok(())
     }
@@ -154,11 +168,10 @@ impl FractalHeapHeader {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     reader.seek(block_addr)?;
-                    let mut filtered =
-                        vec![
-                            0;
-                            heap_object_len(filtered_size, "filtered fractal heap block size",)?
-                        ];
+                    let mut filtered = new_heap_buffer_zeroed(
+                        heap_object_len(filtered_size, "filtered fractal heap block size")?,
+                        "filtered fractal heap block",
+                    )?;
                     reader.read_bytes_into(&mut filtered)?;
                     let pipeline = self.filter_pipeline.as_ref().ok_or_else(|| {
                         Error::InvalidFormat("filtered fractal heap missing filter pipeline".into())
@@ -188,8 +201,10 @@ impl FractalHeapHeader {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 reader.seek(block_addr)?;
-                let mut data =
-                    vec![0; heap_object_len(block_size, "fractal heap direct block size")?];
+                let mut data = new_heap_buffer_zeroed(
+                    heap_object_len(block_size, "fractal heap direct block size")?,
+                    "fractal heap direct block",
+                )?;
                 reader.read_bytes_into(&mut data)?;
                 entry.insert(data)
             }

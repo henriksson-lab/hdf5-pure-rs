@@ -2541,6 +2541,26 @@ pub(super) fn heap_object_len(value: u64, context: &str) -> Result<usize> {
     Ok(len)
 }
 
+pub(super) fn resize_heap_buffer_zeroed(
+    out: &mut Vec<u8>,
+    len: usize,
+    context: &str,
+) -> Result<()> {
+    if len > out.capacity() {
+        out.try_reserve_exact(len - out.capacity())
+            .map_err(|err| Error::InvalidFormat(format!("{context} allocation failed: {err}")))?;
+    }
+    out.clear();
+    out.resize(len, 0);
+    Ok(())
+}
+
+pub(super) fn new_heap_buffer_zeroed(len: usize, context: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    resize_heap_buffer_zeroed(&mut out, len, context)?;
+    Ok(out)
+}
+
 /// Sanity-check the user-facing fractal-heap create parameters (table
 /// width, block sizes power-of-two, max_heap_size width, etc.).
 fn validate_heap_create_params(params: &FractalHeapCreateParams) -> Result<()> {
@@ -2811,6 +2831,29 @@ mod tests {
         too_short.objects.clear();
         too_short.header.num_managed_objects = 0;
         assert!(too_short.insert(vec![1]).is_err());
+    }
+
+    #[test]
+    fn heap_buffer_resize_allocation_failure_preserves_output() {
+        let mut out = b"stale".to_vec();
+        let err = resize_heap_buffer_zeroed(&mut out, usize::MAX, "fractal heap test").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("fractal heap test allocation failed"));
+        assert_eq!(out, b"stale");
+    }
+
+    #[test]
+    fn heap_buffer_resize_reuses_capacity_and_zeroes() {
+        let mut out = b"abcdef".to_vec();
+        out.reserve(16);
+        let capacity = out.capacity();
+
+        resize_heap_buffer_zeroed(&mut out, 4, "fractal heap test").unwrap();
+
+        assert_eq!(out, &[0, 0, 0, 0]);
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]

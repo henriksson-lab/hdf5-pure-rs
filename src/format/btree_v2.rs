@@ -215,8 +215,11 @@ impl BTreeV2Header {
         image: &mut Vec<u8>,
     ) -> Result<()> {
         self.validate()?;
-        let mut next_image =
-            Vec::with_capacity(self.cache_hdr_image_len_with_widths(sizeof_addr, sizeof_size)?);
+        let image_len = self.cache_hdr_image_len_with_widths(sizeof_addr, sizeof_size)?;
+        let mut next_image = Vec::new();
+        next_image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree header image allocation failed: {err}"))
+        })?;
         next_image.extend_from_slice(&B2HD_MAGIC);
         next_image.push(0);
         next_image.push(self.tree_type);
@@ -358,10 +361,23 @@ impl BTreeV2Header {
         sizeof_addr: usize,
         out: &mut Vec<(usize, u64, usize)>,
     ) -> Result<()> {
-        out.clear();
-        for info in compute_node_info(self, sizeof_addr)? {
-            out.push((info.max_nrec, info.cum_max_nrec, info.cum_max_nrec_size));
+        let infos = compute_node_info(self, sizeof_addr)?;
+        let mut next = Vec::new();
+        next.try_reserve_exact(infos.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "v2 B-tree node info output allocation failed: {err}"
+            ))
+        })?;
+        for info in infos {
+            next.push((info.max_nrec, info.cum_max_nrec, info.cum_max_nrec_size));
         }
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "v2 B-tree node info output allocation failed: {err}"
+            ))
+        })?;
+        out.clear();
+        out.extend(next);
         Ok(())
     }
 
@@ -447,11 +463,20 @@ pub fn collect_all_records_into<R: Read + Seek>(
     header_addr: u64,
     records: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
-    records.clear();
+    let mut next = Vec::new();
     visit_all_records(reader, header_addr, |record| {
-        records.push(record.to_vec());
+        next.try_reserve_exact(1).map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree record list allocation failed: {err}"))
+        })?;
+        next.push(copy_record(record)?);
         Ok(())
-    })
+    })?;
+    records.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("v2 B-tree record output allocation failed: {err}"))
+    })?;
+    records.clear();
+    records.extend(next);
+    Ok(())
 }
 
 /// Visit all records from a v2 B-tree in traversal order without collecting
@@ -816,7 +841,11 @@ impl BTreeV2LeafNode {
         image: &mut Vec<u8>,
     ) -> Result<()> {
         self.assert_leaf(record_size)?;
-        let mut next_image = Vec::with_capacity(self.cache_leaf_image_len(record_size)?);
+        let image_len = self.cache_leaf_image_len(record_size)?;
+        let mut next_image = Vec::new();
+        next_image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree leaf image allocation failed: {err}"))
+        })?;
         next_image.extend_from_slice(&B2LF_MAGIC);
         next_image.push(0);
         next_image.push(tree_type);
@@ -1007,7 +1036,11 @@ impl BTreeV2InternalNode {
             infos[0].max_nrec,
             "v2 B-tree leaf record capacity",
         )?);
-        let mut next_image = Vec::with_capacity(self.cache_int_image_len(header, sizeof_addr)?);
+        let image_len = self.cache_int_image_len(header, sizeof_addr)?;
+        let mut next_image = Vec::new();
+        next_image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree internal image allocation failed: {err}"))
+        })?;
         next_image.extend_from_slice(&B2IN_MAGIC);
         next_image.push(0);
         next_image.push(header.tree_type);
@@ -1511,9 +1544,13 @@ fn read_leaf_records<R: Read + Seek>(
     nrecords: u16,
     records: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
-    records.reserve(usize::from(nrecords));
+    records
+        .try_reserve_exact(usize::from(nrecords))
+        .map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree leaf record allocation failed: {err}"))
+        })?;
     let mut append_record = |record: &[u8]| {
-        records.push(record.to_vec());
+        records.push(copy_record(record)?);
         Ok(())
     };
     visit_leaf_records(
@@ -1524,6 +1561,15 @@ fn read_leaf_records<R: Read + Seek>(
         nrecords,
         &mut append_record,
     )
+}
+
+fn copy_record(record: &[u8]) -> Result<Vec<u8>> {
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(record.len()).map_err(|err| {
+        Error::InvalidFormat(format!("v2 B-tree record allocation failed: {err}"))
+    })?;
+    owned.extend_from_slice(record);
+    Ok(owned)
 }
 
 /// Read and validate the common version/type bytes shared by leaf and internal nodes.
@@ -1842,14 +1888,24 @@ impl BTreeV2TestRecord {
 
     /// Encode the native test record into its on-disk little-endian form.
     pub fn test_encode_into(&self, context: &BTreeV2TestContext, out: &mut Vec<u8>) -> Result<()> {
-        out.clear();
-        out.resize(context.record_size, 0);
-        checked_window_mut(out, 0, 8, "v2 B-tree test key")?
+        let mut next = Vec::new();
+        next.try_reserve_exact(context.record_size).map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree test record allocation failed: {err}"))
+        })?;
+        next.resize(context.record_size, 0);
+        checked_window_mut(&mut next, 0, 8, "v2 B-tree test key")?
             .copy_from_slice(&self.key.to_le_bytes());
         if context.record_size >= 16 {
-            checked_window_mut(out, 8, 8, "v2 B-tree test value")?
+            checked_window_mut(&mut next, 8, 8, "v2 B-tree test value")?
                 .copy_from_slice(&self.value.to_le_bytes());
         }
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "v2 B-tree test record output allocation failed: {err}"
+            ))
+        })?;
+        out.clear();
+        out.extend_from_slice(&next);
         Ok(())
     }
 
@@ -1890,14 +1946,24 @@ impl BTreeV2TestRecord {
 
     /// Encode the native record into the on-disk big-endian (test2) form.
     pub fn test2_encode_into(&self, context: &BTreeV2TestContext, out: &mut Vec<u8>) -> Result<()> {
-        out.clear();
-        out.resize(context.record_size, 0);
-        checked_window_mut(out, 0, 8, "v2 B-tree test2 key")?
+        let mut next = Vec::new();
+        next.try_reserve_exact(context.record_size).map_err(|err| {
+            Error::InvalidFormat(format!("v2 B-tree test2 record allocation failed: {err}"))
+        })?;
+        next.resize(context.record_size, 0);
+        checked_window_mut(&mut next, 0, 8, "v2 B-tree test2 key")?
             .copy_from_slice(&self.key.to_be_bytes());
         if context.record_size >= 16 {
-            checked_window_mut(out, 8, 8, "v2 B-tree test2 value")?
+            checked_window_mut(&mut next, 8, 8, "v2 B-tree test2 value")?
                 .copy_from_slice(&self.value.to_be_bytes());
         }
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "v2 B-tree test2 record output allocation failed: {err}"
+            ))
+        })?;
+        out.clear();
+        out.extend_from_slice(&next);
         Ok(())
     }
 
@@ -2405,6 +2471,35 @@ mod tests {
         let leaf = BTreeV2LeafNode::create_leaf(vec![vec![1, 0]], 2).unwrap();
         assert_eq!(leaf.cache_leaf_image_len(2).unwrap(), 12);
         assert!(leaf.cache_leaf_image_len(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn btree_v2_cache_serializers_preserve_output_on_validation_errors() {
+        let header = BTreeV2Header {
+            depth: 1,
+            root_addr: 0x100,
+            root_nrecords: 1,
+            total_records: 3,
+            ..BTreeV2Header::hdr_create(10, 256, 2, 100, 40).unwrap()
+        };
+        let leaf = BTreeV2LeafNode::create_leaf(vec![vec![1, 0]], 2).unwrap();
+        let internal =
+            BTreeV2InternalNode::create_internal(vec![vec![2, 0]], vec![(10, 1), (20, 1)], 2)
+                .unwrap();
+
+        let mut image = b"keep me".to_vec();
+        assert!(header
+            .cache_hdr_serialize_with_widths_into(9, 8, &mut image)
+            .is_err());
+        assert_eq!(image, b"keep me");
+
+        assert!(leaf.cache_leaf_serialize_into(10, 3, &mut image).is_err());
+        assert_eq!(image, b"keep me");
+
+        assert!(internal
+            .cache_int_serialize_into(&header, 9, &mut image)
+            .is_err());
+        assert_eq!(image, b"keep me");
     }
 
     #[test]

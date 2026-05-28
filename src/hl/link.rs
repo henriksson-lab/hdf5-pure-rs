@@ -279,12 +279,14 @@ where
     let mut pos = 0usize;
     group.visit_link_refs_for_link_access(|link| {
         if pos == index {
-            let visit = visitor
-                .take()
-                .expect("link index visitor called more than once");
+            let visit = visitor.take().ok_or_else(|| {
+                Error::InvalidFormat("link index visitor called more than once".into())
+            })?;
             result = Some(visit(get_val_ref_borrowed(link))?);
         }
-        pos += 1;
+        pos = pos
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("link index counter overflow".into()))?;
         Ok(())
     })?;
     result.ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))
@@ -341,23 +343,35 @@ where
     let mut pos = 0usize;
     group.visit_link_refs_for_link_access(|link| {
         if pos == index {
-            let visit = visitor
-                .take()
-                .expect("link name index visitor called more than once");
+            let visit = visitor.take().ok_or_else(|| {
+                Error::InvalidFormat("link name index visitor called more than once".into())
+            })?;
             result = Some(visit(link.name)?);
         }
-        pos += 1;
+        pos = pos
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidFormat("link index counter overflow".into()))?;
         Ok(())
     })?;
     result.ok_or_else(|| Error::InvalidFormat(format!("link index {index} is out of bounds")))
 }
 
 pub fn get_name_by_idx_into(group: &Group, index: usize, out: &mut String) -> Result<()> {
+    let mut next = String::new();
     get_name_by_idx_with(group, index, |name| {
-        out.clear();
-        out.push_str(name);
+        next.try_reserve_exact(name.len()).map_err(|err| {
+            Error::InvalidFormat(format!("link name output allocation failed: {err}"))
+        })?;
+        next.clear();
+        next.push_str(name);
         Ok(())
-    })
+    })?;
+    out.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("link name output allocation failed: {err}"))
+    })?;
+    out.clear();
+    out.push_str(&next);
+    Ok(())
 }
 
 pub fn link_copy_file_into(link: &LinkMessage, out: &mut LinkMessage) {

@@ -81,7 +81,12 @@ pub(super) fn cache_dblock_serialize_into(
     let image_len = prefix_and_payload.len().checked_add(4).ok_or_else(|| {
         Error::InvalidFormat("fixed array data block image length overflow".into())
     })?;
-    let mut image = Vec::with_capacity(image_len);
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "fixed array data block image allocation failed: {err}"
+        ))
+    })?;
     image.extend_from_slice(prefix_and_payload);
     let checksum = crate::format::checksum::checksum_metadata(&image);
     image.extend_from_slice(&checksum.to_le_bytes());
@@ -175,7 +180,12 @@ pub(super) fn dblk_page_offset(
 /// Serialize a data-block page to its on-disk image (payload + checksum).
 pub(super) fn cache_dblk_page_serialize_into(payload: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let image_len = cache_dblk_page_image_len(payload.len())?;
-    let mut image = Vec::with_capacity(image_len);
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "fixed array data block page image allocation failed: {err}"
+        ))
+    })?;
     image.extend_from_slice(payload);
     let checksum = crate::format::checksum::checksum_metadata(&image);
     image.extend_from_slice(&checksum.to_le_bytes());
@@ -400,8 +410,14 @@ pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
     chunk_size_len: usize,
     elements: &mut Vec<FixedArrayElement>,
 ) -> Result<()> {
+    if elements.capacity() < prefix.element_count {
+        elements
+            .try_reserve_exact(prefix.element_count - elements.capacity())
+            .map_err(|err| {
+                Error::InvalidFormat(format!("fixed array elements allocation failed: {err}"))
+            })?;
+    }
     elements.clear();
-    elements.reserve(prefix.element_count);
     if prefix.paginated {
         let mut page_image = Vec::new();
         for page_index in 0..prefix.pages {
@@ -428,6 +444,15 @@ pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
                     "fixed array data block page address",
                 )?;
                 page_image.clear();
+                if page_image.capacity() < page_size {
+                    page_image
+                        .try_reserve_exact(page_size - page_image.capacity())
+                        .map_err(|err| {
+                            Error::InvalidFormat(format!(
+                                "fixed array page image allocation failed: {err}"
+                            ))
+                        })?;
+                }
                 page_image.resize(page_size, 0);
                 reader.seek(page_addr)?;
                 reader.read_bytes_into(&mut page_image)?;
@@ -457,7 +482,13 @@ pub(super) fn collect_data_block_elements_into<R: Read + Seek>(
             4,
             "fixed array data block image size",
         )?;
-        let mut image = vec![0; image_size];
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_size).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "fixed array data block image allocation failed: {err}"
+            ))
+        })?;
+        image.resize(image_size, 0);
         reader.seek(header.data_block_addr)?;
         reader.read_bytes_into(&mut image)?;
         verify_trailing_checksum(&image, "fixed array data block")?;
@@ -745,6 +776,13 @@ mod tests {
         assert_eq!(&image[..payload.len()], payload.as_slice());
         verify_trailing_checksum(&image, "fixed array data block").unwrap();
         assert!(!image.starts_with(&[0xaa, 0xbb, 0xcc]));
+    }
+
+    #[test]
+    fn fixed_array_cache_image_len_helpers_reject_overflow() {
+        let prefix = dblock_alloc(false, 0, 2, 0, usize::MAX);
+        assert!(cache_dblock_image_len(&prefix).is_err());
+        assert!(cache_dblk_page_image_len(usize::MAX).is_err());
     }
 
     #[test]

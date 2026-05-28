@@ -684,13 +684,24 @@ pub fn H5F__cache_drvrinfo_serialize_into(
     }
     let len = driver_info_block_payload_len_u32(block)?;
     let total = H5F__cache_drvrinfo_image_len(block)?;
+    let mut image = Vec::new();
+    image.try_reserve_exact(total).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "driver info cache block image allocation failed: {err}"
+        ))
+    })?;
+    image.push(block.version);
+    image.extend_from_slice(&[0, 0, 0]);
+    image.extend_from_slice(&len.to_le_bytes());
+    image.extend_from_slice(&block.name);
+    image.extend_from_slice(&block.data);
+    out.try_reserve_exact(image.len()).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "driver info cache block output allocation failed: {err}"
+        ))
+    })?;
     out.clear();
-    out.reserve(total);
-    out.push(block.version);
-    out.extend_from_slice(&[0, 0, 0]);
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&block.name);
-    out.extend_from_slice(&block.data);
+    out.extend_from_slice(&image);
     Ok(out.len())
 }
 

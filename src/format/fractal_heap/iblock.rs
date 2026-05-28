@@ -195,9 +195,15 @@ impl FractalHeapHeader {
 
         let max_direct_rows = self.max_direct_rows_checked()?;
         let direct_rows = nrows.min(max_direct_rows);
-        let mut entries = Vec::with_capacity(direct_rows.checked_mul(width).ok_or_else(|| {
+        let entry_count = direct_rows.checked_mul(width).ok_or_else(|| {
             Error::InvalidFormat("fractal heap filtered direct entry count overflow".into())
-        })?);
+        })?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(entry_count).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "fractal heap filtered indirect entries allocation failed: {err}"
+            ))
+        })?;
         for row in 0..nrows {
             let block_size = self.checked_row_block_size(row)?;
             let direct = block_size <= self.max_direct_block_size;

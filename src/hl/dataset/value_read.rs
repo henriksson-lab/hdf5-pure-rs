@@ -19,18 +19,24 @@ impl Dataset {
 
     /// Read strings from the dataset into caller-provided storage.
     pub fn read_strings_into(&self, out: &mut Vec<String>) -> Result<()> {
-        let mut index = 0usize;
+        let mut next = Vec::new();
         self.visit_strings(|value| {
-            if index < out.len() {
-                out[index].clear();
-                out[index].push_str(value);
-            } else {
-                out.push(value.to_string());
-            }
-            index += 1;
+            next.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!("string vector allocation failed: {err}"))
+            })?;
+            let mut owned = String::new();
+            owned.try_reserve_exact(value.len()).map_err(|err| {
+                Error::InvalidFormat(format!("string output allocation failed: {err}"))
+            })?;
+            owned.push_str(value);
+            next.push(owned);
             Ok(())
         })?;
-        out.truncate(index);
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!("string vector allocation failed: {err}"))
+        })?;
+        out.clear();
+        out.extend(next);
         Ok(())
     }
 
@@ -192,15 +198,24 @@ impl Dataset {
     /// Read a single string into caller-provided storage.
     pub fn read_string_into(&self, out: &mut String) -> Result<()> {
         let mut found = false;
+        let mut next = String::new();
         self.visit_strings_until(|value| {
             if !found {
-                out.clear();
-                out.push_str(value);
+                next.try_reserve_exact(value.len()).map_err(|err| {
+                    Error::InvalidFormat(format!("string output allocation failed: {err}"))
+                })?;
+                next.clear();
+                next.push_str(value);
                 found = true;
             }
             Ok(false)
         })?;
         if found {
+            out.try_reserve_exact(next.len()).map_err(|err| {
+                Error::InvalidFormat(format!("string output allocation failed: {err}"))
+            })?;
+            out.clear();
+            out.push_str(&next);
             Ok(())
         } else {
             Err(Error::InvalidFormat("no string data".into()))
@@ -231,13 +246,15 @@ impl Dataset {
         &self,
         out: &mut Vec<crate::format::messages::datatype::CompoundField>,
     ) -> Result<()> {
-        out.clear();
         let info = self.info()?;
         let fields = info.datatype.compound_fields_iter()?;
-        out.reserve(fields.len());
+        let mut next = Vec::new();
+        next.try_reserve_exact(fields.len()).map_err(|err| {
+            Error::InvalidFormat(format!("compound field output allocation failed: {err}"))
+        })?;
         for field in fields {
             let field = field?;
-            out.push(crate::format::messages::datatype::CompoundField {
+            next.push(crate::format::messages::datatype::CompoundField {
                 name: field.name.into_owned(),
                 byte_offset: field.byte_offset,
                 size: field.size,
@@ -246,6 +263,7 @@ impl Dataset {
                 datatype: Box::new(field.datatype),
             });
         }
+        *out = next;
         Ok(())
     }
 
@@ -259,9 +277,11 @@ impl Dataset {
         for field in info.datatype.compound_fields_iter()? {
             let field = field?;
             if field.name == field_name {
-                let f = f
-                    .take()
-                    .expect("compound field callback should only be consumed once");
+                let f = f.take().ok_or_else(|| {
+                    Error::InvalidFormat(
+                        "compound field callback was consumed more than once".into(),
+                    )
+                })?;
                 result = Some(f(&info, field));
                 break;
             }
@@ -323,6 +343,7 @@ impl Dataset {
             let elem_size = field.size;
             for record in raw.chunks_exact(record_size) {
                 let bytes = &record[field.byte_offset..field_end];
+                T::validate_bytes(bytes)?;
                 // Copy to aligned buffer
                 let val = unsafe {
                     let mut v = std::mem::MaybeUninit::<T>::uninit();

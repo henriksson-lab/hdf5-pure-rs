@@ -6,6 +6,7 @@ Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/comm
 
 **Available as early release for testers. Due to the risk of data corruption, be especially vigilant if you use this crate.**
 
+* 2026-05-28: Audits seems to have converged, but more testing needed
 * 2026-05-22: Continued implementation of new features, further audits. not yet complete
 * 2026-05-19: Improved hdf5-metno dropin compatibility. Plenty speed improvements. Some limitations removed. Feaures still missing
 * 2026-05-16: Features being added, docstrings. Work still left to be done

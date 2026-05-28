@@ -274,11 +274,15 @@ impl BTreeV1Node {
 
     /// Compute the on-disk size of a v1 B-tree node prefix (used by the metadata cache).
     pub fn cache_get_initial_load_size(sizeof_addr: usize) -> Result<usize> {
+        validate_width(sizeof_addr, "v1 B-tree address width")?;
         checked_usize_sum(&[4, 1, 1, 2, sizeof_addr, sizeof_addr], "v1 B-tree prefix")
     }
 
     /// Compute the on-disk size of this B-tree node.
     pub fn cache_image_len(&self, sizeof_addr: usize, sizeof_size: usize) -> Result<usize> {
+        validate_width(sizeof_addr, "v1 B-tree address width")?;
+        validate_width(sizeof_size, "v1 B-tree size width")?;
+        self.verify_structure()?;
         let prefix = Self::cache_get_initial_load_size(sizeof_addr)?;
         let per_entry = sizeof_size
             .checked_add(sizeof_addr)
@@ -300,7 +304,11 @@ impl BTreeV1Node {
         out: &mut Vec<u8>,
     ) -> Result<()> {
         self.verify_structure()?;
-        let mut image = Vec::with_capacity(self.cache_image_len(sizeof_addr, sizeof_size)?);
+        let image_len = self.cache_image_len(sizeof_addr, sizeof_size)?;
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!("v1 B-tree image allocation failed: {err}"))
+        })?;
         image.extend_from_slice(&BTREE_MAGIC);
         image.push(match self.node_type {
             BTreeType::Group => 0,
@@ -571,13 +579,16 @@ fn checked_usize_sum(values: &[usize], context: &str) -> Result<usize> {
     })
 }
 
+fn validate_width(width: usize, context: &str) -> Result<()> {
+    if width == 0 || width > 8 {
+        return Err(Error::Unsupported(format!("{context} {width} exceeds u64")));
+    }
+    Ok(())
+}
+
 /// Write a variable-width little-endian integer, validating that `value` fits.
 fn write_var_le(out: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
-    if width == 0 || width > 8 {
-        return Err(Error::Unsupported(format!(
-            "v1 B-tree integer width {width} exceeds u64"
-        )));
-    }
+    validate_width(width, "v1 B-tree integer width")?;
     if width < 8 && value >= (1u64 << (width * 8)) {
         return Err(Error::InvalidFormat(format!(
             "v1 B-tree integer value {value:#x} does not fit in {width} bytes"
@@ -590,11 +601,7 @@ fn write_var_le(out: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
 /// Write a variable-width little-endian address. The undefined-address sentinel
 /// is written as all-`0xff` bytes regardless of width.
 fn write_addr_le(out: &mut Vec<u8>, value: u64, width: usize, context: &str) -> Result<()> {
-    if width == 0 || width > 8 {
-        return Err(Error::Unsupported(format!(
-            "{context} width {width} exceeds u64"
-        )));
-    }
+    validate_width(width, context)?;
     if value == UNDEF_ADDR {
         out.extend(std::iter::repeat_n(0xff, width));
         return Ok(());
@@ -681,7 +688,7 @@ mod tests {
             .is_err());
         assert_eq!(image, b"stale");
 
-        let mut too_large_key = node;
+        let mut too_large_key = node.clone();
         too_large_key.keys[1] = u64::from(u32::MAX) + 1;
         image.clear();
         image.extend_from_slice(b"stale");
@@ -689,6 +696,21 @@ mod tests {
             .cache_serialize_into(4, 4, &mut image)
             .is_err());
         assert_eq!(image, b"stale");
+
+        assert!(node.cache_image_len(9, 4).is_err());
+        assert!(node.cache_image_len(4, 0).is_err());
+        image.clear();
+        image.extend_from_slice(b"stale");
+        assert!(node.cache_serialize_into(9, 4, &mut image).is_err());
+        assert_eq!(image, b"stale");
+    }
+
+    #[test]
+    fn btree_v1_cache_image_len_rejects_invalid_structure() {
+        let mut node = BTreeV1Node::create(BTreeType::Group, 0);
+        node.keys.push(1);
+        node.entries_used = 1;
+        assert!(node.cache_image_len(4, 4).is_err());
     }
 
     #[test]

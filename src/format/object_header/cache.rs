@@ -47,7 +47,14 @@ impl ObjectHeader {
             .checked_add(chunk_data_size)
             .ok_or_else(|| Error::InvalidFormat("object header v1 chunk size overflow".into()))?;
 
-        let mut messages = Vec::with_capacity(usize::from(num_messages));
+        let mut messages = Vec::new();
+        messages
+            .try_reserve_exact(usize::from(num_messages))
+            .map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "object header v1 message vector allocation failed: {err}"
+                ))
+            })?;
         let mut continuations = Vec::new();
         let mut chunk_ranges = vec![(header_start, chunk_end)];
 

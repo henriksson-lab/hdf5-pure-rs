@@ -647,6 +647,44 @@ mod tests {
     }
 
     #[test]
+    fn extensible_array_paginated_reads_partial_final_page() {
+        let mut bytes = extensible_array_prefix(100);
+        append_checksum(&mut bytes);
+        let mut page = Vec::new();
+        page.extend_from_slice(&11u64.to_le_bytes());
+        page.extend_from_slice(&22u64.to_le_bytes());
+        append_checksum(&mut page);
+        bytes.extend_from_slice(&page);
+        page.clear();
+        page.extend_from_slice(&33u64.to_le_bytes());
+        page.extend_from_slice(&44u64.to_le_bytes());
+        append_checksum(&mut page);
+        bytes.extend_from_slice(&page);
+
+        let mut elements = Vec::new();
+        let mut reader = HdfReader::new(Cursor::new(bytes));
+        append_data_block_elements(
+            &mut reader,
+            100,
+            &header(2),
+            false,
+            0,
+            0,
+            3,
+            Some(&[0xc0]),
+            3,
+            &mut elements,
+        )
+        .expect("partial final page should be read");
+
+        let addrs = elements
+            .iter()
+            .map(|element| element.addr)
+            .collect::<Vec<_>>();
+        assert_eq!(addrs, vec![11, 22, 33]);
+    }
+
+    #[test]
     fn extensible_array_page_cache_serializes_and_validates_checksum() {
         let payload = 55u64.to_le_bytes();
         let mut image = b"stale".to_vec();

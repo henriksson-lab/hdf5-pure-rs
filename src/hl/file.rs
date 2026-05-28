@@ -889,7 +889,15 @@ impl File {
     pub fn member_names_into(&self, out: &mut Vec<String>) -> Result<()> {
         let mut names = Vec::new();
         self.visit_member_names(|name| {
-            names.push(name.to_string());
+            let mut owned = String::new();
+            owned.try_reserve_exact(name.len()).map_err(|err| {
+                Error::InvalidFormat(format!("member name output allocation failed: {err}"))
+            })?;
+            owned.push_str(name);
+            names.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!("member name list output allocation failed: {err}"))
+            })?;
+            names.push(owned);
             Ok(())
         })?;
         *out = names;
@@ -927,7 +935,17 @@ impl File {
     pub fn attr_names_into(&self, out: &mut Vec<String>) -> Result<()> {
         let mut names = Vec::new();
         self.visit_attr_names(|name| {
-            names.push(name.to_string());
+            let mut owned = String::new();
+            owned.try_reserve_exact(name.len()).map_err(|err| {
+                Error::InvalidFormat(format!("attribute name output allocation failed: {err}"))
+            })?;
+            owned.push_str(name);
+            names.try_reserve_exact(1).map_err(|err| {
+                Error::InvalidFormat(format!(
+                    "attribute name list output allocation failed: {err}"
+                ))
+            })?;
+            names.push(owned);
             Ok(())
         })?;
         *out = names;

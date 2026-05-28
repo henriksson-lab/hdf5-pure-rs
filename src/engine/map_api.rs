@@ -179,6 +179,9 @@ pub fn H5Mget_key_type(map: &H5Map) -> Result<&str> {
 #[allow(non_snake_case)]
 pub fn H5Mget_key_type_into(map: &H5Map, out: &mut String) -> Result<()> {
     let key_type = H5Mget_key_type(map)?;
+    out.try_reserve(key_type.len()).map_err(|err| {
+        Error::InvalidFormat(format!("map key type output allocation failed: {err}"))
+    })?;
     out.clear();
     out.push_str(key_type);
     Ok(())
@@ -193,6 +196,9 @@ pub fn H5Mget_val_type(map: &H5Map) -> Result<&str> {
 #[allow(non_snake_case)]
 pub fn H5Mget_val_type_into(map: &H5Map, out: &mut String) -> Result<()> {
     let value_type = H5Mget_val_type(map)?;
+    out.try_reserve(value_type.len()).map_err(|err| {
+        Error::InvalidFormat(format!("map value type output allocation failed: {err}"))
+    })?;
     out.clear();
     out.push_str(value_type);
     Ok(())
@@ -387,12 +393,32 @@ where
 #[allow(non_snake_case)]
 pub fn H5M_iterate_into(map: &H5Map, entries: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
     map.ensure_open()?;
-    entries.clear();
-    entries.reserve(map.entries.len());
+    let mut next = Vec::new();
+    next.try_reserve_exact(map.entries.len()).map_err(|err| {
+        Error::InvalidFormat(format!("map iteration output allocation failed: {err}"))
+    })?;
     H5M_iterate_with(map, |key, value| {
-        entries.push((key.to_vec(), value.to_vec()));
+        let mut owned_key = Vec::new();
+        owned_key.try_reserve_exact(key.len()).map_err(|err| {
+            Error::InvalidFormat(format!("map iteration key allocation failed: {err}"))
+        })?;
+        owned_key.extend_from_slice(key);
+
+        let mut owned_value = Vec::new();
+        owned_value.try_reserve_exact(value.len()).map_err(|err| {
+            Error::InvalidFormat(format!("map iteration value allocation failed: {err}"))
+        })?;
+        owned_value.extend_from_slice(value);
+
+        next.push((owned_key, owned_value));
         Ok(())
-    })
+    })?;
+    entries.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("map iteration output allocation failed: {err}"))
+    })?;
+    entries.clear();
+    entries.extend(next);
+    Ok(())
 }
 
 #[allow(non_snake_case)]

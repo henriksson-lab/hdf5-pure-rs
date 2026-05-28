@@ -260,7 +260,11 @@ pub fn encode_v2_with_continuations(
         2 => 1,
         4 => 2,
         8 => 3,
-        _ => unreachable!(),
+        _ => {
+            return Err(Error::InvalidFormat(format!(
+                "invalid object header chunk size width {chunk0_size_len}"
+            )));
+        }
     };
     let oh_flags = flags | chunk0_flag;
     let mut prefix = Vec::new();
@@ -272,7 +276,14 @@ pub fn encode_v2_with_continuations(
     let checksum = checksum_metadata(&prefix);
     prefix.extend_from_slice(&checksum.to_le_bytes());
 
-    let mut continuation_chunks = Vec::with_capacity(continuation_count);
+    let mut continuation_chunks = Vec::new();
+    continuation_chunks
+        .try_reserve_exact(continuation_count)
+        .map_err(|err| {
+            Error::InvalidFormat(format!(
+                "object header continuation allocation failed: {err}"
+            ))
+        })?;
     for idx in 0..continuation_count {
         let mut chunk_data = chunk_payloads[idx + 1].clone();
         if idx + 1 < continuation_count {

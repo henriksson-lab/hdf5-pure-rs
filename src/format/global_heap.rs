@@ -587,7 +587,7 @@ pub fn read_global_heap_objects_batched_into<R: Read + Seek>(
     }
 
     for (slot, gh_ref) in out.iter_mut().zip(refs) {
-        let data = cache.cached_object_data(gh_ref);
+        let data = cache.cached_object_data(gh_ref)?;
         trace_global_heap_deref(gh_ref, data);
         slot.clear();
         slot.extend_from_slice(data);
@@ -732,11 +732,16 @@ impl GlobalHeapObjectCache {
         })
     }
 
-    fn cached_object_data(&self, gh_ref: &GlobalHeapRef) -> &[u8] {
+    fn cached_object_data(&self, gh_ref: &GlobalHeapRef) -> Result<&[u8]> {
         self.collections
             .get(&gh_ref.collection_addr)
             .and_then(|collection| collection.get_object(gh_ref.object_index))
-            .expect("global heap object was validated before cloning output")
+            .ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "global heap object {} not found in validated cache at {:#x}",
+                    gh_ref.object_index, gh_ref.collection_addr
+                ))
+            })
     }
 
     pub fn visit_object<R: Read + Seek, T>(

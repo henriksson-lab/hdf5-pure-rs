@@ -99,12 +99,22 @@ impl SharedMessageStore {
     }
 
     /// Append the serialized shared message table image to `out`.
-    pub fn cache_table_serialize_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
+    pub fn cache_table_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         let image_len = self.cache_table_image_len_checked()?;
-        let mut image = Vec::with_capacity(image_len);
+        let mut image = Vec::new();
+        image.try_reserve_exact(image_len).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "shared message cache table image allocation failed: {err}"
+            ))
+        })?;
         for message in self.messages.values() {
             message.encode_into(&mut image)?;
         }
+        out.try_reserve_exact(image.len()).map_err(|err| {
+            Error::InvalidFormat(format!(
+                "shared message cache table output allocation failed: {err}"
+            ))
+        })?;
         out.extend(image);
         Ok(())
     }
@@ -183,7 +193,7 @@ impl SharedMessageStore {
     }
 
     /// Append the serialized shared message list image to `out`.
-    pub fn cache_list_serialize_into(&self, out: &mut impl Extend<u8>) -> Result<()> {
+    pub fn cache_list_serialize_into(&self, out: &mut Vec<u8>) -> Result<()> {
         self.cache_table_serialize_into(out)
     }
 
@@ -458,7 +468,7 @@ pub fn H5SM__cache_table_image_len_checked(store: &SharedMessageStore) -> Result
 #[allow(non_snake_case)]
 pub fn H5SM__cache_table_serialize_into(
     store: &SharedMessageStore,
-    out: &mut impl Extend<u8>,
+    out: &mut Vec<u8>,
 ) -> Result<()> {
     store.cache_table_serialize_into(out)
 }
@@ -518,7 +528,7 @@ pub fn H5SM__cache_list_image_len_checked(store: &SharedMessageStore) -> Result<
 #[allow(non_snake_case)]
 pub fn H5SM__cache_list_serialize_into(
     store: &SharedMessageStore,
-    out: &mut impl Extend<u8>,
+    out: &mut Vec<u8>,
 ) -> Result<()> {
     store.cache_list_serialize_into(out)
 }

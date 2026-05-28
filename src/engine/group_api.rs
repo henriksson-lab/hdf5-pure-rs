@@ -86,6 +86,27 @@ pub struct GroupLocation {
     pub addr: u64,
 }
 
+fn copy_string_fallible(value: &str, context: &str) -> Result<String> {
+    let mut out = String::new();
+    out.try_reserve_exact(value.len())
+        .map_err(|err| Error::InvalidFormat(format!("{context} allocation failed: {err}")))?;
+    out.push_str(value);
+    Ok(out)
+}
+
+fn clone_group_entry_fallible(entry: &GroupEntry) -> Result<GroupEntry> {
+    Ok(GroupEntry {
+        name: copy_string_fallible(&entry.name, "group entry name")?,
+        addr: entry.addr,
+        creation_order: entry.creation_order,
+        comment: entry
+            .comment
+            .as_deref()
+            .map(|comment| copy_string_fallible(comment, "group entry comment"))
+            .transpose()?,
+    })
+}
+
 /// Initialize the group interface.
 #[allow(non_snake_case)]
 pub fn H5G_init() -> bool {
@@ -267,13 +288,17 @@ where
 #[allow(non_snake_case)]
 pub fn H5G_iterate_into(group: &GroupTable, names: &mut Vec<String>) -> Result<()> {
     group.ensure_open()?;
-    names.reserve(group.links.len());
-    names.extend(
-        group
-            .links
-            .values()
-            .map(|entry| entry.name.as_str().to_string()),
-    );
+    let mut next = Vec::new();
+    next.try_reserve_exact(group.links.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group iteration output allocation failed: {err}"))
+    })?;
+    for entry in group.links.values() {
+        next.push(copy_string_fallible(&entry.name, "group link name")?);
+    }
+    names.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group iteration output allocation failed: {err}"))
+    })?;
+    names.extend(next);
     Ok(())
 }
 
@@ -335,8 +360,15 @@ where
 #[allow(non_snake_case)]
 pub fn H5G_visit_into(group: &GroupTable, addrs: &mut Vec<u64>) -> Result<()> {
     group.ensure_open()?;
-    addrs.reserve(group.links.len());
-    addrs.extend(group.links.values().map(H5G__visit_cb));
+    let mut next = Vec::new();
+    next.try_reserve_exact(group.links.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group visit output allocation failed: {err}"))
+    })?;
+    next.extend(group.links.values().map(H5G__visit_cb));
+    addrs.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group visit output allocation failed: {err}"))
+    })?;
+    addrs.extend(next);
     Ok(())
 }
 
@@ -942,8 +974,17 @@ where
 #[allow(non_snake_case)]
 pub fn H5G__obj_iterate_into(group: &GroupTable, entries: &mut Vec<GroupEntry>) -> Result<()> {
     group.ensure_open()?;
-    entries.reserve(group.links.len());
-    entries.extend(group.links.values().cloned());
+    let mut next = Vec::new();
+    next.try_reserve_exact(group.links.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group entry output allocation failed: {err}"))
+    })?;
+    for entry in group.links.values() {
+        next.push(clone_group_entry_fallible(entry)?);
+    }
+    entries.try_reserve_exact(next.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group entry output allocation failed: {err}"))
+    })?;
+    entries.extend(next);
     Ok(())
 }
 
@@ -1399,12 +1440,19 @@ pub fn H5G__cache_node_serialize_into(group: &GroupTable, out: &mut Vec<u8>) -> 
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| Error::InvalidFormat("group cache node image length overflow".into()))?;
     }
-    out.clear();
-    out.reserve(len);
+    let mut image = Vec::new();
+    image.try_reserve_exact(len).map_err(|err| {
+        Error::InvalidFormat(format!("group cache node image allocation failed: {err}"))
+    })?;
     for name in group.links.keys() {
-        out.extend_from_slice(name.as_bytes());
-        out.push(0);
+        image.extend_from_slice(name.as_bytes());
+        image.push(0);
     }
+    out.try_reserve_exact(image.len()).map_err(|err| {
+        Error::InvalidFormat(format!("group cache node output allocation failed: {err}"))
+    })?;
+    out.clear();
+    out.extend_from_slice(&image);
     Ok(())
 }
 /// Metadata-cache hook: free the in-core representation of a cached group node.
@@ -1414,7 +1462,13 @@ pub fn H5G__cache_node_free_icr(_group: GroupTable) {}
 /// Decode a serialized group-node image into caller-owned entry storage.
 #[allow(non_snake_case)]
 pub fn H5G__ent_decode_into(bytes: &[u8], entries: &mut Vec<GroupEntry>) -> Result<()> {
-    entries.extend(H5G__cache_node_deserialize(bytes)?.links.into_values());
+    let decoded = H5G__cache_node_deserialize(bytes)?;
+    entries
+        .try_reserve_exact(decoded.links.len())
+        .map_err(|err| {
+            Error::InvalidFormat(format!("group entry output allocation failed: {err}"))
+        })?;
+    entries.extend(decoded.links.into_values());
     Ok(())
 }
 /// Reset a group entry to its empty default state.

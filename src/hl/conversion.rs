@@ -1,8 +1,6 @@
-use std::any::TypeId;
-
 use crate::error::{Error, Result};
 use crate::format::messages::datatype::{ByteOrder, DatatypeClass, DatatypeMessage, FloatFields};
-use crate::hl::types::{self, H5Type};
+use crate::hl::types::{self, H5Type, PrimitiveType};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadConversion {
@@ -393,12 +391,20 @@ pub(crate) fn convert_between_datatypes_into(
             )
         }
         _ if source.class == destination.class && src_size == dst_size => {
-            out.clear();
-            out.extend_from_slice(bytes);
+            let mut next = Vec::new();
+            next.try_reserve_exact(bytes.len()).map_err(|err| {
+                Error::InvalidFormat(format!("datatype conversion allocation failed: {err}"))
+            })?;
+            next.extend_from_slice(bytes);
             if source.byte_order() != destination.byte_order() {
-                maybe_swap_elements(out, src_size, source.byte_order());
-                maybe_swap_elements(out, dst_size, destination.byte_order());
+                maybe_swap_elements(&mut next, src_size, source.byte_order());
+                maybe_swap_elements(&mut next, dst_size, destination.byte_order());
             }
+            out.try_reserve_exact(next.len()).map_err(|err| {
+                Error::InvalidFormat(format!("datatype conversion output allocation failed: {err}"))
+            })?;
+            out.clear();
+            out.extend_from_slice(&next);
             Ok(())
         }
         _ => Err(Error::Unsupported(format!(
@@ -444,8 +450,11 @@ fn convert_array_datatype_bytes_into(
     let source_base = source.array_base()?;
     let destination_base = destination.array_base()?;
     let mut converted_array = Vec::new();
-    out.clear();
-    out.reserve(conversion_output_len(bytes.len(), src_size, dst_size)?);
+    let mut next = Vec::new();
+    next.try_reserve_exact(conversion_output_len(bytes.len(), src_size, dst_size)?)
+        .map_err(|err| {
+            Error::InvalidFormat(format!("array conversion allocation failed: {err}"))
+        })?;
 
     for chunk in bytes.chunks_exact(src_size) {
         convert_between_datatypes_into(
@@ -460,8 +469,9 @@ fn convert_array_datatype_bytes_into(
                 converted_array.len()
             )));
         }
-        out.extend_from_slice(&converted_array);
+        next.extend_from_slice(&converted_array);
     }
+    *out = next;
     Ok(())
 }
 
@@ -502,40 +512,16 @@ pub(crate) fn convert_between_datatypes(
 }
 
 fn target_integer<T: H5Type>() -> Option<(bool, usize)> {
-    let type_id = TypeId::of::<T>();
-    if type_id == TypeId::of::<i8>() {
-        Some((true, 1))
-    } else if type_id == TypeId::of::<i16>() {
-        Some((true, 2))
-    } else if type_id == TypeId::of::<i32>() {
-        Some((true, 4))
-    } else if type_id == TypeId::of::<i64>() {
-        Some((true, 8))
-    } else if type_id == TypeId::of::<i128>() {
-        Some((true, 16))
-    } else if type_id == TypeId::of::<u8>() {
-        Some((false, 1))
-    } else if type_id == TypeId::of::<u16>() {
-        Some((false, 2))
-    } else if type_id == TypeId::of::<u32>() {
-        Some((false, 4))
-    } else if type_id == TypeId::of::<u64>() {
-        Some((false, 8))
-    } else if type_id == TypeId::of::<u128>() {
-        Some((false, 16))
-    } else {
-        None
+    match T::primitive_type()? {
+        PrimitiveType::Integer { signed, size } => Some((signed, size)),
+        PrimitiveType::Float { .. } => None,
     }
 }
 
 fn target_float<T: H5Type>() -> Option<usize> {
-    let type_id = TypeId::of::<T>();
-    if type_id == TypeId::of::<f32>() {
-        Some(4)
-    } else if type_id == TypeId::of::<f64>() {
-        Some(8)
-    } else {
-        None
+    match T::primitive_type()? {
+        PrimitiveType::Float { size } => Some(size),
+        PrimitiveType::Integer { .. } => None,
     }
 }
 
@@ -639,8 +625,7 @@ fn convert_integer_bytes_to_order_into(
         )));
     }
 
-    out.clear();
-    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
+    let mut next = zeroed_conversion_output(bytes.len(), src_size, dst_size)?;
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = if src_signed {
             IntegerValue::Signed(read_signed(chunk, src_order))
@@ -648,9 +633,10 @@ fn convert_integer_bytes_to_order_into(
             IntegerValue::Unsigned(read_unsigned(chunk, src_order))
         };
         let raw = clamp_integer(value, dst_size, dst_signed);
-        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
+        let dst = conversion_output_window(next.as_mut_slice(), idx, dst_size)?;
         write_uint_ordered(dst, raw, dst_order);
     }
+    *out = next;
     Ok(())
 }
 
@@ -815,13 +801,13 @@ fn convert_float_bytes_to_order_into(
             bytes.len()
         )));
     }
-    out.clear();
-    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
+    let mut next = zeroed_conversion_output(bytes.len(), src_size, dst_size)?;
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = read_float(chunk, src_size, src_order)?;
-        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
+        let dst = conversion_output_window(next.as_mut_slice(), idx, dst_size)?;
         write_float_ordered(dst, value, dst_order)?;
     }
+    *out = next;
     Ok(())
 }
 
@@ -900,17 +886,17 @@ fn convert_integer_to_float_bytes_to_order_into(
             bytes.len()
         )));
     }
-    out.clear();
-    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
+    let mut next = zeroed_conversion_output(bytes.len(), src_size, dst_size)?;
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = if src_signed {
             read_signed(chunk, src_order) as f64
         } else {
             read_unsigned(chunk, src_order) as f64
         };
-        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
+        let dst = conversion_output_window(next.as_mut_slice(), idx, dst_size)?;
         write_float_ordered(dst, value, dst_order)?;
     }
+    *out = next;
     Ok(())
 }
 
@@ -985,14 +971,14 @@ fn convert_float_to_integer_bytes_to_order_into(
             bytes.len()
         )));
     }
-    out.clear();
-    out.resize(conversion_output_len(bytes.len(), src_size, dst_size)?, 0);
+    let mut next = zeroed_conversion_output(bytes.len(), src_size, dst_size)?;
     for (idx, chunk) in bytes.chunks_exact(src_size).enumerate() {
         let value = read_float(chunk, src_size, src_order)?;
         let raw = clamp_float_to_integer(value, dst_size, dst_signed);
-        let dst = conversion_output_window(out.as_mut_slice(), idx, dst_size)?;
+        let dst = conversion_output_window(next.as_mut_slice(), idx, dst_size)?;
         write_uint_ordered(dst, raw, dst_order);
     }
+    *out = next;
     Ok(())
 }
 
@@ -1000,6 +986,18 @@ fn conversion_output_len(byte_len: usize, src_size: usize, dst_size: usize) -> R
     (byte_len / src_size)
         .checked_mul(dst_size)
         .ok_or_else(|| Error::InvalidFormat("conversion output size overflow".into()))
+}
+
+fn zeroed_conversion_output(byte_len: usize, src_size: usize, dst_size: usize) -> Result<Vec<u8>> {
+    let len = conversion_output_len(byte_len, src_size, dst_size)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "datatype conversion output allocation failed: {err}"
+        ))
+    })?;
+    out.resize(len, 0);
+    Ok(out)
 }
 
 fn converted_element_count(byte_len: usize, src_size: usize) -> Result<usize> {
@@ -1109,7 +1107,9 @@ fn read_float_source(
     let input = bytes
         .get(..source.size)
         .ok_or_else(|| Error::InvalidFormat("floating-point payload is truncated".into()))?;
-    let layout = source.layout.expect("checked above");
+    let layout = source.layout.ok_or_else(|| {
+        Error::InvalidFormat("floating-point layout missing after validation".into())
+    })?;
     decode_float_layout(read_unsigned(input, byte_order), layout)
 }
 

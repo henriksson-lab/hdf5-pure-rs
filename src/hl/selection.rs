@@ -136,9 +136,16 @@ impl SelectionPointIter {
     ) -> Result<()> {
         match kind {
             SelectionPointIterKind::Points(points) => {
-                out.clear();
                 if let Some(point) = points.get(index) {
+                    out.try_reserve_exact(point.len()).map_err(|err| {
+                        Error::InvalidFormat(format!(
+                            "selection point output allocation failed: {err}"
+                        ))
+                    })?;
+                    out.clear();
                     out.extend_from_slice(point);
+                } else {
+                    out.clear();
                 }
                 Ok(())
             }
@@ -3992,9 +3999,9 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
         Error::InvalidFormat("selection serialization ended before u64 field".into())
     })?;
     *offset = end;
-    Ok(u64::from_le_bytes(
-        word.try_into().expect("slice length checked"),
-    ))
+    Ok(u64::from_le_bytes([
+        word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
+    ]))
 }
 
 fn read_usize_u64(bytes: &[u8], offset: &mut usize, context: &str) -> Result<usize> {
@@ -4076,9 +4083,13 @@ fn linear_index(point: &[u64], ds_shape: &[u64]) -> Result<u64> {
 }
 
 fn row_major_coord_from_index(index: usize, shape: &[u64], out: &mut Vec<u64>) -> Result<()> {
-    out.clear();
-    out.resize(shape.len(), 0);
+    let mut next = Vec::new();
+    next.try_reserve_exact(shape.len()).map_err(|err| {
+        Error::InvalidFormat(format!("selection coordinate allocation failed: {err}"))
+    })?;
+    next.resize(shape.len(), 0);
     if shape.is_empty() {
+        out.clear();
         return Ok(());
     }
 
@@ -4090,10 +4101,15 @@ fn row_major_coord_from_index(index: usize, shape: &[u64], out: &mut Vec<u64>) -
                 "selection iterator shape contains zero extent".into(),
             ));
         }
-        out[dim] = remainder % extent;
+        next[dim] = remainder % extent;
         remainder /= extent;
     }
     if remainder == 0 {
+        out.try_reserve_exact(next.len()).map_err(|err| {
+            Error::InvalidFormat(format!("selection coordinate allocation failed: {err}"))
+        })?;
+        out.clear();
+        out.extend_from_slice(&next);
         Ok(())
     } else {
         Err(Error::InvalidFormat(

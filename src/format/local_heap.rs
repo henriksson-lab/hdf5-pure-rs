@@ -145,10 +145,14 @@ impl LocalHeap {
             ));
         }
         Ok(data.chunks_exact(16).map(|record| {
-            let offset = read_le_u64_from_record(record, 0)
-                .expect("validated local heap free-list record offset");
-            let size = read_le_u64_from_record(record, 8)
-                .expect("validated local heap free-list record size");
+            let offset = u64::from_le_bytes([
+                record[0], record[1], record[2], record[3], record[4], record[5], record[6],
+                record[7],
+            ]);
+            let size = u64::from_le_bytes([
+                record[8], record[9], record[10], record[11], record[12], record[13], record[14],
+                record[15],
+            ]);
             (offset, size)
         }))
     }
@@ -469,7 +473,7 @@ impl LocalHeap {
             ));
         }
         reader.seek(prefix.data_addr)?;
-        let mut data = vec![0; data_len];
+        let mut data = new_heap_data_buffer(data_len)?;
         reader.read_bytes_into(&mut data)?;
         Ok(Self { data })
     }
@@ -546,6 +550,14 @@ fn heap_len(value: u64, context: &str) -> Result<usize> {
     Ok(len)
 }
 
+fn new_heap_data_buffer(len: usize) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len)
+        .map_err(|err| Error::InvalidFormat(format!("local heap data allocation failed: {err}")))?;
+    data.resize(len, 0);
+    Ok(data)
+}
+
 /// Encode an unsigned integer into `size` little-endian bytes, rejecting
 /// invalid widths and values that don't fit.
 fn encode_var(out: &mut Vec<u8>, value: u64, size: usize) -> Result<()> {
@@ -610,14 +622,6 @@ fn undefined_length(width: u8) -> Result<u64> {
             .ok_or_else(|| Error::InvalidFormat("local heap length width overflow".into()))?;
         (1u64 << bits) - 1
     })
-}
-
-/// Read an 8-byte little-endian `u64` from `record` at `offset`, returning
-/// `None` if the slice is too short.
-fn read_le_u64_from_record(record: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    let bytes: [u8; 8] = record.get(offset..end)?.try_into().ok()?;
-    Some(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -784,6 +788,18 @@ mod tests {
             .expect_err("out-of-file heap data segment should fail before allocation");
         assert!(
             err.to_string().contains("extends past end of file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn local_heap_data_buffer_allocation_failure_is_reported() {
+        let err = new_heap_data_buffer(usize::MAX)
+            .expect_err("impossible local heap buffer should fail without panicking");
+
+        assert!(
+            err.to_string()
+                .contains("local heap data allocation failed"),
             "unexpected error: {err}"
         );
     }

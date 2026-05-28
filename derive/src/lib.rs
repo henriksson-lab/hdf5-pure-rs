@@ -9,7 +9,8 @@ use syn::{
 ///
 /// # Structs
 ///
-/// Structs must have `#[repr(C)]` or `#[repr(packed)]`. Each field must implement `H5Type`.
+/// Structs must have `#[repr(C)]`, `#[repr(packed)]`, or `#[repr(transparent)]`.
+/// Each field must implement `H5Type`.
 ///
 /// ```ignore
 /// #[derive(Copy, Clone, H5Type)]
@@ -42,7 +43,10 @@ pub fn derive_h5type(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let body = impl_trait(name, &input.data, &input.attrs, &ty_generics);
+    let body = match impl_trait(name, &input.data, &input.attrs, &ty_generics) {
+        Ok(body) => body,
+        Err(err) => return proc_macro::TokenStream::from(err.to_compile_error()),
+    };
     let expanded = quote! {
         #[automatically_derived]
         #[allow(unused_variables)]
@@ -64,13 +68,14 @@ fn impl_trait(
     data: &Data,
     attrs: &[Attribute],
     ty_generics: &TypeGenerics,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     match *data {
         Data::Struct(ref data) => impl_struct(ty, data, attrs, ty_generics),
         Data::Enum(ref data) => impl_enum(ty, data, attrs),
-        Data::Union(_) => {
-            panic!("cannot derive `H5Type` for unions");
-        }
+        Data::Union(_) => Err(syn::Error::new_spanned(
+            ty,
+            "cannot derive `H5Type` for unions",
+        )),
     }
 }
 
@@ -79,9 +84,12 @@ fn impl_struct(
     data: &syn::DataStruct,
     attrs: &[Attribute],
     ty_generics: &TypeGenerics,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     match data.fields {
-        Fields::Unit => panic!("cannot derive `H5Type` for unit structs"),
+        Fields::Unit => Err(syn::Error::new_spanned(
+            ty,
+            "cannot derive `H5Type` for unit structs",
+        )),
         Fields::Named(ref fields) => {
             let fields: Vec<_> = fields
                 .named
@@ -89,26 +97,36 @@ fn impl_struct(
                 .filter(|f| !is_phantom_data(&f.ty))
                 .collect();
             if fields.is_empty() {
-                panic!("cannot derive `H5Type` for empty structs");
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "cannot derive `H5Type` for empty structs",
+                ));
             }
 
-            let repr = find_repr(attrs, &["C", "packed", "transparent"]);
-            if repr.is_none() {
-                panic!("`H5Type` requires #[repr(C)] or #[repr(packed)] for structs");
-            }
-            let repr = repr.unwrap();
+            let Some(repr) = find_repr(attrs, &["C", "packed", "transparent"]) else {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "`H5Type` requires #[repr(C)], #[repr(packed)], or #[repr(transparent)] for structs",
+                ));
+            };
 
             if repr == "transparent" {
                 if fields.len() != 1 {
-                    panic!("#[repr(transparent)] requires exactly one non-PhantomData field");
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "#[repr(transparent)] requires exactly one non-PhantomData field",
+                    ));
                 }
                 let inner_ty = &fields[0].ty;
-                return quote! {
+                return Ok(quote! {
                     fn has_padding() -> bool {
                         <#inner_ty as ::hdf5_pure_rust::H5Type>::has_padding()
                     }
                     fn requires_validation() -> bool {
                         <#inner_ty as ::hdf5_pure_rust::H5Type>::requires_validation()
+                    }
+                    fn primitive_type() -> Option<::hdf5_pure_rust::hl::types::PrimitiveType> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::primitive_type()
                     }
                     fn validate_bytes(bytes: &[u8]) -> ::hdf5_pure_rust::Result<()> {
                         <#inner_ty as ::hdf5_pure_rust::H5Type>::validate_bytes(bytes)
@@ -124,14 +142,20 @@ fn impl_struct(
                     }
                     fn visit_enum_members<F>(visitor: F) -> Option<()>
                     where
-                        F: FnMut(&str, i64),
+                        F: FnMut(&str, u64),
                     {
                         <#inner_ty as ::hdf5_pure_rust::H5Type>::visit_enum_members(visitor)
                     }
-                    fn enum_members_into(out: &mut Vec<(String, i64)>) -> Option<()> {
+                    fn enum_members_into(out: &mut Vec<(String, u64)>) -> Option<()> {
                         <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_members_into(out)
                     }
-                };
+                    fn enum_base_type() -> Option<(bool, usize)> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_base_type()
+                    }
+                    fn enum_members_u64_into(out: &mut Vec<(String, u64)>) -> Option<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_members_u64_into(out)
+                    }
+                });
             }
 
             let field_names: Vec<String> = fields
@@ -148,7 +172,7 @@ fn impl_struct(
             let field_idents_for_validation = field_idents.clone();
             let field_types_for_validation = field_types.clone();
 
-            quote! {
+            Ok(quote! {
                 fn has_padding() -> bool {
                     let mut cursor = 0usize;
                     let mut padded = false;
@@ -193,28 +217,14 @@ fn impl_struct(
                             },
                             size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
                             type_class: {
-                                let size = <#field_types as ::hdf5_pure_rust::H5Type>::type_size();
-                                if size == 4 || size == 8 {
-                                    if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f32>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f64>()
-                                    {
-                                        ::hdf5_pure_rust::hl::types::TypeClass::Float
-                                    } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i32>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i64>()
-                                    {
-                                        ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
-                                    } else {
-                                        ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
+                                let type_class = match ::hdf5_pure_rust::hl::types::type_class_for::<#field_types>() {
+                                    Some(type_class) => type_class,
+                                    None => {
+                                        out.clear();
+                                        return None;
                                     }
-                                } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
-                                    || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
-                                {
-                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
-                                } else {
-                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
-                                }
+                                };
+                                type_class
                             },
                         });
                     )*
@@ -235,34 +245,14 @@ fn impl_struct(
                             },
                             size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
                             type_class: {
-                                let size = <#field_types as ::hdf5_pure_rust::H5Type>::type_size();
-                                if size == 4 || size == 8 {
-                                    if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f32>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<f64>()
-                                    {
-                                        ::hdf5_pure_rust::hl::types::TypeClass::Float
-                                    } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i32>()
-                                        || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i64>()
-                                    {
-                                        ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
-                                    } else {
-                                        ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
-                                    }
-                                } else if ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i8>()
-                                    || ::std::any::TypeId::of::<#field_types>() == ::std::any::TypeId::of::<i16>()
-                                {
-                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: true }
-                                } else {
-                                    ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false }
-                                }
+                                let type_class = ::hdf5_pure_rust::hl::types::type_class_for::<#field_types>()?;
+                                type_class
                             },
                         });
                     )*
                     Some(())
                 }
-            }
+            })
         }
         Fields::Unnamed(ref fields) => {
             let fields: Vec<_> = fields
@@ -272,12 +262,65 @@ fn impl_struct(
                 .filter(|(_, f)| !is_phantom_data(&f.ty))
                 .collect();
             if fields.is_empty() {
-                panic!("cannot derive `H5Type` for empty tuple structs");
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "cannot derive `H5Type` for empty tuple structs",
+                ));
             }
 
-            let repr = find_repr(attrs, &["C", "packed", "transparent"]);
-            if repr.is_none() {
-                panic!("`H5Type` requires #[repr(C)] or #[repr(packed)] for tuple structs");
+            let Some(repr) = find_repr(attrs, &["C", "packed", "transparent"]) else {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "`H5Type` requires #[repr(C)], #[repr(packed)], or #[repr(transparent)] for tuple structs",
+                ));
+            };
+
+            if repr == "transparent" {
+                if fields.len() != 1 {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "#[repr(transparent)] requires exactly one non-PhantomData field",
+                    ));
+                }
+                let inner_ty = &fields[0].1.ty;
+                return Ok(quote! {
+                    fn has_padding() -> bool {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::has_padding()
+                    }
+                    fn requires_validation() -> bool {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::requires_validation()
+                    }
+                    fn primitive_type() -> Option<::hdf5_pure_rust::hl::types::PrimitiveType> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::primitive_type()
+                    }
+                    fn validate_bytes(bytes: &[u8]) -> ::hdf5_pure_rust::Result<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::validate_bytes(bytes)
+                    }
+                    fn visit_compound_fields<F>(visitor: F) -> Option<()>
+                    where
+                        F: FnMut(::hdf5_pure_rust::hl::types::FieldDescriptor),
+                    {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::visit_compound_fields(visitor)
+                    }
+                    fn compound_fields_into(out: &mut Vec<::hdf5_pure_rust::hl::types::FieldDescriptor>) -> Option<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::compound_fields_into(out)
+                    }
+                    fn visit_enum_members<F>(visitor: F) -> Option<()>
+                    where
+                        F: FnMut(&str, u64),
+                    {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::visit_enum_members(visitor)
+                    }
+                    fn enum_members_into(out: &mut Vec<(String, u64)>) -> Option<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_members_into(out)
+                    }
+                    fn enum_base_type() -> Option<(bool, usize)> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_base_type()
+                    }
+                    fn enum_members_u64_into(out: &mut Vec<(String, u64)>) -> Option<()> {
+                        <#inner_ty as ::hdf5_pure_rust::H5Type>::enum_members_u64_into(out)
+                    }
+                });
             }
 
             let field_names: Vec<String> = fields
@@ -292,7 +335,7 @@ fn impl_struct(
             let field_indices_for_validation = field_indices.clone();
             let field_types_for_validation = field_types.clone();
 
-            quote! {
+            Ok(quote! {
                 fn has_padding() -> bool {
                     let mut cursor = 0usize;
                     let mut padded = false;
@@ -336,7 +379,16 @@ fn impl_struct(
                                     .offset_from(origin_ptr.cast()) as usize
                             },
                             size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
-                            type_class: ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false },
+                            type_class: {
+                                let type_class = match ::hdf5_pure_rust::hl::types::type_class_for::<#field_types>() {
+                                    Some(type_class) => type_class,
+                                    None => {
+                                        out.clear();
+                                        return None;
+                                    }
+                                };
+                                type_class
+                            },
                         });
                     )*
                     Some(())
@@ -355,37 +407,47 @@ fn impl_struct(
                                     .offset_from(origin_ptr.cast()) as usize
                             },
                             size: <#field_types as ::hdf5_pure_rust::H5Type>::type_size(),
-                            type_class: ::hdf5_pure_rust::hl::types::TypeClass::Integer { signed: false },
+                            type_class: {
+                                let type_class = ::hdf5_pure_rust::hl::types::type_class_for::<#field_types>()?;
+                                type_class
+                            },
                         });
                     )*
                     Some(())
                 }
-            }
+            })
         }
     }
 }
 
-fn impl_enum(_ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> TokenStream {
+fn impl_enum(ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> syn::Result<TokenStream> {
     let variants = &data.variants;
 
     if variants
         .iter()
         .any(|v| v.fields != Fields::Unit || v.discriminant.is_none())
     {
-        panic!("`H5Type` can only be derived for enums with scalar discriminants");
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`H5Type` can only be derived for enums with scalar discriminants",
+        ));
     }
     if variants.is_empty() {
-        panic!("cannot derive `H5Type` for empty enums");
+        return Err(syn::Error::new_spanned(
+            ty,
+            "cannot derive `H5Type` for empty enums",
+        ));
     }
 
     let enum_reprs = &[
         "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize",
     ];
-    let repr = find_repr(attrs, enum_reprs);
-    if repr.is_none() {
-        panic!("`H5Type` requires explicit integer repr for enums");
-    }
-    let repr = repr.unwrap();
+    let Some(repr) = find_repr(attrs, enum_reprs) else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "`H5Type` requires explicit integer repr for enums",
+        ));
+    };
 
     let names: Vec<String> = variants
         .iter()
@@ -395,12 +457,15 @@ fn impl_enum(_ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> TokenStr
         .iter()
         .map(|v| &v.discriminant.as_ref().unwrap().1)
         .collect();
+    let repr_iter_u64 = std::iter::repeat(&repr);
     let repr_iter_visit = std::iter::repeat(&repr);
     let repr_iter_into = std::iter::repeat(&repr);
     let repr_validate = &repr;
     let values_for_validation = values.clone();
+    let repr_string = repr.to_string();
+    let repr_signed = matches!(repr_string.as_str(), "i8" | "i16" | "i32" | "i64" | "isize");
 
-    quote! {
+    Ok(quote! {
         fn requires_validation() -> bool {
             true
         }
@@ -426,21 +491,40 @@ fn impl_enum(_ty: &Ident, data: &syn::DataEnum, attrs: &[Attribute]) -> TokenStr
         }
         fn visit_enum_members<F>(mut visitor: F) -> Option<()>
         where
-            F: FnMut(&str, i64),
+            F: FnMut(&str, u64),
         {
             #(
-                visitor(#names, (#values) as #repr_iter_visit as i64);
+                let raw = (#values) as #repr_iter_visit as u64;
+                let bits = ::std::mem::size_of::<#repr_iter_visit>() * 8;
+                let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                visitor(#names, raw & mask);
             )*
             Some(())
         }
-        fn enum_members_into(out: &mut Vec<(String, i64)>) -> Option<()> {
+        fn enum_members_into(out: &mut Vec<(String, u64)>) -> Option<()> {
             out.clear();
             #(
-                out.push((#names.to_string(), (#values) as #repr_iter_into as i64));
+                let raw = (#values) as #repr_iter_into as u64;
+                let bits = ::std::mem::size_of::<#repr_iter_into>() * 8;
+                let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                out.push((#names.to_string(), raw & mask));
             )*
             Some(())
         }
-    }
+        fn enum_base_type() -> Option<(bool, usize)> {
+            Some((#repr_signed, ::std::mem::size_of::<#repr_validate>()))
+        }
+        fn enum_members_u64_into(out: &mut Vec<(String, u64)>) -> Option<()> {
+            out.clear();
+            #(
+                let raw = (#values) as #repr_iter_u64 as u64;
+                let bits = ::std::mem::size_of::<#repr_iter_u64>() * 8;
+                let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                out.push((#names.to_string(), raw & mask));
+            )*
+            Some(())
+        }
+    })
 }
 
 fn is_phantom_data(ty: &Type) -> bool {

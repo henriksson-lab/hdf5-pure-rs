@@ -248,7 +248,12 @@ pub fn scaleoffset_compress_into(
         ));
     }
 
-    let mut packed = Vec::with_capacity(expected);
+    let mut packed = Vec::new();
+    packed.try_reserve_exact(expected).map_err(|err| {
+        Error::InvalidFormat(format!(
+            "scaleoffset packed buffer allocation failed: {err}"
+        ))
+    })?;
     let (minbits, minval) = match class {
         CLS_INTEGER => scaleoffset_precompress_i_with_minbits_into(
             &data[..expected],

@@ -404,7 +404,12 @@ pub fn get_token(input: &str, pos: &mut usize) -> Result<Option<XformToken>> {
             };
             let token = match parser.parse_number()? {
                 XformExpr::Number(value) => XformToken::Number(value),
-                _ => unreachable!(),
+                other => {
+                    return Err(Error::InvalidFormat(format!(
+                        "numeric transform token parsed as {:?}",
+                        other.xform_find_type()
+                    )));
+                }
             };
             if parser.pos == start {
                 return Err(Error::InvalidFormat(
