@@ -123,6 +123,43 @@ impl Dataset {
             return Ok(());
         }
 
+        if let crate::hl::selection::Selection::Hyperslab(dims) = selection {
+            let info = self.info()?;
+            let conversion =
+                crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
+            if conversion.is_same_size_bytes() && !T::requires_validation() {
+                let elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+                if elem_size == 0 {
+                    return Err(Error::Other("zero-size type".into()));
+                }
+                let raw_out = crate::hl::types::slice_as_bytes_mut(out);
+                if self
+                    .read_chunked_hyperslab_direct_into(&info, shape, dims, elem_size, raw_out)?
+                {
+                    conversion.convert_bytes_in_place(raw_out);
+                    return Ok(());
+                }
+            }
+            let source_elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+            if source_elem_size == 0 {
+                return Err(Error::Other("zero-size type".into()));
+            }
+            let raw_len = expected_len
+                .checked_mul(source_elem_size)
+                .ok_or_else(|| Error::InvalidFormat("selection byte length overflow".into()))?;
+            let mut raw = vec![0u8; raw_len];
+            if self.read_chunked_hyperslab_direct_into(
+                &info,
+                shape,
+                dims,
+                source_elem_size,
+                &mut raw,
+            )? {
+                conversion.bytes_into_slice(&raw, out)?;
+                return Ok(());
+            }
+        }
+
         if !matches!(
             selection,
             crate::hl::selection::Selection::Points(_)

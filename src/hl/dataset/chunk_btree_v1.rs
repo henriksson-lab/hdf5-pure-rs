@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 use std::thread;
 
 use super::chunk_read::{BorrowedChunkPayloadRead, ChunkBTreeRecord, ChunkReadContext};
-use super::{usize_from_u64, Dataset, DatasetInfo};
+use super::{u64_from_usize, usize_from_u64, Dataset, DatasetInfo};
 
 const MAX_CHUNK_BTREE_V1_RECURSION: usize = 64;
 const MIN_PARALLEL_DEFLATE_CHUNKS_1D: usize = 8;
@@ -26,7 +26,179 @@ enum ChunkBTreeNode {
     },
 }
 
+struct ChunkBTreeKey {
+    scaled: Vec<u64>,
+    nbytes: u64,
+    filter_mask: u32,
+}
+
+struct ChunkBTreeChild {
+    key: ChunkBTreeKey,
+    child_addr: u64,
+}
+
+struct ChunkBTreeLookupNode {
+    level: u8,
+    children: Vec<ChunkBTreeChild>,
+    final_key: ChunkBTreeKey,
+}
+
+struct ChunkBTreeKeyDims<'a> {
+    chunk_dims: &'a [u64],
+    element_size: usize,
+}
+
 impl Dataset {
+    pub(super) fn lookup_btree_v1_chunk<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        data_ndims: usize,
+        chunk_dims: &[u64],
+        element_size: usize,
+        chunk_origin: &[u64],
+    ) -> Result<Option<ChunkBTreeRecord>> {
+        if data_ndims != chunk_dims.len() || data_ndims != chunk_origin.len() {
+            return Err(Error::InvalidFormat(
+                "v1 B-tree lookup rank mismatch".into(),
+            ));
+        }
+        if crate::io::reader::is_undef_addr(addr) {
+            return Ok(None);
+        }
+
+        let mut target_scaled = Vec::with_capacity(data_ndims + 1);
+        for ((&origin, &chunk_dim), dim_index) in
+            chunk_origin.iter().zip(chunk_dims).zip(0..data_ndims)
+        {
+            if chunk_dim == 0 {
+                return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+            }
+            if origin % chunk_dim != 0 {
+                return Err(Error::InvalidFormat(format!(
+                    "v1 B-tree lookup coordinate for dimension {dim_index} is not chunk-aligned"
+                )));
+            }
+            target_scaled.push(origin / chunk_dim);
+        }
+        target_scaled.push(0);
+
+        let mut visited = Vec::new();
+        let key_dims = ChunkBTreeKeyDims {
+            chunk_dims,
+            element_size,
+        };
+        let found = Self::lookup_btree_v1_chunk_inner(
+            reader,
+            addr,
+            data_ndims,
+            &key_dims,
+            &target_scaled,
+            0,
+            None,
+            &mut visited,
+        )?;
+        let (lookup_addr, lookup_nbytes, lookup_mask) = found
+            .as_ref()
+            .map(|record| (record.chunk_addr, record.chunk_size, record.filter_mask))
+            .unwrap_or_else(|| (crate::io::reader::UNDEF_ADDR, 0, 0));
+        Self::trace_btree1_chunk_lookup(
+            addr,
+            &target_scaled[..data_ndims],
+            lookup_addr,
+            lookup_nbytes,
+            lookup_mask,
+        );
+        Ok(found)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_btree_v1_chunk_inner<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        data_ndims: usize,
+        key_dims: &ChunkBTreeKeyDims<'_>,
+        target_scaled: &[u64],
+        depth: usize,
+        expected_level: Option<u8>,
+        visited: &mut Vec<u64>,
+    ) -> Result<Option<ChunkBTreeRecord>> {
+        if depth > MAX_CHUNK_BTREE_V1_RECURSION {
+            return Err(Error::InvalidFormat(
+                "v1 chunk B-tree recursion depth exceeded".into(),
+            ));
+        }
+        if crate::io::reader::is_undef_addr(addr) {
+            return Err(Error::InvalidFormat(
+                "v1 chunk B-tree node address is undefined".into(),
+            ));
+        }
+        if visited.contains(&addr) {
+            return Err(Error::InvalidFormat(
+                "v1 chunk B-tree traversal cycle detected".into(),
+            ));
+        }
+        visited.push(addr);
+
+        let node = Self::decode_chunk_btree_lookup_node(reader, addr, data_ndims, key_dims)?;
+        if let Some(expected_level) = expected_level {
+            if node.level != expected_level {
+                visited.pop();
+                return Err(Error::InvalidFormat(format!(
+                    "v1 chunk B-tree child level {} does not match expected {expected_level}",
+                    node.level
+                )));
+            }
+        }
+
+        let mut lt = 0usize;
+        let mut rt = node.children.len();
+        let mut idx = 0usize;
+        let mut cmp = 1i32;
+        while lt < rt && cmp != 0 {
+            idx = (lt + rt) / 2;
+            let right_key = if idx + 1 < node.children.len() {
+                &node.children[idx + 1].key
+            } else {
+                &node.final_key
+            };
+            cmp = Self::btree_v1_cmp3(&node.children[idx].key, target_scaled, right_key);
+            if cmp < 0 {
+                rt = idx;
+            } else {
+                lt = idx + 1;
+            }
+        }
+
+        let result = if cmp != 0 {
+            Ok(None)
+        } else if node.level > 0 {
+            let child_addr = node.children[idx].child_addr;
+            if child_addr == addr {
+                Err(Error::InvalidFormat(
+                    "cyclic v1 chunk B-tree detected".into(),
+                ))
+            } else {
+                Self::lookup_btree_v1_chunk_inner(
+                    reader,
+                    child_addr,
+                    data_ndims,
+                    key_dims,
+                    target_scaled,
+                    depth.checked_add(1).ok_or_else(|| {
+                        Error::InvalidFormat("v1 chunk B-tree recursion depth overflow".into())
+                    })?,
+                    Some(node.level - 1),
+                    visited,
+                )
+            }
+        } else {
+            Self::found_btree_v1_chunk(&node.children[idx], data_ndims, key_dims, target_scaled)
+        };
+
+        visited.pop();
+        result
+    }
+
     pub(super) fn read_chunked_btree_v1<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         info: &DatasetInfo,
@@ -332,6 +504,155 @@ impl Dataset {
         Ok(())
     }
 
+    fn decode_chunk_btree_lookup_node<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        addr: u64,
+        data_ndims: usize,
+        key_dims: &ChunkBTreeKeyDims<'_>,
+    ) -> Result<ChunkBTreeLookupNode> {
+        reader.seek(addr)?;
+
+        let mut magic = [0u8; 4];
+        reader.read_bytes_into(&mut magic)?;
+        if magic != [b'T', b'R', b'E', b'E'] {
+            return Err(Error::InvalidFormat("invalid chunk B-tree magic".into()));
+        }
+
+        let node_type = reader.read_u8()?;
+        if node_type != 1 {
+            return Err(Error::InvalidFormat(format!(
+                "expected raw data B-tree (type 1), got type {node_type}"
+            )));
+        }
+
+        let level = reader.read_u8()?;
+        let entries_used = usize::from(reader.read_u16()?);
+        let _left_sibling = reader.read_addr()?;
+        let _right_sibling = reader.read_addr()?;
+
+        let mut children = Vec::with_capacity(entries_used);
+        for _ in 0..entries_used {
+            let key = Self::decode_chunk_btree_key(reader, data_ndims, key_dims)?;
+            let child_addr = reader.read_addr()?;
+            if crate::io::reader::is_undef_addr(child_addr) {
+                return Err(Error::InvalidFormat(
+                    "v1 chunk B-tree child address is undefined".into(),
+                ));
+            }
+            children.push(ChunkBTreeChild { key, child_addr });
+        }
+        let final_key = Self::decode_chunk_btree_key(reader, data_ndims, key_dims)?;
+
+        Ok(ChunkBTreeLookupNode {
+            level,
+            children,
+            final_key,
+        })
+    }
+
+    fn decode_chunk_btree_key<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        data_ndims: usize,
+        key_dims: &ChunkBTreeKeyDims<'_>,
+    ) -> Result<ChunkBTreeKey> {
+        if key_dims.chunk_dims.len() != data_ndims {
+            return Err(Error::InvalidFormat(
+                "v1 B-tree key dimension mismatch".into(),
+            ));
+        }
+
+        let nbytes = u64::from(reader.read_u32()?);
+        let filter_mask = reader.read_u32()?;
+        let mut scaled = Vec::with_capacity(data_ndims + 1);
+        for dim_index in 0..data_ndims {
+            let chunk_dim = key_dims.chunk_dims[dim_index];
+            if chunk_dim == 0 {
+                return Err(Error::InvalidFormat(format!(
+                    "chunk size must be > 0, dim = {dim_index}"
+                )));
+            }
+            let offset = reader.read_u64()?;
+            if offset % chunk_dim != 0 {
+                return Err(Error::InvalidFormat(
+                    "bad v1 B-tree coordinate offset".into(),
+                ));
+            }
+            scaled.push(offset / chunk_dim);
+        }
+
+        let element_size = u64_from_usize(key_dims.element_size, "datatype size")?;
+        if element_size == 0 {
+            return Err(Error::InvalidFormat("datatype size is zero".into()));
+        }
+        let extra_offset = reader.read_u64()?;
+        if extra_offset % element_size != 0 {
+            return Err(Error::InvalidFormat(
+                "bad v1 B-tree datatype-size coordinate offset".into(),
+            ));
+        }
+        scaled.push(extra_offset / element_size);
+
+        Ok(ChunkBTreeKey {
+            scaled,
+            nbytes,
+            filter_mask,
+        })
+    }
+
+    fn btree_v1_cmp3(lt_key: &ChunkBTreeKey, target_scaled: &[u64], rt_key: &ChunkBTreeKey) -> i32 {
+        if target_scaled.len() == 2 {
+            if target_scaled[0] > rt_key.scaled[0] {
+                1
+            } else if target_scaled[0] == rt_key.scaled[0] && target_scaled[1] >= rt_key.scaled[1] {
+                1
+            } else if target_scaled[0] < lt_key.scaled[0] {
+                -1
+            } else {
+                0
+            }
+        } else if vector_ge(target_scaled, &rt_key.scaled) {
+            1
+        } else if vector_lt(target_scaled, &lt_key.scaled) {
+            -1
+        } else {
+            0
+        }
+    }
+
+    fn found_btree_v1_chunk(
+        child: &ChunkBTreeChild,
+        data_ndims: usize,
+        key_dims: &ChunkBTreeKeyDims<'_>,
+        target_scaled: &[u64],
+    ) -> Result<Option<ChunkBTreeRecord>> {
+        for (target, left) in target_scaled.iter().zip(&child.key.scaled) {
+            if *target >= left.saturating_add(1) {
+                return Ok(None);
+            }
+        }
+        if child.key.nbytes == 0 {
+            return Err(Error::InvalidFormat(
+                "v1 B-tree chunk has zero byte size".into(),
+            ));
+        }
+        let mut coords = Vec::with_capacity(data_ndims);
+        for dim_index in 0..data_ndims {
+            coords.push(
+                child.key.scaled[dim_index]
+                    .checked_mul(key_dims.chunk_dims[dim_index])
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("v1 B-tree chunk coordinate overflow".into())
+                    })?,
+            );
+        }
+        Ok(Some(ChunkBTreeRecord {
+            coords,
+            chunk_addr: child.child_addr,
+            chunk_size: child.key.nbytes,
+            filter_mask: child.key.filter_mask,
+        }))
+    }
+
     /// Pure deserializer for one v1 chunk-index B-tree node — returns
     /// either the leaf chunk records or the list of child addresses,
     /// depending on the node level. Mirrors libhdf5's
@@ -575,4 +896,28 @@ impl Dataset {
 
         Ok(raw_scratch)
     }
+}
+
+fn vector_ge(left: &[u64], right: &[u64]) -> bool {
+    for (&left_value, &right_value) in left.iter().zip(right) {
+        if left_value > right_value {
+            return true;
+        }
+        if left_value < right_value {
+            return false;
+        }
+    }
+    left.len() >= right.len()
+}
+
+fn vector_lt(left: &[u64], right: &[u64]) -> bool {
+    for (&left_value, &right_value) in left.iter().zip(right) {
+        if left_value < right_value {
+            return true;
+        }
+        if left_value > right_value {
+            return false;
+        }
+    }
+    left.len() < right.len()
 }

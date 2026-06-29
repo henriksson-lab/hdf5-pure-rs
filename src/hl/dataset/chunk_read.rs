@@ -3,7 +3,7 @@ use std::io::{Read, Seek};
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::format::fixed_array::FixedArrayElement;
-use crate::format::messages::data_layout::ChunkIndexType;
+use crate::format::messages::data_layout::{ChunkIndexType, LayoutClass};
 use crate::io::reader::HdfReader;
 
 use super::{u64_from_usize, usize_from_u64, Dataset, DatasetInfo};
@@ -32,7 +32,212 @@ pub(super) struct BorrowedChunkPayloadRead<'a> {
     pub(super) filter_mask: u32,
 }
 
+struct ChunkRead {
+    coords: Vec<u64>,
+    filter_mask: u32,
+    addr: u64,
+    size: usize,
+}
+
 impl Dataset {
+    pub(super) fn read_chunked_hyperslab_direct_into(
+        &self,
+        info: &DatasetInfo,
+        shape: &[u64],
+        dims: &[crate::hl::selection::HyperslabDim],
+        elem_size: usize,
+        raw_out: &mut [u8],
+    ) -> Result<bool> {
+        if info.layout.layout_class != LayoutClass::Chunked
+            || dims.len() != shape.len()
+            || dims
+                .iter()
+                .any(|dim| dim.stride != 1 || (dim.block != 1 && dim.count != 1))
+        {
+            return Ok(false);
+        }
+
+        let raw_chunk_dims = info
+            .layout
+            .chunk_dims
+            .as_ref()
+            .ok_or_else(|| Error::InvalidFormat("chunked dataset missing chunk dims".into()))?;
+        let chunk_dims = Self::chunk_data_dims(shape, raw_chunk_dims)?;
+        if chunk_dims.len() != shape.len() {
+            return Ok(false);
+        }
+
+        let mut sel_start = Vec::with_capacity(dims.len());
+        let mut sel_end = Vec::with_capacity(dims.len());
+        let mut out_shape = Vec::with_capacity(dims.len());
+        for (dim, &extent) in dims.iter().zip(shape) {
+            let output_count = dim.count.checked_mul(dim.block).ok_or_else(|| {
+                Error::InvalidFormat("hyperslab output dimension overflow".into())
+            })?;
+            let end = dim
+                .start
+                .checked_add(output_count)
+                .ok_or_else(|| Error::InvalidFormat("hyperslab end overflow".into()))?;
+            if end > extent {
+                return Ok(false);
+            }
+            sel_start.push(usize_from_u64(dim.start, "hyperslab start")?);
+            sel_end.push(usize_from_u64(end, "hyperslab end")?);
+            out_shape.push(usize_from_u64(output_count, "hyperslab count")?);
+        }
+
+        Self::filled_data_into(raw_out.len() / elem_size, elem_size, info, raw_out)?;
+
+        let mut reads = Vec::new();
+        let is_v1_btree = matches!(info.layout.chunk_index_type, Some(ChunkIndexType::BTreeV1))
+            || (info.layout.chunk_index_type.is_none() && info.layout.version <= 3);
+        if is_v1_btree {
+            let Some(idx_addr) = info.layout.chunk_index_addr else {
+                return Ok(true);
+            };
+            if crate::io::reader::is_undef_addr(idx_addr) {
+                return Ok(true);
+            }
+            let mut guard = self.inner.lock();
+            Self::collect_selected_btree_v1_chunk_reads(
+                &mut guard.reader,
+                idx_addr,
+                shape,
+                chunk_dims,
+                elem_size,
+                &sel_start,
+                &sel_end,
+                &mut reads,
+            )?;
+        } else {
+            self.visit_chunk_infos(|offset, filter_mask, addr, size| {
+                if offset.len() != shape.len() || crate::io::reader::is_undef_addr(addr) {
+                    return Ok(());
+                }
+                if Self::chunk_intersects_hyperslab(
+                    offset, chunk_dims, shape, &sel_start, &sel_end,
+                )? {
+                    reads.push(ChunkRead {
+                        coords: offset.to_vec(),
+                        filter_mask,
+                        addr,
+                        size: usize_from_u64(size, "chunk size")?,
+                    });
+                }
+                Ok(())
+            })?;
+        }
+        if reads.is_empty() {
+            return Ok(true);
+        }
+
+        let chunk_bytes = Self::chunk_byte_len(raw_chunk_dims, chunk_dims, elem_size)?;
+        let mut guard = self.inner.lock();
+        let mut chunk_scratch = Vec::new();
+        for read in reads {
+            guard.reader.seek(read.addr)?;
+            chunk_scratch.resize(read.size, 0);
+            guard.reader.read_exact(&mut chunk_scratch)?;
+
+            if let Some(ref pipeline) = info.filter_pipeline {
+                if !pipeline.filters.is_empty() {
+                    let filtered = filters::apply_pipeline_reverse_with_mask_expected(
+                        &chunk_scratch,
+                        pipeline,
+                        elem_size,
+                        read.filter_mask,
+                        chunk_bytes,
+                    )?;
+                    Self::copy_chunk_hyperslab_intersection(
+                        &filtered,
+                        &read.coords,
+                        chunk_dims,
+                        shape,
+                        &sel_start,
+                        &sel_end,
+                        &out_shape,
+                        elem_size,
+                        raw_out,
+                    )?;
+                    continue;
+                }
+            }
+
+            Self::copy_chunk_hyperslab_intersection(
+                &chunk_scratch,
+                &read.coords,
+                chunk_dims,
+                shape,
+                &sel_start,
+                &sel_end,
+                &out_shape,
+                elem_size,
+                raw_out,
+            )?;
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_selected_btree_v1_chunk_reads<R: Read + Seek>(
+        reader: &mut HdfReader<R>,
+        idx_addr: u64,
+        shape: &[u64],
+        chunk_dims: &[u64],
+        elem_size: usize,
+        sel_start: &[usize],
+        sel_end: &[usize],
+        reads: &mut Vec<ChunkRead>,
+    ) -> Result<()> {
+        let mut range_starts = Vec::with_capacity(shape.len());
+        let mut range_ends = Vec::with_capacity(shape.len());
+        for ((&chunk_dim, &start), &end) in chunk_dims.iter().zip(sel_start).zip(sel_end) {
+            if start == end {
+                return Ok(());
+            }
+            let chunk_dim = usize_from_u64(chunk_dim, "chunk dimension")?;
+            if chunk_dim == 0 {
+                return Err(Error::InvalidFormat("chunk dimension is zero".into()));
+            }
+            range_starts.push(start / chunk_dim);
+            range_ends.push((end - 1) / chunk_dim);
+        }
+
+        let mut chunk_index = range_starts.clone();
+        let mut chunk_origin = vec![0u64; shape.len()];
+        loop {
+            for (dim, origin) in chunk_origin.iter_mut().enumerate() {
+                let chunk_dim = usize_from_u64(chunk_dims[dim], "chunk dimension")?;
+                let origin_usize = chunk_index[dim]
+                    .checked_mul(chunk_dim)
+                    .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?;
+                *origin = u64_from_usize(origin_usize, "chunk coordinate")?;
+            }
+
+            if let Some(record) = Self::lookup_btree_v1_chunk(
+                reader,
+                idx_addr,
+                shape.len(),
+                chunk_dims,
+                elem_size,
+                &chunk_origin,
+            )? {
+                reads.push(ChunkRead {
+                    coords: record.coords,
+                    filter_mask: record.filter_mask,
+                    addr: record.chunk_addr,
+                    size: usize_from_u64(record.chunk_size, "chunk size")?,
+                });
+            }
+
+            if !increment_chunk_index(&mut chunk_index, &range_starts, &range_ends) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     pub(super) fn read_chunked_into<R: Read + Seek>(
         reader: &mut HdfReader<R>,
         info: &DatasetInfo,
@@ -106,6 +311,162 @@ impl Dataset {
                 Ok(())
             }
         }
+    }
+
+    fn chunk_intersects_hyperslab(
+        coords: &[u64],
+        chunk_dims: &[u64],
+        shape: &[u64],
+        sel_start: &[usize],
+        sel_end: &[usize],
+    ) -> Result<bool> {
+        for (((&coord, &chunk_dim), &extent), (&start, &end)) in coords
+            .iter()
+            .zip(chunk_dims)
+            .zip(shape)
+            .zip(sel_start.iter().zip(sel_end))
+        {
+            let chunk_start = usize_from_u64(coord, "chunk coordinate")?;
+            let chunk_end = chunk_start
+                .checked_add(usize_from_u64(chunk_dim, "chunk dimension")?)
+                .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?
+                .min(usize_from_u64(extent, "dataset dimension")?);
+            if chunk_start >= end || chunk_end <= start {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_chunk_hyperslab_intersection(
+        chunk_data: &[u8],
+        coords: &[u64],
+        chunk_dims: &[u64],
+        shape: &[u64],
+        sel_start: &[usize],
+        sel_end: &[usize],
+        out_shape: &[usize],
+        elem_size: usize,
+        raw_out: &mut [u8],
+    ) -> Result<()> {
+        let rank = shape.len();
+        if rank == 0 {
+            if raw_out.len() == elem_size && chunk_data.len() >= elem_size {
+                raw_out.copy_from_slice(&chunk_data[..elem_size]);
+            }
+            return Ok(());
+        }
+
+        let mut chunk_start = Vec::with_capacity(rank);
+        let mut chunk_end = Vec::with_capacity(rank);
+        let mut inter_start = Vec::with_capacity(rank);
+        let mut inter_end = Vec::with_capacity(rank);
+        for (((&coord, &chunk_dim), &extent), (&start, &end)) in coords
+            .iter()
+            .zip(chunk_dims)
+            .zip(shape)
+            .zip(sel_start.iter().zip(sel_end))
+        {
+            let c_start = usize_from_u64(coord, "chunk coordinate")?;
+            let c_end = c_start
+                .checked_add(usize_from_u64(chunk_dim, "chunk dimension")?)
+                .ok_or_else(|| Error::InvalidFormat("chunk coordinate overflow".into()))?
+                .min(usize_from_u64(extent, "dataset dimension")?);
+            let i_start = c_start.max(start);
+            let i_end = c_end.min(end);
+            if i_start >= i_end {
+                return Ok(());
+            }
+            chunk_start.push(c_start);
+            chunk_end.push(c_end);
+            inter_start.push(i_start);
+            inter_end.push(i_end);
+        }
+
+        let chunk_shape = chunk_start
+            .iter()
+            .zip(&chunk_end)
+            .map(|(&start, &end)| end - start)
+            .collect::<Vec<_>>();
+        let chunk_strides = row_major_strides_bytes(&chunk_shape, elem_size)?;
+        let out_strides = row_major_strides_bytes(out_shape, elem_size)?;
+        let last = rank - 1;
+        let span_elems = inter_end[last] - inter_start[last];
+        let span_bytes = span_elems
+            .checked_mul(elem_size)
+            .ok_or_else(|| Error::InvalidFormat("hyperslab span byte count overflow".into()))?;
+
+        if rank == 1 {
+            let src_offset = (inter_start[0] - chunk_start[0])
+                .checked_mul(chunk_strides[0])
+                .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
+            let dst_offset = (inter_start[0] - sel_start[0])
+                .checked_mul(out_strides[0])
+                .ok_or_else(|| Error::InvalidFormat("selection output offset overflow".into()))?;
+            copy_checked_span(chunk_data, raw_out, src_offset, dst_offset, span_bytes)?;
+            return Ok(());
+        }
+
+        let outer_counts = inter_start[..last]
+            .iter()
+            .zip(&inter_end[..last])
+            .map(|(&start, &end)| end - start)
+            .collect::<Vec<_>>();
+        let mut idx = vec![0usize; last];
+        loop {
+            let mut src_offset = 0usize;
+            let mut dst_offset = 0usize;
+            for dim in 0..last {
+                let global = inter_start[dim]
+                    .checked_add(idx[dim])
+                    .ok_or_else(|| Error::InvalidFormat("hyperslab coordinate overflow".into()))?;
+                src_offset = src_offset
+                    .checked_add(
+                        (global - chunk_start[dim])
+                            .checked_mul(chunk_strides[dim])
+                            .ok_or_else(|| {
+                                Error::InvalidFormat("chunk input offset overflow".into())
+                            })?,
+                    )
+                    .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
+                dst_offset = dst_offset
+                    .checked_add(
+                        (global - sel_start[dim])
+                            .checked_mul(out_strides[dim])
+                            .ok_or_else(|| {
+                                Error::InvalidFormat("selection output offset overflow".into())
+                            })?,
+                    )
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("selection output offset overflow".into())
+                    })?;
+            }
+            src_offset = src_offset
+                .checked_add(
+                    (inter_start[last] - chunk_start[last])
+                        .checked_mul(chunk_strides[last])
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("chunk input offset overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| Error::InvalidFormat("chunk input offset overflow".into()))?;
+            dst_offset = dst_offset
+                .checked_add(
+                    (inter_start[last] - sel_start[last])
+                        .checked_mul(out_strides[last])
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("selection output offset overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| Error::InvalidFormat("selection output offset overflow".into()))?;
+            copy_checked_span(chunk_data, raw_out, src_offset, dst_offset, span_bytes)?;
+
+            if !increment_row_major_index(&mut idx, &outer_counts) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn read_chunked_with_index<R: Read + Seek>(
@@ -933,4 +1294,62 @@ impl Dataset {
 
         Ok(())
     }
+}
+
+fn row_major_strides_bytes(dims: &[usize], elem_size: usize) -> Result<Vec<usize>> {
+    if dims.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut strides = vec![elem_size; dims.len()];
+    for dim in (0..dims.len().saturating_sub(1)).rev() {
+        strides[dim] = strides[dim + 1]
+            .checked_mul(dims[dim + 1])
+            .ok_or_else(|| Error::InvalidFormat("byte stride overflow".into()))?;
+    }
+    Ok(strides)
+}
+
+fn copy_checked_span(
+    src: &[u8],
+    dst: &mut [u8],
+    src_offset: usize,
+    dst_offset: usize,
+    len: usize,
+) -> Result<()> {
+    let src_end = src_offset
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat("chunk input range overflow".into()))?;
+    let dst_end = dst_offset
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat("selection output range overflow".into()))?;
+    let src_span = src
+        .get(src_offset..src_end)
+        .ok_or_else(|| Error::InvalidFormat("chunk input range out of bounds".into()))?;
+    let dst_span = dst
+        .get_mut(dst_offset..dst_end)
+        .ok_or_else(|| Error::InvalidFormat("selection output range out of bounds".into()))?;
+    dst_span.copy_from_slice(src_span);
+    Ok(())
+}
+
+fn increment_row_major_index(idx: &mut [usize], limits: &[usize]) -> bool {
+    for dim in (0..idx.len()).rev() {
+        idx[dim] += 1;
+        if idx[dim] < limits[dim] {
+            return true;
+        }
+        idx[dim] = 0;
+    }
+    false
+}
+
+fn increment_chunk_index(idx: &mut [usize], starts: &[usize], ends: &[usize]) -> bool {
+    for dim in (0..idx.len()).rev() {
+        if idx[dim] < ends[dim] {
+            idx[dim] += 1;
+            return true;
+        }
+        idx[dim] = starts[dim];
+    }
+    false
 }

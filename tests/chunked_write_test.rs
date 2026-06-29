@@ -3,7 +3,7 @@ use std::fs;
 use hdf5_pure_rust::engine::writer::{DatasetSpec, DtypeSpec, FillValueSpec, HdfFileWriter};
 use hdf5_pure_rust::format::messages::data_layout::ChunkIndexType;
 use hdf5_pure_rust::io::reader::UNDEF_ADDR;
-use hdf5_pure_rust::{Dataset, File, H5Type, Result};
+use hdf5_pure_rust::{Dataset, File, H5Type, HyperslabDim, Result, Selection};
 
 fn assert_dataset_shape(ds: &Dataset, expected: &[u64]) -> Result<()> {
     let space = ds.space()?;
@@ -835,4 +835,65 @@ fn test_write_chunked_with_shuffle_and_deflate() {
          assert d[:].tolist() == list(range(50))",
         "shuffle+deflate chunked writer fixture",
     );
+}
+
+#[test]
+fn test_filtered_chunked_multidim_hyperslab_reads_only_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("filtered_chunked_multidim_hyperslab.h5");
+
+    {
+        let f = fs::File::create(&path).unwrap();
+        let mut w = HdfFileWriter::new(f);
+        w.begin().unwrap();
+        w.create_root_group().unwrap();
+
+        let shape = [2, 3, 1, 4, 6];
+        let mut data = Vec::new();
+        for c in 0..shape[0] {
+            for t in 0..shape[1] {
+                for z in 0..shape[2] {
+                    for y in 0..shape[3] {
+                        for x in 0..shape[4] {
+                            data.push((c * 70 + t * 20 + z * 11 + y * 6 + x) as u8);
+                        }
+                    }
+                }
+            }
+        }
+
+        w.create_chunked_dataset(
+            "/",
+            &DatasetSpec {
+                name: "cellh5_like",
+                shape: &[2, 3, 1, 4, 6],
+                max_shape: None,
+                dtype: DtypeSpec::U8,
+                data: &data,
+            },
+            &[2, 1, 1, 2, 3],
+            Some(4),
+            false,
+        )
+        .unwrap();
+
+        w.finalize().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let ds = f.dataset("cellh5_like").unwrap();
+    let selection = Selection::Hyperslab(vec![
+        HyperslabDim::new(0, 1, 1, 1),
+        HyperslabDim::new(1, 1, 1, 1),
+        HyperslabDim::new(0, 1, 1, 1),
+        HyperslabDim::new(0, 1, 4, 1),
+        HyperslabDim::new(0, 1, 6, 1),
+    ]);
+    let mut plane = vec![0u8; 4 * 6];
+    ds.read_slice_into::<u8, _>(selection, &mut plane).unwrap();
+
+    let expected = (0..4)
+        .flat_map(|y| (0..6).map(move |x| (20 + y * 6 + x) as u8))
+        .collect::<Vec<_>>();
+    assert_eq!(plane, expected);
 }
