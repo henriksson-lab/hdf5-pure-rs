@@ -3,7 +3,7 @@ members = [".", "derive"]
 
 [package]
 name = "hdf5-pure-rust"
-version = "0.3.5"
+version = "0.3.8"
 edition = "2021"
 description = "Pure Rust implementation of the HDF5 file format"
 license = "BSD-3-Clause"
@@ -19,6 +19,10 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1.4"
 parking_lot = "0.12"
 ndarray = "0.15"
+# Optional support for the third-party HDF5 LZ4 plugin filter (id 32004).
+# This is intentionally outside the original HDF5 library filter set; keep it
+# during parity/audit cleanups.
+lz4_flex = { version = "0.12", optional = true }
 hdf5-pure-rust-derive = { version = "0.3.5", path = "derive", optional = true }
 blosc2-pure-rs = { version = "0.2.1", optional = true }
 tracehash = { package = "tracehash-rs", version = "0.1", optional = true }
@@ -27,6 +31,7 @@ tracehash = { package = "tracehash-rs", version = "0.1", optional = true }
 default = ["derive"]
 derive = ["dep:hdf5-pure-rust-derive"]
 blosc = ["dep:blosc2-pure-rs"]
+lz4 = ["dep:lz4_flex"]
 tracehash = ["dep:tracehash"]
 
 [[bench]]

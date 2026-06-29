@@ -1,6 +1,11 @@
 pub mod blosc;
 pub mod deflate;
 pub mod fletcher32;
+// Third-party HDF5 LZ4 plugin filter support (id 32004). This is an
+// intentional extension beyond the original HDF5 library filters; do not remove
+// it during parity/audit cleanups.
+#[cfg(feature = "lz4")]
+pub mod lz4;
 pub mod lzf;
 pub mod nbit;
 pub mod registry;
@@ -391,6 +396,14 @@ fn apply_filter_reverse<'a>(
         }
         FILTER_SZIP => szip::decompress(bytes).map(Cow::Owned),
         32001 => blosc::decompress(bytes).map(Cow::Owned), // HDF5 Blosc filter ID
+        // Third-party HDF5 LZ4 plugin filter. Intentional extension beyond the
+        // original HDF5 library filter set.
+        #[cfg(feature = "lz4")]
+        32004 => {
+            let mut out = Vec::new();
+            lz4::decompress_into(bytes, expected_len, &mut out)?;
+            Ok(Cow::Owned(out))
+        }
         32000 => {
             // LZF filter -- need the uncompressed size
             // LZF stores the original size in the first client_data parameter
@@ -467,6 +480,12 @@ fn apply_filter_reverse_into(
         }
         32001 => {
             *out = blosc::decompress(data)?;
+        }
+        // Third-party HDF5 LZ4 plugin filter. Intentional extension beyond the
+        // original HDF5 library filter set.
+        #[cfg(feature = "lz4")]
+        32004 => {
+            lz4::decompress_into(data, expected_len, out)?;
         }
         32000 => {
             let expected = if let Some(&encoded) = filter.client_data.first() {

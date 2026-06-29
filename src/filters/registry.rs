@@ -8,6 +8,9 @@ use crate::format::messages::filter_pipeline::{
 
 const FILTER_LZF: u16 = 32_000;
 const FILTER_BLOSC: u16 = 32_001;
+// Third-party HDF5 LZ4 plugin filter. This is intentionally beyond the
+// original HDF5 library filter set and should be preserved during audits.
+const FILTER_LZ4: u16 = 32_004;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredFilter {
@@ -96,6 +99,7 @@ impl FilterRegistry {
             RegisteredFilter::builtin(FILTER_NBIT, "nbit"),
             RegisteredFilter::builtin(FILTER_SCALEOFFSET, "scaleoffset"),
             RegisteredFilter::builtin(FILTER_LZF, "lzf"),
+            RegisteredFilter::builtin(FILTER_LZ4, "lz4"),
             #[cfg(feature = "blosc")]
             RegisteredFilter::builtin(FILTER_BLOSC, "blosc"),
         ] {
@@ -154,6 +158,10 @@ impl FilterRegistry {
         }
         #[cfg(not(feature = "blosc"))]
         if filter_id == FILTER_BLOSC {
+            return false;
+        }
+        #[cfg(not(feature = "lz4"))]
+        if filter_id == FILTER_LZ4 {
             return false;
         }
         true
