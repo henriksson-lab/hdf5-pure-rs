@@ -4899,38 +4899,11 @@ pub fn H5O__pline_decode(bytes: &[u8]) -> Result<FilterPipelineMessage> {
             for _ in 0..nfilters {
                 let id =
                     read_le_uint_cursor(bytes, &mut pos, 2, "filter pipeline v2 filter id")? as u16;
-                let name = if id >= 256 {
-                    let name_len =
-                        read_le_uint_cursor(bytes, &mut pos, 2, "filter pipeline v2 name length")?
-                            as usize;
-                    if name_len == 0 {
-                        None
-                    } else {
-                        let name_end = checked_add(pos, name_len, "filter pipeline v2 name")?;
-                        let name_bytes = bytes.get(pos..name_end).ok_or_else(|| {
-                            Error::InvalidFormat("filter pipeline v2 name is truncated".into())
-                        })?;
-                        let null_pos =
-                            name_bytes
-                                .iter()
-                                .position(|&byte| byte == 0)
-                                .ok_or_else(|| {
-                                    Error::InvalidFormat(
-                                        "filter pipeline v2 name is not null-terminated".into(),
-                                    )
-                                })?;
-                        let text = std::str::from_utf8(&name_bytes[..null_pos])
-                            .map_err(|_| {
-                                Error::InvalidFormat(
-                                    "filter pipeline v2 name text is not UTF-8".into(),
-                                )
-                            })?
-                            .to_string();
-                        pos = name_end;
-                        Some(text)
-                    }
+                let name_len = if id >= 256 {
+                    read_le_uint_cursor(bytes, &mut pos, 2, "filter pipeline v2 name length")?
+                        as usize
                 } else {
-                    None
+                    0
                 };
                 let flags =
                     read_le_uint_cursor(bytes, &mut pos, 2, "filter pipeline v2 flags")? as u16;
@@ -4945,6 +4918,30 @@ pub fn H5O__pline_decode(bytes: &[u8]) -> Result<FilterPipelineMessage> {
                         "filter pipeline v2 client data count {cd_nelmts} exceeds supported maximum 1024"
                     )));
                 }
+                let name = if name_len == 0 {
+                    None
+                } else {
+                    let name_end = checked_add(pos, name_len, "filter pipeline v2 name")?;
+                    let name_bytes = bytes.get(pos..name_end).ok_or_else(|| {
+                        Error::InvalidFormat("filter pipeline v2 name is truncated".into())
+                    })?;
+                    let null_pos =
+                        name_bytes
+                            .iter()
+                            .position(|&byte| byte == 0)
+                            .ok_or_else(|| {
+                                Error::InvalidFormat(
+                                    "filter pipeline v2 name is not null-terminated".into(),
+                                )
+                            })?;
+                    let text = std::str::from_utf8(&name_bytes[..null_pos])
+                        .map_err(|_| {
+                            Error::InvalidFormat("filter pipeline v2 name text is not UTF-8".into())
+                        })?
+                        .to_string();
+                    pos = name_end;
+                    Some(text)
+                };
                 let mut client_data = Vec::with_capacity(cd_nelmts);
                 for _ in 0..cd_nelmts {
                     client_data.push(read_le_uint_cursor(

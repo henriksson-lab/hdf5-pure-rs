@@ -39,6 +39,26 @@ impl Dataset {
                 return Ok(Vec::new());
             }
             let total_out_usize = usize_from_u64(total_out, "hyperslab selection element count")?;
+            let info = self.info()?;
+            let conversion =
+                crate::hl::conversion::ReadConversion::for_dataset::<T>(&info.datatype)?;
+            let source_elem_size = usize_from_u64(u64::from(info.datatype.size), "datatype size")?;
+            if source_elem_size == 0 {
+                return Err(Error::Other("zero-size type".into()));
+            }
+            let raw_len = total_out_usize
+                .checked_mul(source_elem_size)
+                .ok_or_else(|| Error::InvalidFormat("selection byte length overflow".into()))?;
+            let mut raw = vec![0u8; raw_len];
+            if self.read_chunked_hyperslab_direct_into(
+                &info,
+                shape,
+                dims,
+                source_elem_size,
+                &mut raw,
+            )? {
+                return conversion.bytes_to_vec(raw);
+            }
             let all_data = self.read_dataset_values::<T>()?;
             return Self::extract_hyperslab_selection(
                 &all_data,

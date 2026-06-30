@@ -156,29 +156,14 @@ impl FilterPipelineMessage {
             let id = read_u16_le(data, &mut pos, "filter pipeline v2 filter id")?;
 
             // v2: name_length and name are OMITTED for known filter IDs (< 256)
-            let name = if id >= 256 {
-                let name_len = usize::from(read_u16_le(
+            let name_len = if id >= 256 {
+                usize::from(read_u16_le(
                     data,
                     &mut pos,
                     "filter pipeline v2 name length",
-                )?);
-                if name_len > 0 {
-                    let name_bytes =
-                        checked_window(data, pos, name_len, "filter pipeline v2 name")?;
-                    let null_pos = name_bytes.iter().position(|&b| b == 0).ok_or_else(|| {
-                        Error::InvalidFormat(
-                            "filter pipeline v2 name is not null-terminated".into(),
-                        )
-                    })?;
-                    let n =
-                        decode_utf8_name(&name_bytes[..null_pos], "filter pipeline v2 name text")?;
-                    advance_pos(&mut pos, name_len, "filter pipeline v2 name")?;
-                    Some(n)
-                } else {
-                    None
-                }
+                )?)
             } else {
-                None
+                0
             };
 
             let flags = read_u16_le(data, &mut pos, "filter pipeline v2 flags")?;
@@ -192,6 +177,18 @@ impl FilterPipelineMessage {
                     "filter pipeline v2 client data count {cd_nelmts} exceeds supported maximum {MAX_FILTER_CLIENT_VALUES}"
                 )));
             }
+
+            let name = if name_len > 0 {
+                let name_bytes = checked_window(data, pos, name_len, "filter pipeline v2 name")?;
+                let null_pos = name_bytes.iter().position(|&b| b == 0).ok_or_else(|| {
+                    Error::InvalidFormat("filter pipeline v2 name is not null-terminated".into())
+                })?;
+                let n = decode_utf8_name(&name_bytes[..null_pos], "filter pipeline v2 name text")?;
+                advance_pos(&mut pos, name_len, "filter pipeline v2 name")?;
+                Some(n)
+            } else {
+                None
+            };
 
             let client_data =
                 read_client_data(data, &mut pos, cd_nelmts, "filter pipeline v2 client data")?;
@@ -283,7 +280,7 @@ fn align8(len: usize, context: &str) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_pos, align8, checked_window};
+    use super::{advance_pos, align8, checked_window, FilterPipelineMessage};
 
     #[test]
     fn filter_pipeline_padding_rejects_overflow() {
@@ -302,5 +299,27 @@ mod tests {
     fn filter_pipeline_checked_window_rejects_overflow() {
         let err = checked_window(&[], usize::MAX, 1, "filter window").unwrap_err();
         assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn filter_pipeline_v2_custom_filter_name_follows_flags_and_cd_count() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[2, 1]);
+        bytes.extend_from_slice(&32004u16.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"lz4\0");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&65536u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let pipeline = FilterPipelineMessage::decode(&bytes).unwrap();
+        assert_eq!(pipeline.version, 2);
+        assert_eq!(pipeline.filters.len(), 1);
+        assert_eq!(pipeline.filters[0].id, 32004);
+        assert_eq!(pipeline.filters[0].name.as_deref(), Some("lz4"));
+        assert_eq!(pipeline.filters[0].flags, 1);
+        assert_eq!(pipeline.filters[0].client_data, vec![0, 65536, 0]);
     }
 }
