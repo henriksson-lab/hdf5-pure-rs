@@ -174,10 +174,10 @@ output placement, and error handling.
 1. Large 1D `f64` dataset, `32,000,000` elements, chunked `(1,000,000)`,
    gzip/deflate level `1`, no shuffle:
 
-| Reader | Average Read Time | Best Read Time |
-|--------|------------------:|---------------:|
-| h5py/libhdf5 | 275.8 ms | 268.5 ms |
-| hdf5-pure-rust | 338.2 ms | 326.1 ms |
+| Reader | Average Read Time | Best Read Time | Peak RSS | RSS Ratio |
+|--------|------------------:|---------------:|---------:|----------:|
+| h5py/libhdf5 | 275.8 ms | 268.5 ms | 300,812 KiB | 1.00x |
+| hdf5-pure-rust | 338.2 ms | 326.1 ms | 444,600 KiB | 1.48x |
 
 The remaining gap on this workload is now mostly in the deflate backend rather
 than in the HDF5 chunk-copy path. Profiling currently shows
@@ -186,10 +186,10 @@ than in the HDF5 chunk-copy path. Profiling currently shows
 2. Large 1D `f64` dataset, `16,000,000` elements, chunked `(1,000,000)`,
    gzip/deflate level `1`, shuffle enabled:
 
-| Reader | Average Read Time | Best Read Time |
-|--------|------------------:|---------------:|
-| h5py/libhdf5 | 172.6 ms | 167.0 ms |
-| hdf5-pure-rust | 166.4 ms | 160.6 ms |
+| Reader | Average Read Time | Best Read Time | Peak RSS | RSS Ratio |
+|--------|------------------:|---------------:|---------:|----------:|
+| h5py/libhdf5 | 172.6 ms | 167.0 ms | 190,264 KiB | 1.00x |
+| hdf5-pure-rust | 166.4 ms | 160.6 ms | 143,780 KiB | 0.76x |
 
 This second case improved substantially after specializing the shuffle reversal
 path for common numeric element sizes and routing full 1D chunk reads directly
@@ -205,16 +205,20 @@ into the final output buffer.
    Local sequential hot-cache run, 5 seconds per dataset, h5py `3.12.1` with
    HDF5 `1.14.5`:
 
-| Dataset | Shape / dtype / layout | Reader | Average Read Time | Best Read Time |
-|---------|------------------------|--------|------------------:|---------------:|
-| `mod/RNA/X/data` | `(40,325,108)` `float64`, chunks `(1,024)`, gzip | h5py/libhdf5 | 1973.2 ms | 1729.6 ms |
-| `mod/RNA/X/data` | same | hdf5-pure-rust | 261.5 ms | 240.6 ms |
-| `mod/RNA/X/indices` | `(40,325,108)` `int32`, chunks `(2,048)`, gzip | h5py/libhdf5 | 1311.0 ms | 1101.4 ms |
-| `mod/RNA/X/indices` | same | hdf5-pure-rust | 208.8 ms | 195.0 ms |
+| Dataset | Shape / dtype / layout | Reader | Average Read Time | Best Read Time | Peak RSS | RSS Ratio |
+|---------|------------------------|--------|------------------:|---------------:|---------:|----------:|
+| `mod/RNA/X/data` | `(40,325,108)` `float64`, chunks `(1,024)`, gzip | h5py/libhdf5 | 1973.2 ms | 1729.6 ms | 625,800 KiB | 1.00x |
+| `mod/RNA/X/data` | same | hdf5-pure-rust | 261.5 ms | 240.6 ms | 356,800 KiB | 0.57x |
+| `mod/RNA/X/indices` | `(40,325,108)` `int32`, chunks `(2,048)`, gzip | h5py/libhdf5 | 1311.0 ms | 1101.4 ms | 335,264 KiB | 1.00x |
+| `mod/RNA/X/indices` | same | hdf5-pure-rust | 208.8 ms | 195.0 ms | 226,240 KiB | 0.67x |
 
 This fixture is not currently one of the documented public-download fixtures,
 so these rows should be treated as local regression data until the exact source
 and regeneration steps are documented.
+
+Peak RSS was measured with `/usr/bin/time -f %M` around separate single-read
+hot-cache processes. The RSS ratio is relative to the h5py/libhdf5 row for the
+same dataset.
 
 For reproducible local timing, use:
 
