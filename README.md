@@ -6,6 +6,7 @@ Based on HDF5 C library commit [`62701c4`](https://github.com/HDFGroup/hdf5/comm
 
 **Available as early release for testers. Due to the risk of data corruption, be especially vigilant if you use this crate.**
 
+* 2026-08-01: CI added
 * 2026-06-29: Added LZ4 support; fixed RSS divergence
 * 2026-05-28: Audits seems to have converged, but more testing needed
 * 2026-05-22: Continued implementation of new features, further audits. not yet complete
@@ -158,7 +159,17 @@ These numbers are for local development only. They are intended to guide
 translation work and performance regressions, not to make broad claims about
 general HDF5 performance.
 
+Original benchmark baseline: the vendored HDFGroup/hdf5 source is commit
+`62701c4c7977` (`git describe`: `62701c4-dirty`).
+
 Current local read baselines after the recent chunked-read optimizations:
+
+2026-07-14 rerun note: the current `perf_compare` CLI requires explicit dataset
+names for these read loops. Rerunning the two generated `data` rows and the two
+`hcabm40k_mudataseurat.h5mu` rows below for 3 seconds each gave a mean
+h5py/Rust speedup of 2.69x and a mean Rust/h5py RSS ratio of 0.64. Checksums
+matched for all four rows; raw rows are recorded in the presentation tracker as
+`benchmarks/hdf5-pure-rust.tsv`.
 
 ### Local deflate parallelism
 
