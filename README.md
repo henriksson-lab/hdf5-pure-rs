@@ -302,11 +302,19 @@ Use `scripts/download-real-world-fixtures.py --no-download` to regenerate only l
 Unsupported HDF5 features are tracked in `analysis/unsupported_features.md`.
 
 
-## How to Cite HDF5
+## Citing
 
 If you use HDF5 in your research, please cite it. See the original [original code](https://github.com/HDFGroup/hdf5) for details
 
 **Quick DOI:** [10.5281/zenodo.17808558](https://doi.org/10.5281/zenodo.17808558)
+
+If you use our translation, we recommend that you also cite the precise version you use. If you link to [crates.io](http://crates.io), you can cite the version number;
+but if you link to our Git repository, for reproducibility, it is better that you provide the URL to the repository and the git hash (Github lists it high up on the page as 7 letters, under the Code button, e.g. '21751cd')
+
+In addition, we appreciate if you cite the paper below describing the translation approach. If for some reason you struggle with journal citation limits, please prioritizing citing the original software over our translation paper.
+
+> Johan Henriksson. Static analysis-guided agentic AI translation enables Rust as a full stack bioinformatics language. arXiv:2608.13029, 2026. https://doi.org/10.48550/arXiv.2608.13029
+
 
 
 ## License
